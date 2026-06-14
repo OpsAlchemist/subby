@@ -1,0 +1,96 @@
+# electron-builder configuration (https://www.electron.build/configuration)
+#
+# Subby ships as a fully self-contained desktop app: electron-vite bundles all
+# runtime code (main, preload, renderer + their npm deps) into `out/`, so the
+# packaged app only needs `out/**` plus the Electron runtime — node_modules is
+# intentionally NOT shipped, keeping installers small.
+appId: com.opsalchemist.subby
+productName: Subby
+copyright: Copyright © 2026 Mr. K (@KubeMonk), OpsAlchemist
+
+directories:
+  # Build resources (icons, entitlements). Drop icon.icns / icon.ico / icon.png
+  # here to override the default Electron icon (see build/README.md).
+  buildResources: build
+  # Where installers are emitted.
+  output: release
+
+# Authoritative include list — only the bundled app and its manifest.
+files:
+  - out/**
+  - package.json
+
+# Pack into an asar archive (smaller, faster startup).
+asar: true
+
+# Don't rebuild native modules — there are none (pure JS app).
+npmRebuild: false
+
+# ---------------------------------------------------------------------------
+# macOS (.dmg installer + .zip for auto-update / manual install)
+# ---------------------------------------------------------------------------
+mac:
+  category: public.app-category.finance
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  # Beta builds are unsigned/un-notarized. Set hardenedRuntime + signing later.
+  hardenedRuntime: false
+  gatekeeperAssess: false
+
+dmg:
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+# ---------------------------------------------------------------------------
+# Windows (NSIS installer)
+# ---------------------------------------------------------------------------
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  artifactName: ${productName}-Setup-${version}.${ext}
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  deleteAppDataOnUninstall: false
+
+# ---------------------------------------------------------------------------
+# Linux (AppImage + .deb)
+# ---------------------------------------------------------------------------
+linux:
+  category: Office
+  maintainer: OpsAlchemist <subby@opsalchemist.dev>
+  vendor: OpsAlchemist
+  synopsis: Privacy-first, offline subscription tracker
+  description: >-
+    Subby is a privacy-first subscription tracker. All data is stored locally
+    as JSON files with no database, no accounts, and no network access.
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  artifactName: ${productName}-${version}-${arch}.${ext}
+
+# ---------------------------------------------------------------------------
+# Publishing — GitHub Releases. The CI release workflow attaches artifacts to a
+# draft release itself (via softprops/action-gh-release), so electron-builder
+# runs with `--publish never`. This block documents the canonical provider and
+# enables `electron-builder --publish always` for local/manual publishing.
+# ---------------------------------------------------------------------------
+publish:
+  provider: github
+  owner: KubeMonk
+  repo: subby
+  releaseType: draft

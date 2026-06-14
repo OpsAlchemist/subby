@@ -1,0 +1,295 @@
+/**
+ * Calendar view (task 23.1, Req 10.1–10.3), lazy-loaded by the app shell.
+ *
+ * A monthly calendar of subscription renewals. It reads the live subscription
+ * list from the client store via `useStoreData` (a `useSyncExternalStore`
+ * adapter), so it re-renders whenever subscription data changes after any
+ * mutation — the store is reloaded on the `onDataChanged` broadcast.
+ *
+ * All date math + renewal indexing lives in the pure, unit-testable
+ * `./calendarGrid` module (`buildMonthGrid`, `indexByRenewalDate`, …) so this
+ * file stays a thin presentational shell and month-navigation recomputation can
+ * be verified deterministically (task 23.2):
+ *
+ *   - The visible month is component state, defaulting to the current month.
+ *   - `buildMonthGrid` produces a Sunday-first weeks × 7 grid with leading/
+ *     trailing blanks for alignment.
+ *   - `indexByRenewalDate` maps `YYYY-MM-DD` → renewing subscriptions; cells
+ *     with ≥1 renewal show a count badge (Req 10.1).
+ *   - Selecting a day opens a side panel listing that date's renewals — name,
+ *     amount, billing cycle — or an empty state (Req 10.2).
+ *   - Prev/next navigation shifts the visible month and recomputes the grid +
+ *     indicators (Req 10.3).
+ *
+ * Accessibility: the calendar is an ARIA `grid` with weekday `columnheader`s;
+ * each day is a `button` with an aria-label naming the date and renewal count,
+ * `aria-pressed` for the selected day, `aria-current="date"` for today, and a
+ * visible focus ring. This file MUST keep a default export for `React.lazy`.
+ */
+
+import { useMemo, useState } from "react";
+import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
+import type { Subscription } from "core/models/subscription";
+import { subscriptionsStore } from "@/stores/subscriptionsStore";
+import { useStoreData } from "@/stores/hooks";
+import { cn } from "@/lib/utils";
+import {
+  addMonths,
+  buildMonthGrid,
+  currentYearMonth,
+  indexByRenewalDate,
+  monthLabel,
+  todayISO,
+  WEEKDAY_LABELS,
+  type YearMonth,
+} from "./calendarGrid";
+
+/**
+ * Shared focus-ring utility matching the rest of the app so every interactive
+ * control has a visible, consistent keyboard focus indicator (Req 22.1, 22.3).
+ */
+const focusRing =
+  "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+/** Format an amount in its subscription currency, falling back gracefully. */
+function formatCurrency(amount: number, currency: string): string {
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency,
+    }).format(amount);
+  } catch {
+    return `${currency} ${amount.toFixed(2)}`;
+  }
+}
+
+/** Format an ISO `YYYY-MM-DD` date into a long, human-readable form. */
+function formatLongDate(iso: string): string {
+  const date = new Date(`${iso}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toLocaleDateString(undefined, {
+    weekday: "long",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+/** Build the screen-reader label for a day cell (date + renewal count). */
+function dayAriaLabel(iso: string, count: number): string {
+  const date = formatLongDate(iso);
+  if (count === 0) return `${date}, no renewals`;
+  return `${date}, ${count} renewal${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Side panel listing the subscriptions renewing on the selected date (Req 10.2),
+ * with an empty state for dates that have no renewals and a prompt when nothing
+ * is selected yet.
+ */
+function DayDetailPanel({
+  selectedDate,
+  subs,
+}: {
+  selectedDate: string | null;
+  subs: Subscription[];
+}): JSX.Element {
+  return (
+    <aside
+      aria-label="Selected day renewals"
+      className="rounded-lg border border-border bg-card p-4"
+    >
+      {selectedDate === null ? (
+        <p className="text-sm text-muted-foreground">
+          Select a date to see the subscriptions renewing that day.
+        </p>
+      ) : (
+        <>
+          <h3 className="text-sm font-semibold">{formatLongDate(selectedDate)}</h3>
+          {subs.length === 0 ? (
+            <p className="mt-3 text-sm text-muted-foreground">
+              No renewals on this date.
+            </p>
+          ) : (
+            <ul className="mt-3 flex flex-col divide-y divide-border">
+              {subs.map((s) => (
+                <li key={s.id} className="py-2 first:pt-0 last:pb-0">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="min-w-0 truncate font-medium">{s.name}</span>
+                    <span className="shrink-0 text-sm font-medium">
+                      {formatCurrency(s.amount, s.currency)}
+                    </span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">{s.billingCycle}</p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </aside>
+  );
+}
+
+/**
+ * Calendar view (Req 10). Default export so the shell can `React.lazy`-import it.
+ */
+export default function CalendarView(): JSX.Element {
+  const subscriptions = useStoreData(subscriptionsStore);
+
+  // Visible month (Req 10.3) and the selected date (Req 10.2) are local state.
+  const [view, setView] = useState<YearMonth>(() => currentYearMonth());
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+
+  const today = todayISO();
+
+  // Renewal index keyed by `YYYY-MM-DD`; rebuilt only when the data changes.
+  const renewalsByDate = useMemo(
+    () => indexByRenewalDate(subscriptions),
+    [subscriptions],
+  );
+
+  // Month grid; recomputed when navigating to a different month (Req 10.3).
+  const weeks = useMemo(() => buildMonthGrid(view.year, view.month), [view]);
+
+  // Subscriptions for the currently selected date (Req 10.2).
+  const selectedSubs = useMemo(
+    () => (selectedDate ? (renewalsByDate.get(selectedDate) ?? []) : []),
+    [selectedDate, renewalsByDate],
+  );
+
+  function goToMonth(delta: number): void {
+    setView((prev) => addMonths(prev, delta));
+  }
+
+  return (
+    <div className="space-y-6">
+      <header className="space-y-1">
+        <h2 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
+          <CalendarDays className="h-6 w-6 text-muted-foreground" aria-hidden="true" />
+          Calendar
+        </h2>
+        <p className="text-muted-foreground">
+          Monthly view of your subscription renewals.
+        </p>
+      </header>
+
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        {/* Calendar grid + month navigation. */}
+        <section className="rounded-lg border border-border bg-card p-4">
+          {/* Month navigation (Req 10.3). */}
+          <div className="mb-4 flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => goToMonth(-1)}
+              aria-label="Previous month"
+              className={cn(
+                "inline-flex h-9 w-9 items-center justify-center rounded-md border border-input hover:bg-secondary/60",
+                focusRing,
+              )}
+            >
+              <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+            </button>
+            <h3
+              aria-live="polite"
+              className="text-base font-semibold tracking-tight"
+            >
+              {monthLabel(view)}
+            </h3>
+            <button
+              type="button"
+              onClick={() => goToMonth(1)}
+              aria-label="Next month"
+              className={cn(
+                "inline-flex h-9 w-9 items-center justify-center rounded-md border border-input hover:bg-secondary/60",
+                focusRing,
+              )}
+            >
+              <ChevronRight className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+
+          {/* Month grid (Req 10.1). */}
+          <div role="grid" aria-label={`${monthLabel(view)} renewals`}>
+            {/* Weekday headers. */}
+            <div role="row" className="grid grid-cols-7">
+              {WEEKDAY_LABELS.map((label) => (
+                <div
+                  key={label}
+                  role="columnheader"
+                  className="px-1 py-2 text-center text-xs font-medium text-muted-foreground"
+                >
+                  {label}
+                </div>
+              ))}
+            </div>
+
+            {/* Week rows. */}
+            {weeks.map((week, weekIdx) => (
+              <div role="row" key={weekIdx} className="grid grid-cols-7">
+                {week.map((cell, cellIdx) => {
+                  if (cell.date === null || cell.day === null) {
+                    // Blank alignment cell (leading/trailing).
+                    return (
+                      <div
+                        role="gridcell"
+                        key={`blank-${weekIdx}-${cellIdx}`}
+                        aria-hidden="true"
+                        className="m-0.5 aspect-square"
+                      />
+                    );
+                  }
+
+                  const cellSubs = renewalsByDate.get(cell.date) ?? [];
+                  const count = cellSubs.length;
+                  const isToday = cell.date === today;
+                  const isSelected = cell.date === selectedDate;
+
+                  return (
+                    <div role="gridcell" key={cell.date} className="m-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedDate(cell.date)}
+                        aria-label={dayAriaLabel(cell.date, count)}
+                        aria-pressed={isSelected}
+                        aria-current={isToday ? "date" : undefined}
+                        className={cn(
+                          "flex aspect-square w-full flex-col items-center justify-start gap-1 rounded-md border p-1 text-sm transition-colors",
+                          focusRing,
+                          isSelected
+                            ? "border-accent bg-accent/10"
+                            : "border-border hover:bg-secondary/60",
+                          isToday && !isSelected && "border-accent",
+                        )}
+                      >
+                        <span
+                          className={cn(
+                            "leading-none",
+                            isToday && "font-semibold text-foreground",
+                          )}
+                        >
+                          {cell.day}
+                        </span>
+                        {count > 0 && (
+                          <span
+                            className="inline-flex min-w-4 items-center justify-center rounded-full bg-accent px-1 text-[0.625rem] font-semibold leading-4 text-accent-foreground"
+                            aria-hidden="true"
+                          >
+                            {count}
+                          </span>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
+        </section>
+
+        {/* Selected-day side panel (Req 10.2). */}
+        <DayDetailPanel selectedDate={selectedDate} subs={selectedSubs} />
+      </div>
+    </div>
+  );
+}

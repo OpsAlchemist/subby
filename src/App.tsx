@@ -1,0 +1,352 @@
+import { lazy, Suspense, useEffect, useState } from "react";
+import {
+  Info,
+  LayoutDashboard,
+  List,
+  Monitor,
+  Moon,
+  Plus,
+  Search,
+  Settings as SettingsIcon,
+  Sun,
+  BarChart3,
+  Calendar,
+  type LucideIcon,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+import { settingsApi } from "@/api/subby";
+import { settingsStore } from "@/stores";
+import { useStoreData } from "@/stores/hooks";
+import {
+  applySettingsTheme,
+  subscribeSystemTheme,
+} from "@/theme/themeManager";
+
+// Eagerly-loaded lightweight views.
+import Dashboard from "@/views/Dashboard";
+import SubscriptionList from "@/views/SubscriptionList";
+import Settings from "@/views/Settings";
+import About from "@/views/About";
+import SubscriptionModal from "@/components/SubscriptionModal";
+import GlobalSearch from "@/components/GlobalSearch";
+
+/**
+ * Heavy views are code-split with React.lazy so they do not weigh on cold-start
+ * (Req 21.1). The placeholders default-export simple components today; tasks 23
+ * (Calendar) and 24 (Analytics) replace their contents without changing this
+ * import boundary.
+ */
+const CalendarView = lazy(() => import("@/views/CalendarView"));
+const AnalyticsView = lazy(() => import("@/views/AnalyticsView"));
+
+/** The set of routable views. The shell uses simple in-memory routing (see below). */
+type ViewKey =
+  | "dashboard"
+  | "list"
+  | "calendar"
+  | "analytics"
+  | "settings"
+  | "about";
+
+interface NavItem {
+  key: ViewKey;
+  label: string;
+  icon: LucideIcon;
+}
+
+/**
+ * Navigation rail items, in tab order (Req 22.1). Each renders an icon + text
+ * label so the rail is usable by sighted and screen-reader users alike
+ * (Req 22.3).
+ */
+const NAV_ITEMS: readonly NavItem[] = [
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  { key: "list", label: "List", icon: List },
+  { key: "calendar", label: "Calendar", icon: Calendar },
+  { key: "analytics", label: "Analytics", icon: BarChart3 },
+  { key: "settings", label: "Settings", icon: SettingsIcon },
+  { key: "about", label: "About", icon: Info },
+] as const;
+
+/**
+ * Shared focus-ring utility so every interactive control has a visible,
+ * consistent keyboard focus indicator (Req 22.1, 22.3). Uses the design's
+ * `--ring` token via Tailwind's `ring` color.
+ */
+const focusRing =
+  "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+/**
+ * Render the active view. Calendar/Analytics are lazy and wrapped in Suspense
+ * by the caller. The other views are eager and cheap.
+ */
+function ActiveView({ view }: { view: ViewKey }): JSX.Element {
+  switch (view) {
+    case "dashboard":
+      return <Dashboard />;
+    case "list":
+      return <SubscriptionList />;
+    case "calendar":
+      return <CalendarView />;
+    case "analytics":
+      return <AnalyticsView />;
+    case "settings":
+      return <Settings />;
+    case "about":
+      return <About />;
+  }
+}
+
+/**
+ * Application shell (design: Application Shell). Provides:
+ *   - a labelled left navigation rail landmark (`<nav aria-label="Primary">`),
+ *   - a top bar (`<header>`) with the "Add subscription" primary action and a
+ *     Global Search trigger (Cmd/Ctrl-K affordance) plus a theme indicator,
+ *   - a `<main>` content region with a skip-nav target.
+ *
+ * Routing is in-memory `useState` keyed to the nav (no router dependency): the
+ * renderer loads a single HTML file under Electron, so state-based view
+ * switching is the lightest correct approach. The "Add subscription" and
+ * search controls are wired to local state today; tasks 19 (modal) and 22
+ * (Global Search overlay) replace the handlers.
+ *
+ * _Requirements: 21.1 (lazy heavy views), 22.1 (tab-order keyboard nav),
+ * 22.3 (screen-reader labels on landmarks + icon-only controls)._
+ */
+export default function App(): JSX.Element {
+  const [view, setView] = useState<ViewKey>("dashboard");
+
+  // Add subscription modal open state (task 19). Opening with no target puts
+  // the modal in CREATE mode; the list view can later pass a subscription for
+  // EDIT mode through its own wiring.
+  const [addOpen, setAddOpen] = useState(false);
+
+  // Global Search command palette open state (task 22). Opened by the top-bar
+  // search trigger or the Cmd/Ctrl-K shortcut (Req 22.2).
+  const [searchOpen, setSearchOpen] = useState(false);
+
+  // Theme wiring (task 25, Req 14): subscribe to the settings store and apply
+  // the theme + accent whenever they change, and follow OS appearance while the
+  // preference is "system". Pre-load, the store seeds DEFAULT_SETTINGS (dark),
+  // and index.html ships data-theme="dark", so the first paint stays dark.
+  const settings = useStoreData(settingsStore);
+  const theme = settings.theme;
+  const accentColor = settings.accentColor;
+
+  useEffect(() => {
+    applySettingsTheme({ theme, accentColor });
+    // Re-apply on OS appearance changes while following the system theme.
+    return subscribeSystemTheme(theme);
+  }, [theme, accentColor]);
+
+  // Global keyboard shortcuts for primary actions (Req 22.2):
+  //   - Cmd/Ctrl-K → open the Global Search palette (works anywhere),
+  //   - N         → open the Add subscription modal,
+  //   - 1–6       → switch to the matching nav view (Dashboard..About).
+  // Single-key shortcuts are suppressed while the user is typing in a field or
+  // while a modal/search overlay is open (those overlays own their own keys),
+  // and they ignore modifier combinations so they never clash with browser or
+  // OS shortcuts. Re-registered when overlay state changes; cleaned up on
+  // unmount.
+  useEffect(() => {
+    function isTypingTarget(target: EventTarget | null): boolean {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return (
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        target.isContentEditable
+      );
+    }
+
+    function onKeyDown(e: KeyboardEvent): void {
+      // Cmd/Ctrl-K opens search from anywhere, even while typing.
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setSearchOpen(true);
+        return;
+      }
+
+      // All remaining shortcuts are single-key and must not fire with
+      // modifiers, while typing, or while an overlay is capturing input.
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (addOpen || searchOpen || isTypingTarget(e.target)) return;
+
+      if (e.key === "n" || e.key === "N") {
+        e.preventDefault();
+        setAddOpen(true);
+        return;
+      }
+
+      // Digits 1–6 map to the nav rail items in order.
+      if (e.key >= "1" && e.key <= "6") {
+        const item = NAV_ITEMS[Number(e.key) - 1];
+        if (item) {
+          e.preventDefault();
+          setView(item.key);
+        }
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [addOpen, searchOpen]);
+
+  /** Cycle the theme preference dark → light → system → dark and persist it. */
+  function cycleTheme(): void {
+    const next: typeof theme =
+      theme === "dark" ? "light" : theme === "light" ? "system" : "dark";
+    void settingsApi.update({ theme: next });
+  }
+
+  const ThemeIcon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
+
+  // Cmd/Ctrl-K affordance label varies by platform; detect Apple platforms for
+  // the displayed shortcut hint only (no behavior depends on it yet).
+  const isMac =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  const searchShortcut = isMac ? "\u2318K" : "Ctrl+K";
+
+  return (
+    <div className="flex min-h-screen bg-background text-foreground">
+      {/* Skip-navigation link: first tab stop, jumps past the rail (Req 22.1). */}
+      <a
+        href="#main-content"
+        className={cn(
+          "sr-only focus:not-sr-only focus:absolute focus:left-2 focus:top-2 focus:z-50",
+          "rounded-md bg-secondary px-3 py-2 text-sm text-secondary-foreground",
+          focusRing,
+        )}
+      >
+        Skip to main content
+      </a>
+
+      {/* Visually-hidden keyboard-shortcuts reference for screen-reader users
+          (Req 22.2/22.3). Sighted users see the same hints via control titles
+          and the search trigger's kbd badge. */}
+      <p className="sr-only">
+        Keyboard shortcuts: press N to add a subscription, {searchShortcut} to
+        open search, and the number keys 1 through 6 to switch between
+        Dashboard, List, Calendar, Analytics, Settings, and About.
+      </p>
+
+      {/* Left navigation rail — a labelled landmark (Req 22.3). */}
+      <nav
+        aria-label="Primary"
+        className="flex w-56 shrink-0 flex-col gap-1 border-r border-border bg-card p-3"
+      >
+        <div className="mb-4 flex items-center gap-2 px-2">
+          <span className="text-lg font-semibold tracking-tight">Subby</span>
+        </div>
+        <ul className="flex flex-col gap-1">
+          {NAV_ITEMS.map(({ key, label, icon: Icon }, index) => {
+            const active = key === view;
+            return (
+              <li key={key}>
+                <button
+                  type="button"
+                  aria-current={active ? "page" : undefined}
+                  title={`${label} (${index + 1})`}
+                  onClick={() => setView(key)}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
+                    focusRing,
+                    active
+                      ? "bg-secondary text-secondary-foreground"
+                      : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
+                  )}
+                >
+                  <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                  <span>{label}</span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      </nav>
+
+      {/* Right column: top bar + content. */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Top bar landmark. */}
+        <header className="flex items-center justify-between gap-3 border-b border-border bg-card px-6 py-3">
+          {/* Global Search trigger with Cmd/Ctrl-K affordance (task 22 wires it). */}
+          <button
+            type="button"
+            onClick={() => setSearchOpen(true)}
+            className={cn(
+              "flex min-w-0 flex-1 items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm text-muted-foreground",
+              "max-w-md hover:text-foreground",
+              focusRing,
+            )}
+          >
+            <Search className="h-4 w-4 shrink-0" aria-hidden="true" />
+            <span className="truncate">Search subscriptions...</span>
+            <kbd className="ml-auto rounded border border-border px-1.5 py-0.5 text-xs">
+              {searchShortcut}
+            </kbd>
+          </button>
+
+          <div className="flex items-center gap-2">
+            {/* Theme indicator (task 25): shows the active theme preference and
+                cycles dark → light → system on click, persisting via settings. */}
+            <button
+              type="button"
+              aria-label={`Theme: ${theme}. Click to change.`}
+              title={`Theme: ${theme}`}
+              onClick={cycleTheme}
+              className={cn(
+                "inline-flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
+                focusRing,
+              )}
+            >
+              <ThemeIcon className="h-4 w-4" aria-hidden="true" />
+            </button>
+
+            {/* Primary action: Add subscription (task 19 opens the modal). */}
+            <button
+              type="button"
+              onClick={() => setAddOpen(true)}
+              title="Add subscription (N)"
+              className={cn(
+                "inline-flex items-center gap-2 rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-foreground hover:opacity-90",
+                focusRing,
+              )}
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              <span>Add subscription</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Main content region with a skip-nav target and accessible label. */}
+        <main
+          id="main-content"
+          aria-label={NAV_ITEMS.find((i) => i.key === view)?.label}
+          className="flex-1 overflow-auto p-6"
+        >
+          <Suspense
+            fallback={
+              <div className="text-sm text-muted-foreground" role="status">
+                Loading...
+              </div>
+            }
+          >
+            <ActiveView view={view} />
+          </Suspense>
+        </main>
+      </div>
+
+      {/* Add/Edit subscription modal (task 19). Create mode: no `subscription`. */}
+      <SubscriptionModal open={addOpen} onClose={() => setAddOpen(false)} />
+
+      {/* Global Search command palette (task 22). On select, jump to the List
+          view and close; the list owns per-row navigation/editing. */}
+      <GlobalSearch
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onSelect={() => setView("list")}
+      />
+    </div>
+  );
+}

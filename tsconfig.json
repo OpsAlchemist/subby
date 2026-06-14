@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Strict mode (Requirement 2.1 / design: TypeScript strict) */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Types available across the project */
+    "types": ["node", "vitest/globals"],
+
+    /* Path aliases for core and shared (and renderer @) */
+    "baseUrl": ".",
+    "paths": {
+      "core/*": ["core/*"],
+      "shared/*": ["shared/*"],
+      "@/*": ["src/*"]
+    }
+  },
+  "include": [
+    "core",
+    "shared",
+    "src",
+    "electron",
+    "tests",
+    "electron.vite.config.ts",
+    "vitest.config.ts"
+  ],
+  "exclude": ["node_modules", "out", "dist"]
+}

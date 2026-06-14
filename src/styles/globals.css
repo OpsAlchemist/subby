@@ -1,0 +1,98 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Theme tokens as CSS custom properties (design: Theming, Req 14).
+ * Dark is the first-run default (Req 14.4). `--accent` is set by the
+ * Theme_Manager to the configured accent color (Req 14.3).
+ */
+@layer base {
+  :root,
+  [data-theme="light"] {
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 222.2 47.4% 11.2%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 222.2 84% 4.9%;
+    --radius: 0.5rem;
+    --accent: #7c5cff;
+  }
+
+  [data-theme="dark"] {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222.2 84% 4.9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 210 40% 98%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 212.7 26.8% 83.9%;
+    --accent: #7c5cff;
+  }
+}
+
+@layer base {
+  /*
+   * Anchor the root font size to the user's browser/OS preference (100% = the
+   * user's configured default) so all rem-based sizing scales with OS font
+   * settings (Req 22.4 — scalable fonts). Tailwind's type/spacing scale is rem
+   * based, so no hardcoded px font sizes are used anywhere.
+   */
+  html {
+    font-size: 100%;
+  }
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/*
+ * High-contrast affordance (Req 22.4). When the OS requests more contrast,
+ * strengthen the token-driven borders, muted text, and focus ring so structure
+ * and focus remain clearly visible. Kept purely token-based so every component
+ * inherits the stronger contrast without per-component changes.
+ */
+@media (prefers-contrast: more) {
+  :root,
+  [data-theme="light"] {
+    --border: 0 0% 0%;
+    --input: 0 0% 0%;
+    --muted-foreground: 0 0% 20%;
+    --ring: 0 0% 0%;
+  }
+
+  [data-theme="dark"] {
+    --border: 0 0% 100%;
+    --input: 0 0% 100%;
+    --muted-foreground: 0 0% 92%;
+    --ring: 0 0% 100%;
+  }
+}

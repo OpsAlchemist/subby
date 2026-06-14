@@ -1,0 +1,118 @@
+name: Release
+
+# Builds platform installers and attaches them to a GitHub Release.
+#
+# Trigger: push a semver tag (e.g. v0.1.0-beta.1, v1.0.0). A pre-release tag
+# (one containing a hyphen, per semver) is published as a GitHub "pre-release".
+# The release is created as a DRAFT so you can review notes/artifacts and then
+# publish it manually. `workflow_dispatch` allows manual runs against a tag.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to build a release for (e.g. v0.1.0-beta.1)"
+        required: true
+        type: string
+
+# Needed for softprops/action-gh-release to create/update the release.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Build installers natively on each OS.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+          - os: windows-latest
+            platform: win
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck & test
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Build bundle & package installers
+        run: npm run build && npx --no-install electron-builder --${{ matrix.platform }} --publish never
+        env:
+          # Beta builds are unsigned: don't let electron-builder hunt for a
+          # macOS signing identity (would fail on CI without certs).
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.deb
+            release/*.blockmap
+            release/latest*.yml
+
+  # ---------------------------------------------------------------------------
+  # 2) Collect all installers and create/update the (draft) GitHub Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish draft release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all installer artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Resolve tag name
+        id: tag
+        run: echo "name=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Subby ${{ steps.tag.outputs.name }}
+          draft: true
+          # Semver pre-release tags contain a hyphen (e.g. -beta.1, -rc.1).
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: dist-artifacts/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

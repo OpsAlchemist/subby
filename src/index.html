@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      Privacy-first CSP (Req 20.2): no remote origins are permitted. Only
+      same-origin and inline assets load; http(s) hosts are never allowed for
+      script/style/img/font/connect. ws:/wss:/'unsafe-*' support the Vite dev
+      server (HMR) only; production tightens this further via the main process
+      (see electron/main.ts onHeadersReceived).
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ws: wss:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    />
+    <title>Subby</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
