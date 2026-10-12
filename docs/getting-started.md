@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Node.js 20+** (the CI pipeline uses Node 20).
+- **Node.js 24.x** (pinned via `engines.node` in `package.json`; the CI pipeline uses Node 24).
 - **npm** (the repo ships a `package-lock.json`; use `npm ci` for reproducible
   installs).
 - A desktop OS: macOS, Windows, or Linux.
