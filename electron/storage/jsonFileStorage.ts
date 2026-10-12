@@ -36,11 +36,14 @@ import {
   DEFAULT_CATEGORIES,
   DEFAULT_SETTINGS,
   settingsFileSchema,
+  settingsFileV2Schema,
   subscriptionsFileSchema,
+  subscriptionsFileV2Schema,
 } from "core/models/schema";
 import { assembleBackupPayload, backupFileName } from "core/backup";
+import { migrate } from "core/migrations";
 import type { Category } from "core/models/category";
-import type { Settings } from "core/models/settings";
+import type { Settings, SettingsFile } from "core/models/settings";
 import type {
   Subscription,
   SubscriptionsFile,
@@ -48,13 +51,23 @@ import type {
 import type { StoragePort } from "core/ports/storagePort";
 
 import { fileNames, resolveDataDir } from "./paths";
-import { safeReadJson, writeJsonAtomic } from "./safeJson";
+import {
+  safeReadJson,
+  safeReadVersionedJson,
+  writeJsonAtomic,
+} from "./safeJson";
 
 /**
- * On-disk schema version stamped into newly written files. Matches the
- * `version` field of the root file shapes validated in `core/models/schema`.
+ * The current on-disk schema version the live app reads and writes.
+ *
+ * Epic-1 compatibility window (scope A): this stays **1**. The running app still
+ * reads/writes v1 files; v1↔v2 coexist until Epic 3 makes the app v2-aware. The
+ * version-gated read path below is built and fully tested now (including the
+ * v1→v2 migrate branch, exercised in tests against a synthetic lower `current`),
+ * so FR-29 is proven-ready. Epic 3 activates live migration by flipping this one
+ * constant to 2 — no other change in the gating logic is required (AD-15).
  */
-const FILE_SCHEMA_VERSION = 1;
+export const CURRENT_VERSION = 1;
 
 /**
  * Typed error thrown when a data file exists but cannot be read as valid data
@@ -112,6 +125,97 @@ export function isStorageCorruptError(
 }
 
 /**
+ * Typed error thrown when a data file on disk carries a `version` **newer** than
+ * the adapter's `current` (AD-15). A newer-than-supported file is never
+ * downgrade-migrated and never overwritten — the adapter refuses the read and
+ * leaves the file untouched on disk, so a future-version file written by a newer
+ * app build cannot be silently clobbered with a downgraded shape.
+ *
+ *   - `file`         — the affected file name (e.g. `subscriptions.json`).
+ *   - `fileVersion`  — the `version` found on disk.
+ *   - `currentVersion` — the version this adapter supports.
+ */
+export class StorageNewerVersionError extends Error {
+  /** Discriminator so non-`instanceof` consumers can still detect this error. */
+  readonly isStorageNewerVersionError = true as const;
+  readonly file: string;
+  readonly fileVersion: number;
+  readonly currentVersion: number;
+
+  constructor(file: string, fileVersion: number, currentVersion: number) {
+    super(
+      `Data file "${file}" is version ${fileVersion}, newer than the supported ` +
+        `version ${currentVersion}. It was not modified; upgrade the app to read it.`,
+    );
+    this.name = "StorageNewerVersionError";
+    this.file = file;
+    this.fileVersion = fileVersion;
+    this.currentVersion = currentVersion;
+  }
+}
+
+/** Type guard for {@link StorageNewerVersionError} across module boundaries. */
+export function isStorageNewerVersionError(
+  err: unknown,
+): err is StorageNewerVersionError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { isStorageNewerVersionError?: unknown })
+      .isStorageNewerVersionError === true
+  );
+}
+
+/**
+ * Typed error thrown when a `< current` file was detected and a migration was
+ * attempted but the migrate step or the post-migration validation failed
+ * (AD-15). The original file is left untouched (no write-back occurred) and the
+ * pre-migration backup — taken before the attempt — survives. The underlying
+ * `MigrationError` / zod error is carried as `cause`.
+ *
+ *   - `file`           — the affected file name.
+ *   - `fromVersion`    — the on-disk version the migration started from.
+ *   - `currentVersion` — the version the migration targeted.
+ */
+export class StorageMigrationError extends Error {
+  /** Discriminator so non-`instanceof` consumers can still detect this error. */
+  readonly isStorageMigrationError = true as const;
+  readonly file: string;
+  readonly fromVersion: number;
+  readonly currentVersion: number;
+
+  constructor(
+    file: string,
+    fromVersion: number,
+    currentVersion: number,
+    cause?: unknown,
+  ) {
+    super(
+      `Migrating data file "${file}" from version ${fromVersion} to ` +
+        `${currentVersion} failed. The original file was not modified and a ` +
+        `pre-migration backup was taken.`,
+      cause !== undefined ? { cause } : undefined,
+    );
+    this.name = "StorageMigrationError";
+    this.file = file;
+    this.fromVersion = fromVersion;
+    this.currentVersion = currentVersion;
+  }
+}
+
+/** Type guard for {@link StorageMigrationError} across module boundaries. */
+export function isStorageMigrationError(
+  err: unknown,
+): err is StorageMigrationError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { isStorageMigrationError?: unknown }).isStorageMigrationError ===
+      true
+  );
+}
+
+/**
  * Local JSON file implementation of {@link StoragePort} for the Electron main
  * process.
  */
@@ -120,16 +224,37 @@ export class JsonFileStorage implements StoragePort {
   private dataFolder: string | null;
 
   /**
+   * The schema version this adapter treats as "current" for the migrate-before-
+   * validate read path (AD-15). Production constructs the adapter at the default
+   * {@link CURRENT_VERSION} (1 in Epic 1), so the live `== current` branch runs
+   * and behavior is byte-identical to before. Tests inject `current = 2` to
+   * exercise the `< current` migrate branch and the `> current` refuse branch
+   * end-to-end against the Story 1.3 migrator and the v2 schemas, without
+   * flipping the live constant (scope A: the running app never sees v2).
+   */
+  private readonly current: number;
+
+  /**
    * @param defaultUserData The platform `userData` directory (typically
    *                        `app.getPath('userData')`). Used whenever no data
    *                        folder override is configured (Req 1.1).
    * @param dataFolder      Optional initial data-folder override from
    *                        `settings.dataFolder` (Req 15.3). `null`/omitted
    *                        means "use the default".
+   * @param current         The current schema version for the version-gated
+   *                        read path (AD-15). Defaults to {@link CURRENT_VERSION}
+   *                        (1 in Epic 1). Injectable so tests can drive the
+   *                        migrate/refuse branches at `current = 2` without
+   *                        touching the live constant.
    */
-  constructor(defaultUserData: string, dataFolder: string | null = null) {
+  constructor(
+    defaultUserData: string,
+    dataFolder: string | null = null,
+    current: number = CURRENT_VERSION,
+  ) {
     this.defaultUserData = defaultUserData;
     this.dataFolder = dataFolder;
+    this.current = current;
   }
 
   // --- Path helpers ----------------------------------------------------------
@@ -165,13 +290,18 @@ export class JsonFileStorage implements StoragePort {
   }
 
   // --- Default file builders (Req 1.5, 19.3) ---------------------------------
+  //
+  // Recreate-on-missing stamps the adapter's own `current` version so a freshly
+  // created file is already at the current version (its subsequent read takes
+  // the `== current` branch, never a spurious migrate). In Epic 1 production
+  // `current` is 1, so defaults are stamped `version: 1` exactly as before.
 
   private defaultSubscriptionsFile(): SubscriptionsFile {
-    return { version: FILE_SCHEMA_VERSION, subscriptions: [] };
+    return { version: this.current, subscriptions: [] };
   }
 
   private defaultSettingsFile(): Settings & { version: number } {
-    return { version: FILE_SCHEMA_VERSION, ...DEFAULT_SETTINGS };
+    return { version: this.current, ...DEFAULT_SETTINGS };
   }
 
   private defaultCategoriesFile(): { version: number; categories: Category[] } {
@@ -180,40 +310,184 @@ export class JsonFileStorage implements StoragePort {
       name,
       isDefault: true,
     }));
-    return { version: FILE_SCHEMA_VERSION, categories };
+    return { version: this.current, categories };
+  }
+
+  // --- Version-gated read path (AD-15) ---------------------------------------
+
+  /**
+   * The migrate-before-validate read path (AD-15 / FR-29) for a versioned data
+   * file, parameterized per file. It detects the on-disk `version` and branches:
+   *
+   *   - `missing`      → recreate defaults at `current` and return them (the
+   *                      existing recreate-on-missing behavior; Req 1.5, 19.3).
+   *   - `< current`    → take a **pre-migration backup** (AD-16, before any
+   *                      write-back), run the pure `core/migrations.migrate`,
+   *                      **validate** the result against the current-version
+   *                      schema, **atomically write it back**, and return it. A
+   *                      migrate/validate failure surfaces a typed error and the
+   *                      original file is left untouched (no write-back happened
+   *                      and the pre-migration backup survives).
+   *   - `== current`   → validate against the current-version schema and return
+   *                      as-is with **no** write-back (the common/live case).
+   *   - `> current`    → **refuse** with {@link StorageNewerVersionError}; the
+   *                      file is left untouched on disk (never downgrade-
+   *                      overwrite).
+   *
+   * A file whose `version` is *older* than current is therefore never classified
+   * `corrupt` — it is migrated. `corrupt`/`malformed` classification still
+   * applies to genuinely bad bytes/shape at the *target* (current) version.
+   *
+   * The migrator stays pure: this adapter owns all I/O (the backup, the
+   * validate, the atomic write-back). The `migrateFile` callback adapts the
+   * variadic `core/migrations.migrate` overloads to a single typed call per file
+   * so the pure migrator is unaware of storage.
+   *
+   * @param config Per-file read configuration.
+   * @returns The validated current-version file object.
+   */
+  private async readVersioned<TCurrent extends { version: number }>(config: {
+    path: string;
+    fileName: string;
+    /** Validate a parsed object against the **current-version** schema. */
+    validateCurrent: (data: unknown) => TCurrent;
+    /** Build the default file (stamped at `current`) when the file is missing. */
+    buildDefaults: () => TCurrent;
+    /** Migrate a parsed older-version object to the current version (pure). */
+    migrateFile: (data: Record<string, unknown>, fromVersion: number) => TCurrent;
+    /**
+     * Take a pre-migration backup of the **raw** (pre-migration) parsed file,
+     * before any migrate/write-back (AD-16). Omit for files without a backup
+     * stream (settings/categories).
+     */
+    preMigrationBackup?: (raw: Record<string, unknown>) => Promise<void>;
+    /** Resolve `canRestoreBackup` for a corrupt/malformed classification. */
+    canRestoreBackup: () => Promise<boolean>;
+  }): Promise<TCurrent> {
+    await this.ensureTree();
+
+    const detected = await safeReadVersionedJson(config.path);
+
+    if (!detected.ok) {
+      if (detected.reason === "missing") {
+        // Recreate-on-missing (Req 1.5, 19.3). Guard the write: a disk error
+        // here must surface as a typed storage error, not crash a read that must
+        // never throw (Req 19). "malformed" is the least-surprising mapping — the
+        // adapter could not establish a valid data file at this path.
+        const defaults = config.buildDefaults();
+        try {
+          await writeJsonAtomic(config.path, defaults);
+        } catch {
+          throw new StorageCorruptError(
+            config.fileName,
+            "malformed",
+            await config.canRestoreBackup(),
+          );
+        }
+        return defaults;
+      }
+      // malformed: not valid JSON / not an object / no usable version. Do not
+      // overwrite; surface a restorable error (Req 19.1).
+      throw new StorageCorruptError(
+        config.fileName,
+        detected.reason,
+        await config.canRestoreBackup(),
+      );
+    }
+
+    const { value, version } = detected;
+
+    // `> current`: refuse, never downgrade-overwrite (file left untouched).
+    if (version > this.current) {
+      throw new StorageNewerVersionError(config.fileName, version, this.current);
+    }
+
+    // `== current`: validate at the current version; return as-is, no write-back.
+    if (version === this.current) {
+      try {
+        return config.validateCurrent(value);
+      } catch {
+        // Valid JSON but fails the current schema → corrupt. Do not overwrite.
+        throw new StorageCorruptError(
+          config.fileName,
+          "corrupt",
+          await config.canRestoreBackup(),
+        );
+      }
+    }
+
+    // `< current`: migrate-before-validate. Every step of this branch — the
+    // pre-migration backup, the migrate, the validate, and the atomic
+    // write-back — runs inside one error-guarded region so ANY failure surfaces
+    // as a typed StorageMigrationError and a read never throws raw (Req 19). The
+    // backup is still taken FIRST (AD-16), from the RAW pre-migration file, so
+    // the original survives even if a later step fails and so a same-run backup
+    // can never shadow it (collision-proof naming is Story 1.5). Because write-
+    // back is the last step, a failure before it means the original file is
+    // untouched on disk.
+    try {
+      if (config.preMigrationBackup !== undefined) {
+        await config.preMigrationBackup(value);
+      }
+      const result = config.migrateFile(value, version);
+      // Validate the migrated result against the current-version schema before
+      // trusting it. The migrator already validates internally, but re-asserting
+      // here keeps the adapter's "only ever write back a schema-valid file"
+      // guarantee independent of the migrator.
+      const migrated = config.validateCurrent(result);
+      // Atomic write-back of the validated, migrated file.
+      await writeJsonAtomic(config.path, migrated);
+      return migrated;
+    } catch (err) {
+      // Any failure in the <current branch: the original file is untouched (the
+      // write-back is the last step and did not complete) and the pre-migration
+      // backup exists. Surface a typed error rather than crashing the read.
+      if (isStorageCorruptError(err) || isStorageNewerVersionError(err)) {
+        throw err;
+      }
+      throw new StorageMigrationError(config.fileName, version, this.current, err);
+    }
   }
 
   // --- Subscriptions ---------------------------------------------------------
 
   async readSubscriptions(): Promise<Subscription[]> {
-    await this.ensureTree();
-    const result = await safeReadJson(
-      this.subscriptionsPath,
-      (data) => subscriptionsFileSchema.parse(data),
-    );
-
-    if (result.ok) {
-      return result.value.subscriptions;
-    }
-    if (result.reason === "missing") {
-      // Lazily create with valid defaults and return them (Req 1.5, 19.3).
-      const defaults = this.defaultSubscriptionsFile();
-      await writeJsonAtomic(this.subscriptionsPath, defaults);
-      return defaults.subscriptions;
-    }
-    // malformed/corrupt: do not overwrite; surface a restorable error (Req 19.1, 19.2).
-    const canRestore = (await this.listBackups()).length > 0;
-    throw new StorageCorruptError(
-      fileNames.subscriptions,
-      result.reason,
-      canRestore,
-    );
+    const file = await this.readVersioned<SubscriptionsFile>({
+      path: this.subscriptionsPath,
+      fileName: fileNames.subscriptions,
+      // At the current version the live app validates with the v1 schema; a
+      // `current = 2` adapter (tests / Epic 3) validates with the v2 schema.
+      validateCurrent: (data) =>
+        this.current >= 2
+          ? (subscriptionsFileV2Schema.parse(data) as unknown as SubscriptionsFile)
+          : subscriptionsFileSchema.parse(data),
+      buildDefaults: () => this.defaultSubscriptionsFile(),
+      migrateFile: (data, fromVersion) =>
+        migrate(
+          data as unknown as SubscriptionsFile,
+          fromVersion,
+        ) as unknown as SubscriptionsFile,
+      // Pre-migration backup of the RAW v1 file (AD-16). `assembleBackupPayload`
+      // preserves the file's own `version`, so the backup is a faithful v1
+      // snapshot — never a re-migrated one.
+      preMigrationBackup: async (raw) => {
+        await this.writeBackupPayload(
+          assembleBackupPayload(raw as unknown as SubscriptionsFile),
+        );
+      },
+      canRestoreBackup: async () => (await this.listBackups()).length > 0,
+    });
+    return file.subscriptions;
   }
 
   async writeSubscriptions(subs: Subscription[]): Promise<void> {
     await this.ensureTree();
+    // Stamp the adapter's own `current` — the single version source the read
+    // gate and the default-builders also use — so flipping CURRENT_VERSION (or
+    // injecting a different `current`) is a genuine one-source change and a
+    // write-then-read round-trips at that version with no spurious re-migrate.
     const file: SubscriptionsFile = {
-      version: FILE_SCHEMA_VERSION,
+      version: this.current,
       subscriptions: subs,
     };
     await writeJsonAtomic(this.subscriptionsPath, file);
@@ -222,29 +496,31 @@ export class JsonFileStorage implements StoragePort {
   // --- Settings --------------------------------------------------------------
 
   async readSettings(): Promise<Settings> {
-    await this.ensureTree();
-    const result = await safeReadJson(
-      this.settingsPath,
-      (data) => settingsFileSchema.parse(data),
-    );
-
-    if (result.ok) {
-      // SettingsFile structurally satisfies Settings (extra `version` is benign
-      // and is rewritten on the next write).
-      return result.value;
-    }
-    if (result.reason === "missing") {
-      const defaults = this.defaultSettingsFile();
-      await writeJsonAtomic(this.settingsPath, defaults);
-      return defaults;
-    }
-    // No settings backup stream exists, so a restore cannot recover settings.
-    throw new StorageCorruptError(fileNames.settings, result.reason, false);
+    // SettingsFile structurally satisfies Settings (the extra `version` is
+    // benign and rewritten on the next write).
+    const file = await this.readVersioned<SettingsFile>({
+      path: this.settingsPath,
+      fileName: fileNames.settings,
+      validateCurrent: (data) =>
+        this.current >= 2
+          ? (settingsFileV2Schema.parse(data) as unknown as SettingsFile)
+          : settingsFileSchema.parse(data),
+      buildDefaults: () => this.defaultSettingsFile(),
+      migrateFile: (data, fromVersion) =>
+        migrate(
+          data as unknown as SettingsFile,
+          fromVersion,
+        ) as unknown as SettingsFile,
+      // Settings has no backup stream, so no pre-migration backup is taken and a
+      // corrupt classification is never restorable (reset-to-defaults instead).
+      canRestoreBackup: async () => false,
+    });
+    return file;
   }
 
   async writeSettings(settings: Settings): Promise<void> {
     await this.ensureTree();
-    const file = { version: FILE_SCHEMA_VERSION, ...settings };
+    const file = { version: this.current, ...settings };
     await writeJsonAtomic(this.settingsPath, file);
   }
 
@@ -270,7 +546,7 @@ export class JsonFileStorage implements StoragePort {
 
   async writeCategories(categories: Category[]): Promise<void> {
     await this.ensureTree();
-    const file = { version: FILE_SCHEMA_VERSION, categories };
+    const file = { version: this.current, categories };
     await writeJsonAtomic(this.categoriesPath, file);
   }
 
@@ -287,7 +563,20 @@ export class JsonFileStorage implements StoragePort {
   async createBackup(_reason: string): Promise<string> {
     await this.ensureTree();
     const subs = await this.readSubscriptions();
-    const payload = assembleBackupPayload(subs);
+    return this.writeBackupPayload(assembleBackupPayload(subs));
+  }
+
+  /**
+   * Write an already-assembled backup payload to `backup/<name>.json` and return
+   * the name (Req 18.1). The single low-level backup-write seam, shared by
+   * {@link createBackup} and the migrate-before-validate pre-migration backup
+   * (AD-16). Separating this from {@link createBackup} is what lets the
+   * pre-migration path back up the **raw pre-migration file** directly instead
+   * of re-reading subscriptions through the version-gated path — re-reading
+   * mid-migration would re-enter the migrate branch and recurse.
+   */
+  private async writeBackupPayload(payload: SubscriptionsFile): Promise<string> {
+    await this.ensureTree();
     const name = backupFileName(new Date());
     await writeJsonAtomic(join(this.backupDir, name), payload);
     return name;

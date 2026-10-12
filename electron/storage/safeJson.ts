@@ -36,6 +36,28 @@ export type SafeReadResult<T> =
   | { ok: true; value: T }
   | { ok: false; reason: "missing" | "malformed" | "corrupt"; raw?: string };
 
+/**
+ * Result of a version-aware safe read (AD-15). On success it carries the
+ * **parsed-but-not-yet-schema-validated** JSON object together with its detected
+ * on-disk `version`, deferring the choice of which schema to validate against to
+ * the caller — the migrate-before-validate read path (Story 1.4) needs the
+ * version *before* it can pick a schema. On failure it carries the same
+ * machine-readable reason as {@link SafeReadResult}.
+ *
+ *   - `missing`   : the file does not exist (ENOENT).
+ *   - `malformed` : not valid JSON, unreadable, not a JSON object, or missing a
+ *                   usable integer `version` field. A versioned data file that
+ *                   carries no detectable version cannot be gated and is treated
+ *                   as unreadable rather than silently assumed to be any version.
+ *
+ * There is no `corrupt` reason here: schema validation (the only thing that can
+ * yield `corrupt`) is deliberately deferred to the caller, which runs it against
+ * the version-appropriate schema and raises its own typed error.
+ */
+export type SafeReadVersionedResult =
+  | { ok: true; value: Record<string, unknown>; version: number }
+  | { ok: false; reason: "missing" | "malformed"; raw?: string };
+
 /** Node error shape with an errno `code` (e.g. `ENOENT`). */
 function isErrnoException(err: unknown): err is NodeJS.ErrnoException {
   return (
@@ -88,6 +110,68 @@ export async function safeReadJson<T>(
   } catch {
     return { ok: false, reason: "corrupt", raw };
   }
+}
+
+/**
+ * Read a JSON file and detect its on-disk `version` **without** validating it
+ * against any particular schema (AD-15). This is the version-detection seam the
+ * migrate-before-validate read path needs: it must know a file's version before
+ * it can decide whether to migrate, validate at the current version, or refuse a
+ * newer file — so schema choice is deferred to the caller.
+ *
+ * Like {@link safeReadJson}, this never throws; it classifies failures. The
+ * only reasons returned are `missing` (ENOENT) and `malformed` (unreadable, not
+ * valid JSON, not a JSON object, or carrying no usable integer `version`). It
+ * never returns `corrupt`: schema validation — the sole source of `corrupt` — is
+ * the caller's responsibility, run against the version-appropriate schema.
+ *
+ * @param file Absolute path to the JSON file.
+ * @returns A {@link SafeReadVersionedResult}:
+ *   - `{ ok: true, value, version }`               parsed object + its detected `version`,
+ *   - `{ ok: false, reason: "missing" }`           the file does not exist,
+ *   - `{ ok: false, reason: "malformed", raw }`    unreadable / not JSON / not an
+ *                                                  object / no integer `version`.
+ */
+export async function safeReadVersionedJson(
+  file: string,
+): Promise<SafeReadVersionedResult> {
+  let raw: string;
+  try {
+    raw = await readFile(file, "utf8");
+  } catch (err) {
+    if (isErrnoException(err) && err.code === "ENOENT") {
+      return { ok: false, reason: "missing" };
+    }
+    return { ok: false, reason: "malformed" };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { ok: false, reason: "malformed", raw };
+  }
+
+  // A versioned data file must be a JSON object carrying a non-negative integer
+  // `version`. Anything else (array, primitive, null, or a missing/non-integer
+  // version) cannot be version-gated, so it is treated as unreadable rather than
+  // silently assumed to be any particular version. Schema validation at the
+  // target version still runs afterwards in the caller and will reject other
+  // shape problems as `corrupt`.
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed)
+  ) {
+    return { ok: false, reason: "malformed", raw };
+  }
+  const obj = parsed as Record<string, unknown>;
+  const version = obj.version;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 0) {
+    return { ok: false, reason: "malformed", raw };
+  }
+
+  return { ok: true, value: obj, version };
 }
 
 /**
