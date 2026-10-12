@@ -63,7 +63,7 @@ import { extname } from "node:path";
 
 import { dialog, type BrowserWindow, type FileFilter } from "electron";
 
-import type { AppServices, DataFormat } from "../appWiring";
+import { SYNCED_FOLDER_CAVEAT, type AppServices, type DataFormat } from "../appWiring";
 import type { ImportOutcome } from "core/import";
 import type { Settings } from "core/models/settings";
 import type { ConflictMode } from "shared/types";
@@ -174,7 +174,19 @@ export type DialogServices = Pick<
 /** Result of {@link runChooseDataFolder}. */
 export type ChooseDataFolderResult =
   | { cancelled: true }
-  | { cancelled: false; path: string; settings: Settings };
+  | {
+      cancelled: false;
+      path: string;
+      settings: Settings;
+      /**
+       * The single-machine synced-folder caveat (AD-31, Story 1.7). Always
+       * carried on a successful folder choice so the IPC/UI layer can surface it
+       * — it is NOT hidden. It is a documented stance string, not multi-device
+       * sync advertising; whether to show it per-selection or once is Epic-3/5 UI
+       * territory, so the string is simply made available here.
+       */
+      caveat: string;
+    };
 
 /** Result of {@link runImportFromDialog}. */
 export type ImportFromDialogResult =
@@ -192,8 +204,9 @@ export type ExportToDialogResult =
  * {@link AppServices.setDataFolder} so subsequent file operations use the new
  * location (Req 15.3).
  *
- * @returns `{ cancelled: true }` when dismissed; otherwise the chosen `path`
- *          and the merged {@link Settings} after the switch.
+ * @returns `{ cancelled: true }` when dismissed; otherwise the chosen `path`,
+ *          the merged {@link Settings} after the switch, and the single-machine
+ *          synced-folder caveat string (AD-31) so the UI can surface it.
  */
 export async function runChooseDataFolder(
   window: BrowserWindow,
@@ -202,7 +215,11 @@ export async function runChooseDataFolder(
   const path = await chooseDataFolder(window);
   if (path === null) return { cancelled: true };
   const settings = await services.setDataFolder(path);
-  return { cancelled: false, path, settings };
+  // Surface the single-machine synced-folder caveat (AD-31) alongside the switch
+  // — never hidden. Keeping it a plain string here (no renderer work) keeps this
+  // module to the stance/notice contract; the Settings UI (Epic 3/5) decides how
+  // to present it.
+  return { cancelled: false, path, settings, caveat: SYNCED_FOLDER_CAVEAT };
 }
 
 /** Options for {@link runImportFromDialog}. */

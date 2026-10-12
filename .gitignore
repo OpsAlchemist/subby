@@ -164,3 +164,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Misc
+.claude/
+_bmad*/
+AGENTS.MD
