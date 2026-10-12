@@ -21,6 +21,10 @@ No account. No bank linking. No cloud. Your subscriptions, your real monthly and
 
 **[Download](https://github.com/OpsAlchemist/subby/releases/latest) · [Documentation](./docs/README.md) · [Report a bug](https://github.com/OpsAlchemist/subby/issues) · [Request a feature](https://github.com/OpsAlchemist/subby/issues)**
 
+<br />
+
+<img src="./docs/images/dashboard.png" alt="Subby dashboard — monthly and yearly spend, renewing soon, and category breakdown" width="100%" />
+
 </div>
 
 ---
@@ -45,6 +49,18 @@ Subby owns that gap. It does well the things the incumbents do badly: reliable n
 - **Theming and accessibility** — dark / light / system themes, a configurable accent, keyboard navigation, ARIA labels, chart text alternatives, high-contrast, and OS font scaling.
 
 > **In active development (1.0 revamp).** A brand-new UI, honest multi-currency (native + home currency with converted totals), free-trial tracking with pre-charge alerts, price history, and an opt-in online-enrichment surface (brand logos, FX refresh) — all private-by-default, each disclosing exactly what, if anything, leaves your device. See [`_bmad-output/planning-artifacts`](./_bmad-output/planning-artifacts) for the PRD, UX, and architecture.
+
+## Preview
+
+Design mockups of the 1.0 "Warm Graphite" interface (in progress — not yet the shipping beta UI).
+
+| Subscription list | Add / edit |
+| --- | --- |
+| [<img src="./docs/images/subscription-list.png" alt="Subscription list with search, filters, and inline quick-edit" width="100%" />](./docs/images/subscription-list.png) | [<img src="./docs/images/add-edit-modal.png" alt="Add / edit subscription modal with trial fields" width="100%" />](./docs/images/add-edit-modal.png) |
+
+| Settings — Online Features (opt-in) |
+| --- |
+| [<img src="./docs/images/settings-online.png" alt="Settings showing the opt-in Online Features surface, all off by default" width="100%" />](./docs/images/settings-online.png) |
 
 ## Privacy
 
