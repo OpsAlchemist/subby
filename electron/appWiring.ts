@@ -29,9 +29,31 @@ import type { StoragePort } from "core/ports/storagePort";
 import type { ConflictMode, SubscriptionInput } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
+import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
+
+/**
+ * The synced-folder caveat surfaced to the user when a data folder lives in a
+ * cloud-synced location (AD-31, Story 1.7).
+ *
+ * Subby's data folder may be relocated into an iCloud / Dropbox / Drive folder,
+ * but Subby does NOT provide real multi-device sync. The stance is
+ * **single-machine-at-a-time**: a synced folder is safe only when one machine
+ * writes to it at a time, and two machines running Subby against the same synced
+ * folder concurrently can corrupt or lose data mid-sync. This string is the
+ * canonical copy of that stance — exported so the Settings / data-folder surface
+ * (UI copy is Epic-3/5 territory) can present it rather than hiding it. It is a
+ * documented stance, not advertised as blessed multi-device sync.
+ */
+export const SYNCED_FOLDER_CAVEAT =
+  "Storing your data folder in a cloud-synced location (iCloud, Dropbox, Google " +
+  "Drive, OneDrive) is supported for a single machine at a time. Subby does not " +
+  "provide multi-device sync: running Subby on two machines against the same " +
+  "synced folder at once can lose or corrupt data mid-sync. If a file is " +
+  "temporarily unavailable while syncing, Subby will ask you to retry or restore " +
+  "from a backup rather than overwrite it with empty data.";
 
 /**
  * The mutable user-data files that get an independent serialized write
@@ -419,12 +441,25 @@ export function buildAppServices(storage: StoragePort): AppServices {
  *                        (`app.getPath('userData')`).
  * @param dataFolder      Optional initial data-folder override from
  *                        `settings.dataFolder` (Req 15.3).
+ * @param isCloudPath     The cloud-path detection predicate behind the AD-31
+ *                        safe-read guardrail (Story 1.7). **Defaults to the safe
+ *                        no-op {@link defaultIsCloudPath}** (`() => false`), so
+ *                        production is byte-identical to before this story — the
+ *                        guardrail is dormant until PRD Q7 supplies a real per-OS
+ *                        detector behind this same seam. Threaded here so the
+ *                        swap is a one-argument change with no structural edit.
  */
 export function createAppContext(
   defaultUserData: string,
   dataFolder: string | null = null,
+  isCloudPath: CloudPathPredicate = defaultIsCloudPath,
 ): AppContext {
-  const storage = new JsonFileStorage(defaultUserData, dataFolder);
+  const storage = new JsonFileStorage(
+    defaultUserData,
+    dataFolder,
+    undefined,
+    isCloudPath,
+  );
   const services = buildAppServices(storage);
   return { storage, services };
 }

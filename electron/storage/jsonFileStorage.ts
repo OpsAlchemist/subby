@@ -50,7 +50,12 @@ import type {
 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
 
-import { fileNames, resolveDataDir } from "./paths";
+import {
+  defaultIsCloudPath,
+  fileNames,
+  resolveDataDir,
+  type CloudPathPredicate,
+} from "./paths";
 import {
   isFileExistsError,
   safeReadJson,
@@ -123,6 +128,73 @@ export function isStorageCorruptError(
     typeof err === "object" &&
     err !== null &&
     (err as { isStorageCorruptError?: unknown }).isStorageCorruptError === true
+  );
+}
+
+/**
+ * Typed, **recoverable** error thrown when a data file is missing *and* the
+ * active data folder is a synced cloud path *and* there is evidence that real
+ * data exists (a backup, or another data file is present) — the cloud-folder
+ * safe-read guardrail (AD-31, Story 1.7).
+ *
+ * The scenario this exists to catch: the data folder is an iCloud / Dropbox /
+ * Drive directory and one file (e.g. `subscriptions.json`) is *transiently*
+ * absent mid-sync — the cloud client has not yet materialized it locally. The
+ * ordinary recreate-on-missing behavior would silently stamp an empty-defaults
+ * file over the gap and, when the sync completes, the user's real data is gone.
+ * Instead the adapter refuses to recreate and surfaces THIS error so the IPC/UI
+ * layer can offer **retry** (wait for sync) or **restore** (from a backup) rather
+ * than establishing empty data.
+ *
+ * It is intentionally distinct from {@link StorageCorruptError}: the file is not
+ * corrupt, it is *transiently gone*, and the recommended action is retry-then-
+ * restore, not reset-to-defaults. It still carries `canRestoreBackup` in the same
+ * shape so the existing IPC → `AppError` mapping can treat it uniformly.
+ *
+ *   - `file`             — the affected file name (e.g. `subscriptions.json`).
+ *   - `dataDir`          — the active (cloud) data directory it was read from.
+ *   - `canRestoreBackup` — `true` when a backup is available to restore from.
+ *   - `recoverable`      — always `true`; a marker that retry is a valid action
+ *                          (the absence may be transient), distinguishing this
+ *                          from a hard corruption.
+ */
+export class StorageTransientMissingError extends Error {
+  /** Discriminator so non-`instanceof` consumers can still detect this error. */
+  readonly isStorageTransientMissingError = true as const;
+  /** Always true: a transiently-missing file may reappear, so retry is valid. */
+  readonly recoverable = true as const;
+  readonly file: string;
+  readonly dataDir: string;
+  readonly canRestoreBackup: boolean;
+
+  constructor(file: string, dataDir: string, canRestoreBackup: boolean) {
+    super(
+      // The absolute `dataDir` is intentionally kept OUT of the human-readable
+      // message (it would leak an absolute path + OS username into UI/logs,
+      // inconsistent with StorageCorruptError's bare-filename message). It is
+      // retained as a field below for structured logging only.
+      `Data file "${file}" is missing from the synced cloud folder. ` +
+        "It may be mid-sync; it was NOT recreated with empty defaults. " +
+        (canRestoreBackup
+          ? "Retry once sync completes, or restore from a backup."
+          : "Retry once sync completes."),
+    );
+    this.name = "StorageTransientMissingError";
+    this.file = file;
+    this.dataDir = dataDir;
+    this.canRestoreBackup = canRestoreBackup;
+  }
+}
+
+/** Type guard for {@link StorageTransientMissingError} across module boundaries. */
+export function isStorageTransientMissingError(
+  err: unknown,
+): err is StorageTransientMissingError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { isStorageTransientMissingError?: unknown })
+      .isStorageTransientMissingError === true
   );
 }
 
@@ -237,6 +309,21 @@ export class JsonFileStorage implements StoragePort {
   private readonly current: number;
 
   /**
+   * The cloud-path predicate behind the AD-31 safe-read guardrail (Story 1.7).
+   * It is consulted on a `missing` read: when `isCloudPath(this.dataDir)` is true
+   * AND there is evidence of real data to protect, the adapter does NOT recreate
+   * the file with empty defaults — it surfaces a {@link StorageTransientMissingError}
+   * so the UI can offer retry/restore instead of silently establishing empty data.
+   *
+   * Injected like {@link current}, it **defaults to {@link defaultIsCloudPath}**
+   * (`() => false`), so production is byte-identical to before this story — the
+   * guardrail is dormant until PRD Q7 supplies a real per-OS detector behind this
+   * exact seam. Tests drive it directly (true/false) to exercise the matrix. It
+   * is a pure string predicate: no wall-clock, no network, no filesystem probe.
+   */
+  private readonly isCloudPath: CloudPathPredicate;
+
+  /**
    * @param defaultUserData The platform `userData` directory (typically
    *                        `app.getPath('userData')`). Used whenever no data
    *                        folder override is configured (Req 1.1).
@@ -248,15 +335,23 @@ export class JsonFileStorage implements StoragePort {
    *                        (1 in Epic 1). Injectable so tests can drive the
    *                        migrate/refuse branches at `current = 2` without
    *                        touching the live constant.
+   * @param isCloudPath     The cloud-path detection predicate behind the AD-31
+   *                        guardrail. Defaults to {@link defaultIsCloudPath}
+   *                        (`() => false`), keeping the guardrail dormant and
+   *                        production behavior unchanged until PRD Q7 supplies a
+   *                        real detector. Injectable so tests drive the guardrail
+   *                        directly without a real detection heuristic.
    */
   constructor(
     defaultUserData: string,
     dataFolder: string | null = null,
     current: number = CURRENT_VERSION,
+    isCloudPath: CloudPathPredicate = defaultIsCloudPath,
   ) {
     this.defaultUserData = defaultUserData;
     this.dataFolder = dataFolder;
     this.current = current;
+    this.isCloudPath = isCloudPath;
   }
 
   // --- Path helpers ----------------------------------------------------------
@@ -315,14 +410,162 @@ export class JsonFileStorage implements StoragePort {
     return { version: this.current, categories };
   }
 
+  // --- Cloud-path guardrail (AD-31) ------------------------------------------
+
+  /**
+   * Decide whether a `missing` file in the active data folder is a **transient
+   * loss worth guarding** (there is evidence of real data to protect) versus a
+   * **pristine folder** that should be allowed to initialize (AD-31, Story 1.7).
+   *
+   * This is the conservative transient-vs-pristine heuristic the spec mandates:
+   * guard ONLY when there is positive evidence that real data exists, so a
+   * genuine first-run in a cloud folder is never bricked. It returns `true`
+   * (→ transient, guard) when EITHER
+   *   - at least one backup exists in `backup/` (a backup is only ever written by
+   *     a destructive/scheduled op on real data — it never appears during a
+   *     pristine first-run), OR
+   *   - a *sibling* record file (`subscriptions.json` or `categories.json`),
+   *     other than the one being read, exists **and holds at least one record**.
+   * Otherwise the folder has no backups and no populated record file, so the
+   * vanished file is treated as a pristine first-run (→ `false`, allow init).
+   *
+   * **Why "populated record file", not "any sibling present":** first-run
+   * initialization recreates the three data files one at a time, so after the
+   * first is written the folder is no longer strictly empty. A naive "a sibling
+   * file exists" check would make the *second* file's init look like a transient
+   * loss and brick first-run. Keying on a non-empty record LIST sidesteps this:
+   * a just-recreated `subscriptions.json`/`categories.json` holds an **empty**
+   * list, and the default `settings.json` — though full of default keys — is
+   * deliberately NOT consulted (it always has content, so it cannot discriminate
+   * pristine-init from real data). An established user who lost a file mid-sync
+   * will have backups and/or populated record files; a pristine first-run has
+   * neither.
+   *
+   * The bias is deliberate (favor NOT destroying data): a record file that is
+   * present but **unparseable / unreadable** is ambiguous, and ambiguity is
+   * treated as evidence (it is on disk — possibly a mid-sync artifact of real
+   * data — so it is not a pristine-folder signal) rather than waved through to an
+   * empty-recreate. A false "transient" only costs the user a retry/restore
+   * prompt; a false "pristine" silently loses data.
+   *
+   * @param missingFileName The file that came back `missing` — excluded from the
+   *                        sibling scan so its own absence does not count.
+   */
+  private async hasEvidenceOfRealData(
+    missingFileName: string,
+  ): Promise<boolean> {
+    // Evidence #1: any backup present. Backups never exist on a pristine
+    // first-run, so a single backup is unambiguous evidence of real prior data.
+    if ((await this.listBackups()).length > 0) {
+      return true;
+    }
+    // Evidence #2: any OTHER record file (subscriptions/categories) that holds at
+    // least one record. `settings.json` is intentionally excluded — its default
+    // form is non-empty, so it cannot distinguish pristine-init from real data.
+    const recordFiles = [fileNames.subscriptions, fileNames.categories].filter(
+      (name) => name !== missingFileName,
+    );
+    for (const name of recordFiles) {
+      if (await this.recordFileIsPopulated(name)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Read a sibling record file and decide whether it holds **at least one
+   * record** (AD-31 evidence check) versus being absent or a freshly-stamped
+   * empty-defaults file written moments ago by first-run init.
+   *
+   * Returns `false` for an absent file and for a file whose record list is empty.
+   * Returns `true` for a populated list. A present-but-unreadable/unparseable
+   * file is treated as `true` (ambiguous → favor guarding, per the conservative
+   * bias): it is on disk, so it is not a pristine-folder signal.
+   */
+  private async recordFileIsPopulated(fileName: string): Promise<boolean> {
+    const result = await safeReadJson<unknown>(
+      join(this.dataDir, fileName),
+      (data) => data,
+    );
+    if (!result.ok) {
+      // `missing` → no evidence from this sibling. `malformed` (present but not
+      // valid JSON / unreadable) → ambiguous, treat as evidence (not pristine).
+      return result.reason !== "missing";
+    }
+    const value = result.value;
+    if (typeof value !== "object" || value === null) {
+      return true; // present with an odd shape → ambiguous → evidence.
+    }
+    const obj = value as Record<string, unknown>;
+    const list = Array.isArray(obj.subscriptions)
+      ? obj.subscriptions
+      : Array.isArray(obj.categories)
+        ? obj.categories
+        : null;
+    if (list === null) {
+      // Present record file with neither list key → odd shape → evidence.
+      return true;
+    }
+    return list.length > 0;
+  }
+
+  /**
+   * The single source of the AD-31 guardrail rule (Story 1.7), called by every
+   * recreate-on-missing site so the rule lives in exactly one place.
+   *
+   * When the active data folder is a synced cloud path AND there is evidence of
+   * real data to protect, a `missing` read is a MID-SYNC transient loss: this
+   * throws {@link StorageTransientMissingError} so the caller does NOT recreate
+   * the file with empty defaults (which would clobber the user's real data once
+   * sync completes). Otherwise it returns normally and the caller proceeds with
+   * ordinary recreate-on-missing.
+   *
+   * **`settings.json` is exempt and never reaches this helper** — see the call
+   * sites. Settings has no backup stream, so a guarded (retry-only) settings loss
+   * could never self-heal; it must always recreate-on-missing. Only files with a
+   * recovery path (subscriptions: restore-from-backup; categories: reset) are
+   * guarded.
+   *
+   * Inert under the default `isCloudPath` predicate (`() => false`): the first
+   * clause short-circuits, `hasEvidenceOfRealData` is never called, and behavior
+   * is byte-identical to before this story.
+   *
+   * @param fileName         The file that came back `missing`.
+   * @param canRestoreBackup Whether a backup is available to restore from —
+   *                         carried onto the error so the UI can offer restore.
+   */
+  private async guardTransientMissingInCloud(
+    fileName: string,
+    canRestoreBackup: boolean,
+  ): Promise<void> {
+    if (
+      this.isCloudPath(this.dataDir) &&
+      (await this.hasEvidenceOfRealData(fileName))
+    ) {
+      throw new StorageTransientMissingError(
+        fileName,
+        this.dataDir,
+        canRestoreBackup,
+      );
+    }
+  }
+
   // --- Version-gated read path (AD-15) ---------------------------------------
 
   /**
    * The migrate-before-validate read path (AD-15 / FR-29) for a versioned data
    * file, parameterized per file. It detects the on-disk `version` and branches:
    *
-   *   - `missing`      → recreate defaults at `current` and return them (the
-   *                      existing recreate-on-missing behavior; Req 1.5, 19.3).
+   *   - `missing`      → normally recreate defaults at `current` and return them
+   *                      (the existing recreate-on-missing behavior; Req 1.5,
+   *                      19.3). **AD-31 cloud guardrail (Story 1.7):** when the
+   *                      active data folder is a cloud path AND there is evidence
+   *                      of real data (a backup, or a sibling data file), the file
+   *                      is treated as *transiently* missing mid-sync and is NOT
+   *                      recreated-empty — a {@link StorageTransientMissingError}
+   *                      is surfaced instead. A pristine cloud folder (no data, no
+   *                      backups) still initializes normally.
    *   - `< current`    → take a **pre-migration backup** (AD-16, before any
    *                      write-back), run the pure `core/migrations.migrate`,
    *                      **validate** the result against the current-version
@@ -365,6 +608,13 @@ export class JsonFileStorage implements StoragePort {
     preMigrationBackup?: (raw: Record<string, unknown>) => Promise<void>;
     /** Resolve `canRestoreBackup` for a corrupt/malformed classification. */
     canRestoreBackup: () => Promise<boolean>;
+    /**
+     * Apply the AD-31 cloud guardrail to a `missing` read of this file (Story
+     * 1.7). Set only for files with a recovery path (subscriptions). Omitted/
+     * `false` for settings so it always recreate-on-missing — a guarded settings
+     * loss (no backup stream) would be an unrecoverable retry-only dead-end.
+     */
+    guardMissingInCloud?: boolean;
   }): Promise<TCurrent> {
     await this.ensureTree();
 
@@ -372,6 +622,18 @@ export class JsonFileStorage implements StoragePort {
 
     if (!detected.ok) {
       if (detected.reason === "missing") {
+        // AD-31 cloud guardrail (Story 1.7), applied via the single shared rule.
+        // Only files flagged `guardMissingInCloud` (those with a recovery path,
+        // e.g. subscriptions) are guarded; settings opts OUT so it can always
+        // recreate-on-missing (it has no backup stream to recover from). A
+        // PRISTINE cloud folder still falls through to normal init. Inert under
+        // the default `() => false` predicate.
+        if (config.guardMissingInCloud === true) {
+          await this.guardTransientMissingInCloud(
+            config.fileName,
+            await config.canRestoreBackup(),
+          );
+        }
         // Recreate-on-missing (Req 1.5, 19.3). Guard the write: a disk error
         // here must surface as a typed storage error, not crash a read that must
         // never throw (Req 19). "malformed" is the least-surprising mapping — the
@@ -478,6 +740,9 @@ export class JsonFileStorage implements StoragePort {
         );
       },
       canRestoreBackup: async () => (await this.listBackups()).length > 0,
+      // AD-31 cloud guardrail applies to subscriptions: it has a recovery path
+      // (restore-from-backup), so a mid-sync transient loss is recoverable.
+      guardMissingInCloud: true,
     });
     return file.subscriptions;
   }
@@ -539,6 +804,10 @@ export class JsonFileStorage implements StoragePort {
       return result.value.categories;
     }
     if (result.reason === "missing") {
+      // AD-31 cloud guardrail (Story 1.7) via the single shared rule. Categories
+      // has no backup stream, so `canRestoreBackup` is false (retry/reset is the
+      // recovery). Inert under the default `() => false` predicate.
+      await this.guardTransientMissingInCloud(fileNames.categories, false);
       const defaults = this.defaultCategoriesFile();
       await writeJsonAtomic(this.categoriesPath, defaults);
       return defaults.categories;
