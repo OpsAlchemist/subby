@@ -52,9 +52,11 @@ import type { StoragePort } from "core/ports/storagePort";
 
 import { fileNames, resolveDataDir } from "./paths";
 import {
+  isFileExistsError,
   safeReadJson,
   safeReadVersionedJson,
   writeJsonAtomic,
+  writeJsonExclusive,
 } from "./safeJson";
 
 /**
@@ -553,8 +555,8 @@ export class JsonFileStorage implements StoragePort {
   // --- Backups (Req 18.1, 18.2) ----------------------------------------------
 
   /**
-   * Write the current subscriptions to `backup/<YYYY-MM-DD-HH-MM>.json` and
-   * return the backup file name (Req 18.1).
+   * Write the current subscriptions to a collision-proof backup file and return
+   * its name (Req 18.1, AD-16).
    *
    * The `reason` argument is part of the port contract for caller intent
    * (e.g. "pre-delete", "pre-import", "pre-restore"); it is not currently
@@ -567,19 +569,77 @@ export class JsonFileStorage implements StoragePort {
   }
 
   /**
-   * Write an already-assembled backup payload to `backup/<name>.json` and return
-   * the name (Req 18.1). The single low-level backup-write seam, shared by
-   * {@link createBackup} and the migrate-before-validate pre-migration backup
-   * (AD-16). Separating this from {@link createBackup} is what lets the
-   * pre-migration path back up the **raw pre-migration file** directly instead
-   * of re-reading subscriptions through the version-gated path — re-reading
-   * mid-migration would re-enter the migrate branch and recurse.
+   * Write an already-assembled backup payload to a **collision-proof,
+   * never-overwrite** backup file and return the name (Req 18.1, AD-16). The
+   * single low-level backup-write seam, shared by {@link createBackup} and the
+   * migrate-before-validate pre-migration backup (Story 1.4). Separating this
+   * from {@link createBackup} is what lets the pre-migration path back up the
+   * **raw pre-migration file** directly instead of re-reading subscriptions
+   * through the version-gated path — re-reading mid-migration would re-enter the
+   * migrate branch and recurse.
+   *
+   * Collision-proof + never-overwrite (AD-16): the adapter is the one place that
+   * reads the real clock and the monotonic counter (keeping the pure
+   * `core/backupFileName` free of `Date.now()`/entropy per AD-1). It stamps the
+   * name with `new Date()` plus an injected, ever-increasing `seq`, so two
+   * backups taken in the same clock-minute — even the same millisecond — get
+   * distinct, prefix-sortable names. The pre-migration safety backup from Story
+   * 1.4 can therefore never be clobbered by a same-minute scheduled or
+   * pre-destructive backup. On top of the unique name, the write uses an
+   * **exclusive** placement ({@link writeJsonExclusive}): if the resolved path
+   * somehow already exists, it bumps `seq` and retries rather than overwriting;
+   * only after exhausting a bounded number of attempts does it fail loudly —
+   * never a silent clobber.
+   *
+   * The disambiguating `seq` is **loop-local** and reset per captured instant: it
+   * starts at 0 for each `writeBackupPayload` call and only needs to distinguish
+   * backups that resolve to the *same* `now` millisecond (the retry path). It is
+   * never an accumulating instance counter — that would eventually exceed the
+   * 4-digit `seq` segment (`...-9999.json` vs `...-10000.json` sorts WRONG because
+   * `'1' < '9'`). Scoping `seq` to a single same-instant burst keeps the segment
+   * width-stable (≤ `MAX_ATTEMPTS` ≪ 10000) and sort-correct.
    */
   private async writeBackupPayload(payload: SubscriptionsFile): Promise<string> {
     await this.ensureTree();
-    const name = backupFileName(new Date());
-    await writeJsonAtomic(join(this.backupDir, name), payload);
-    return name;
+
+    // Read the clock once per backup; sub-minute precision (seconds + millis)
+    // disambiguates across milliseconds, and the loop-local `seq` disambiguates
+    // within one millisecond.
+    const now = new Date();
+
+    // A small retry budget: in practice the first attempt always succeeds. The
+    // loop only matters when a resolved name is somehow already on disk (a
+    // pre-existing file). `seq` resets to 0 here and increments only on a
+    // collision, so it stays well under the 4-digit cap (10000) and the name
+    // segment never widens. Bounding the loop keeps a never-overwrite failure
+    // *loud* instead of spinning forever.
+    const MAX_ATTEMPTS = 1000;
+    let lastName = "";
+    for (let seq = 0; seq < MAX_ATTEMPTS; seq += 1) {
+      const name = backupFileName(now, { seq });
+      lastName = name;
+      try {
+        await writeJsonExclusive(join(this.backupDir, name), payload);
+        return name;
+      } catch (err) {
+        // The resolved name already existed: bump `seq` (loop increment) and
+        // retry with a fresh name. Any other write error is a genuine I/O fault
+        // and propagates.
+        if (isFileExistsError(err)) {
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    // Exhausted the retry budget without finding a free name: fail loudly rather
+    // than overwrite an existing backup (AD-16 "never silently clobber"). Name
+    // the directory and the last attempted file so the failure is diagnostic.
+    throw new Error(
+      `Could not write a collision-free backup in "${this.backupDir}" after ` +
+        `${MAX_ATTEMPTS} attempts (last tried "${lastName}", seq ` +
+        `${MAX_ATTEMPTS - 1}); the backup directory may be in an unexpected state.`,
+    );
   }
 
   /**

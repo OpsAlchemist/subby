@@ -204,3 +204,70 @@ export async function writeJsonAtomic(file: string, data: unknown): Promise<void
     throw err;
   }
 }
+
+/**
+ * Error thrown by {@link writeJsonExclusive} when the target path already exists
+ * (AD-16). The never-overwrite backup writer uses this to resolve a fresh name
+ * (bump the uniqueness suffix) rather than silently clobbering an existing
+ * backup — and to fail *loudly* if a fresh name can never be found.
+ */
+export class FileExistsError extends Error {
+  readonly isFileExistsError = true as const;
+  readonly file: string;
+
+  constructor(file: string) {
+    super(`Refusing to overwrite existing file: ${file}`);
+    this.name = "FileExistsError";
+    this.file = file;
+  }
+}
+
+/** Type guard for {@link FileExistsError}. */
+export function isFileExistsError(err: unknown): err is FileExistsError {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { isFileExistsError?: unknown }).isFileExistsError === true
+  );
+}
+
+/**
+ * Write JSON to `file` **only if it does not already exist** (AD-16).
+ *
+ * Uses a single **exclusive open** (`writeFile` with `flag: "wx"`), which the OS
+ * fails with `EEXIST` when the target already exists — so an existing backup is
+ * never clobbered. On that failure this throws a {@link FileExistsError} and the
+ * existing file is left completely intact; the caller (the backup writer) catches
+ * it, resolves a fresh name, and retries. This is the fs-level half of the
+ * never-overwrite guarantee: even if two writers somehow resolve the same name,
+ * the second one's exclusive create fails rather than overwriting the first.
+ *
+ * `flag: "wx"` is used rather than a temp-file + `link`/`rename` dance: the `wx`
+ * open is portable (no hardlink-support dependency, so no `ENOSYS`/`EXDEV` on
+ * filesystems that lack hardlinks) and leaves no temp file in the backup
+ * directory to clean up. The target is created and written in one call, so an
+ * `EEXIST` means the create never happened and nothing was touched.
+ *
+ * @param file Absolute path to write (must not already exist).
+ * @param data Serializable value to persist.
+ * @throws {FileExistsError} when `file` already exists.
+ */
+export async function writeJsonExclusive(
+  file: string,
+  data: unknown,
+): Promise<void> {
+  const dir = dirname(file);
+  await mkdir(dir, { recursive: true });
+
+  const contents = `${JSON.stringify(data, null, 2)}\n`;
+
+  try {
+    // "wx": create for writing; fail with EEXIST if the path already exists.
+    await writeFile(file, contents, { encoding: "utf8", flag: "wx" });
+  } catch (err) {
+    if (isErrnoException(err) && err.code === "EEXIST") {
+      throw new FileExistsError(file);
+    }
+    throw err;
+  }
+}
