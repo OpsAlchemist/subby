@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "defaultCurrency": "INR",
+  "notification": {
+    "enabled": true,
+    "leadTimes": ["same-day", "one-day", "three-days"]
+  },
+  "backupFrequency": "weekly",
+  "theme": "dark",
+  "accentColor": "#7C5CFF",
+  "trayMode": false,
+  "dataFolder": null
+}
