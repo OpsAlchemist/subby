@@ -33,6 +33,63 @@ import { JsonFileStorage } from "./storage/jsonFileStorage";
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
 
+/**
+ * The mutable user-data files that get an independent serialized write
+ * authority. Serialization is **per-file**, never global (AD-29): a
+ * subscriptions mutation and a settings mutation may run concurrently; only
+ * same-file mutations are forced one-at-a-time.
+ */
+type MutableFileKey = "subscriptions" | "settings" | "categories";
+
+/**
+ * Build a set of per-file async mutexes (AD-29).
+ *
+ * Each key owns its own promise chain. A `runExclusive(key, fn)` call appends
+ * `fn` to that key's chain so the next same-key critical section does not begin
+ * until the previous one has fully resolved (its `read → core → write` — and, for
+ * a destructive op, its backup — complete). Different keys have independent
+ * chains, so unrelated files never block each other.
+ *
+ * The chain only sequences execution; it never propagates a prior section's
+ * rejection to the next waiter. A failing mutation rejects **its own** returned
+ * promise only — the next section still runs (edge-case matrix: "a failing
+ * mutation rejects its own call only; the other still applies").
+ *
+ * This is deliberately a tiny inline primitive (no new dependency): a
+ * `Map<key, Promise>` tail per file, exactly as the Design Notes describe.
+ */
+function createPerFileLock(): <T>(
+  key: MutableFileKey,
+  fn: () => Promise<T>,
+) => Promise<T> {
+  const tails = new Map<MutableFileKey, Promise<unknown>>();
+
+  return function runExclusive<T>(
+    key: MutableFileKey,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prev = tails.get(key) ?? Promise.resolve();
+    // Chain AFTER the previous section regardless of whether it fulfilled or
+    // rejected (`catch(() => {})` swallows a prior failure for sequencing only;
+    // it never leaks to this section's result).
+    const run = prev.then(
+      () => fn(),
+      () => fn(),
+    );
+    // Advance the tail to this section's completion. Swallow for the tail only
+    // so a rejection here does not become an unhandled rejection AND does not
+    // poison the next waiter — the real result is returned via `run` below.
+    tails.set(
+      key,
+      run.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return run;
+  };
+}
+
 /** Result of {@link AppServices.deleteCategory}. */
 export type DeleteCategoryOutcome =
   | { ok: true; categories: Category[] }
@@ -114,6 +171,49 @@ export interface AppContext {
   services: AppServices;
 }
 
+/**
+ * Run the migration barrier (AD-28): bring every mutable user-data file to the
+ * current schema version **before** the scheduler or any IPC handler reads user
+ * data on launch.
+ *
+ * It touches each file through the storage port's version-gated read path
+ * (Story 1.4): a `< current` file is backed up, migrated, re-validated, and
+ * atomically written back; a `== current` file is validated and returned
+ * unchanged with no write-back. Running every migratable read here, up front,
+ * is the hard barrier — nothing downstream (scheduler catch-up, periodic ticks,
+ * handler reads) observes a half-migrated file because the migration already
+ * completed-or-no-opped by the time this resolves.
+ *
+ * **Inert at `current = 1` (live scope A):** every file on disk is already at the
+ * live `CURRENT_VERSION`, so each read takes the `== current` branch — it
+ * validates and returns with NO migration and NO write-back. The barrier is a
+ * genuine no-op *pass* today: it changes launch *structure*, not launch
+ * *behavior*. When Epic 3 flips `CURRENT_VERSION` to 2, these same reads become
+ * the load-bearing migrate-and-write-back step, ahead of any reader — no change
+ * to this function is required.
+ *
+ * **Fail-soft contract (AD-28):** a migration/read fault is surfaced as a typed
+ * storage error to the caller (`createAppContext`'s launch sequence in
+ * `main.ts`), which degrades to an `evt:error` and does NOT start the scheduler
+ * on corrupt/un-migrated state. This function does not swallow the error — it
+ * lets the typed storage error propagate so the launch sequence can classify it;
+ * it just guarantees the migration is driven to completion before returning.
+ *
+ * Categories are included for completeness even though at scope A they share the
+ * same no-op semantics; reading them here keeps the barrier's "no reader touches
+ * un-migrated user data" guarantee total across every mutable file.
+ */
+export async function runMigrationBarrier(storage: StoragePort): Promise<void> {
+  // Order is irrelevant (each read is independent and the version-gated path is
+  // idempotent once a file is at current), but doing them sequentially keeps the
+  // launch path deterministic and avoids a burst of concurrent write-backs on an
+  // upgrade launch. Each call either no-ops (== current) or migrates-and-writes
+  // (< current) to completion before the next begins.
+  await storage.readSubscriptions();
+  await storage.readSettings();
+  await storage.readCategories();
+}
+
 /** Current instant as an ISO-8601 string — the single wall-clock read site. */
 function nowIso(): string {
   return new Date().toISOString();
@@ -127,40 +227,66 @@ function nowIso(): string {
  * adapter.
  */
 export function buildAppServices(storage: StoragePort): AppServices {
+  // Per-file write authority (AD-29). Every mutating method below runs its whole
+  // `read → core → write` (and, for a destructive op, its pre-op backup) inside
+  // `lock(<file>, ...)` so two same-file mutations never interleave across an
+  // `await` — the second does not begin its read until the first has written.
+  // This closes the last-writer-wins bug where two concurrent read-modify-writes
+  // each read the same `existing` set and the later write clobbered the earlier.
+  //
+  // Read stance (snapshot consistency): read-only methods (`listSubscriptions`,
+  // `getSettings`, `listCategories`, `listBackups`, `exportData`) stay OUTSIDE
+  // the lock. The storage adapter writes atomically (temp-then-rename), so a
+  // lock-free read observes either the pre-write file or the post-write file —
+  // never a torn/partial state — even when issued between two serialized writes.
+  const lock = createPerFileLock();
+
   return {
     // --- Subscriptions -------------------------------------------------------
     listSubscriptions() {
+      // Lock-free read: snapshot-consistent at the adapter's atomic-write
+      // granularity (see read stance above).
       return storage.readSubscriptions();
     },
 
-    async createSubscription(input) {
-      const existing = await storage.readSubscriptions();
-      const next = subsCore.createSubscription(existing, input, nowIso());
-      await storage.writeSubscriptions(next);
-      return next;
+    createSubscription(input) {
+      return lock("subscriptions", async () => {
+        const existing = await storage.readSubscriptions();
+        const next = subsCore.createSubscription(existing, input, nowIso());
+        await storage.writeSubscriptions(next);
+        return next;
+      });
     },
 
-    async updateSubscription(id, patch) {
-      const existing = await storage.readSubscriptions();
-      const next = subsCore.editSubscription(existing, id, patch, nowIso());
-      await storage.writeSubscriptions(next);
-      return next;
+    updateSubscription(id, patch) {
+      return lock("subscriptions", async () => {
+        const existing = await storage.readSubscriptions();
+        const next = subsCore.editSubscription(existing, id, patch, nowIso());
+        await storage.writeSubscriptions(next);
+        return next;
+      });
     },
 
-    async deleteSubscription(id) {
-      // Backup-before-destructive (Req 3.3).
-      await storage.createBackup("pre-delete");
-      const existing = await storage.readSubscriptions();
-      const next = subsCore.deleteSubscription(existing, id);
-      await storage.writeSubscriptions(next);
-      return next;
+    deleteSubscription(id) {
+      return lock("subscriptions", async () => {
+        // Backup-before-destructive (Req 3.3) runs INSIDE the serialized section
+        // so the backup + the delete write are one atomic unit — no other
+        // subscriptions mutation can interleave between them (AD-29).
+        await storage.createBackup("pre-delete");
+        const existing = await storage.readSubscriptions();
+        const next = subsCore.deleteSubscription(existing, id);
+        await storage.writeSubscriptions(next);
+        return next;
+      });
     },
 
-    async toggleActive(id, value) {
-      const existing = await storage.readSubscriptions();
-      const next = subsCore.toggleActive(existing, id, value, nowIso());
-      await storage.writeSubscriptions(next);
-      return next;
+    toggleActive(id, value) {
+      return lock("subscriptions", async () => {
+        const existing = await storage.readSubscriptions();
+        const next = subsCore.toggleActive(existing, id, value, nowIso());
+        await storage.writeSubscriptions(next);
+        return next;
+      });
     },
 
     // --- Categories ----------------------------------------------------------
@@ -168,37 +294,44 @@ export function buildAppServices(storage: StoragePort): AppServices {
       return storage.readCategories();
     },
 
-    async createCategory(name) {
-      const existing = await storage.readCategories();
-      const result = catCore.createCategory(existing, name);
-      if (result.ok) {
-        await storage.writeCategories(result.categories);
-      }
-      return result;
+    createCategory(name) {
+      return lock("categories", async () => {
+        const existing = await storage.readCategories();
+        const result = catCore.createCategory(existing, name);
+        if (result.ok) {
+          await storage.writeCategories(result.categories);
+        }
+        return result;
+      });
     },
 
-    async deleteCategory(id, opts) {
-      const existing = await storage.readCategories();
-      const target = existing.find((c) => c.id === id);
-      if (target === undefined) {
-        return { ok: false, reason: "not_found" };
-      }
-      if (opts?.confirmed !== true) {
-        const subs = await storage.readSubscriptions();
-        const inUseCount = catCore.categoryAssignmentCount(subs, target.name);
-        if (inUseCount > 0) {
-          // Defer to the renderer to confirm before deleting an in-use category (Req 7.4).
-          return {
-            ok: false,
-            reason: "needs_confirmation",
-            name: target.name,
-            inUseCount,
-          };
+    deleteCategory(id, opts) {
+      // Serializes on the file it WRITES — `categories`. The subscriptions read
+      // used to count assignments is a lock-free, snapshot-consistent read (it
+      // does not mutate subscriptions).
+      return lock("categories", async () => {
+        const existing = await storage.readCategories();
+        const target = existing.find((c) => c.id === id);
+        if (target === undefined) {
+          return { ok: false, reason: "not_found" };
         }
-      }
-      const next = catCore.deleteCategory(existing, id);
-      await storage.writeCategories(next);
-      return { ok: true, categories: next };
+        if (opts?.confirmed !== true) {
+          const subs = await storage.readSubscriptions();
+          const inUseCount = catCore.categoryAssignmentCount(subs, target.name);
+          if (inUseCount > 0) {
+            // Defer to the renderer to confirm before deleting an in-use category (Req 7.4).
+            return {
+              ok: false,
+              reason: "needs_confirmation",
+              name: target.name,
+              inUseCount,
+            };
+          }
+        }
+        const next = catCore.deleteCategory(existing, id);
+        await storage.writeCategories(next);
+        return { ok: true, categories: next };
+      });
     },
 
     // --- Settings ------------------------------------------------------------
@@ -206,39 +339,46 @@ export function buildAppServices(storage: StoragePort): AppServices {
       return storage.readSettings();
     },
 
-    async updateSettings(patch) {
-      // Read from the CURRENT folder before any data-folder switch so existing
-      // settings are not lost.
-      const current = await storage.readSettings();
-      const merged = catCore.mergeSettings(current, patch);
-      if ("dataFolder" in patch) {
-        await storage.setDataFolder(merged.dataFolder);
-      }
-      await storage.writeSettings(merged);
-      return merged;
+    updateSettings(patch) {
+      return lock("settings", async () => {
+        // Read from the CURRENT folder before any data-folder switch so existing
+        // settings are not lost.
+        const current = await storage.readSettings();
+        const merged = catCore.mergeSettings(current, patch);
+        if ("dataFolder" in patch) {
+          await storage.setDataFolder(merged.dataFolder);
+        }
+        await storage.writeSettings(merged);
+        return merged;
+      });
     },
 
-    async setDataFolder(path) {
-      const current = await storage.readSettings();
-      await storage.setDataFolder(path);
-      const merged = catCore.mergeSettings(current, { dataFolder: path });
-      await storage.writeSettings(merged);
-      return merged;
+    setDataFolder(path) {
+      return lock("settings", async () => {
+        const current = await storage.readSettings();
+        await storage.setDataFolder(path);
+        const merged = catCore.mergeSettings(current, { dataFolder: path });
+        await storage.writeSettings(merged);
+        return merged;
+      });
     },
 
     // --- Import / Export -----------------------------------------------------
-    async applyImport(raw, format, mode) {
-      // Backup-before-destructive (Req 16.4).
-      await storage.createBackup("pre-import");
-      const existing = await storage.readSubscriptions();
-      const outcome = planImport(existing, raw, format, mode);
-      // `applied` starts from `existing`, so partial failures never discard
-      // valid data (Req 16.5).
-      await storage.writeSubscriptions(outcome.applied);
-      return outcome;
+    applyImport(raw, format, mode) {
+      return lock("subscriptions", async () => {
+        // Backup-before-destructive (Req 16.4) inside the serialized section.
+        await storage.createBackup("pre-import");
+        const existing = await storage.readSubscriptions();
+        const outcome = planImport(existing, raw, format, mode);
+        // `applied` starts from `existing`, so partial failures never discard
+        // valid data (Req 16.5).
+        await storage.writeSubscriptions(outcome.applied);
+        return outcome;
+      });
     },
 
     async exportData(format) {
+      // Read-only: no lock (snapshot-consistent reads).
       const subs = await storage.readSubscriptions();
       if (format === "csv") {
         return exportCsv(subs);
@@ -252,12 +392,15 @@ export function buildAppServices(storage: StoragePort): AppServices {
       return storage.listBackups();
     },
 
-    async restoreBackup(name) {
-      // Backup current data before replacing it (Req 18.3).
-      await storage.createBackup("pre-restore");
-      const file = await storage.readBackup(name);
-      await storage.writeSubscriptions(file.subscriptions);
-      return file.subscriptions;
+    restoreBackup(name) {
+      return lock("subscriptions", async () => {
+        // Backup current data before replacing it (Req 18.3) inside the
+        // serialized section so the backup + restore write are atomic.
+        await storage.createBackup("pre-restore");
+        const file = await storage.readBackup(name);
+        await storage.writeSubscriptions(file.subscriptions);
+        return file.subscriptions;
+      });
     },
 
     // --- Shared destructive helper -------------------------------------------

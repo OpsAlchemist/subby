@@ -4,7 +4,11 @@ import { app, BrowserWindow, ipcMain, session } from "electron";
 import type { Settings } from "core/models/settings";
 import type { AppError, IpcResult } from "shared/types";
 
-import { createAppContext, type AppContext } from "./appWiring";
+import {
+  createAppContext,
+  runMigrationBarrier,
+  type AppContext,
+} from "./appWiring";
 import { CH } from "./ipc/channels";
 import {
   registerIpcHandlers,
@@ -122,6 +126,26 @@ async function bootstrapContext(): Promise<AppContext> {
     await context.services.setDataFolder(settings.dataFolder);
   }
   return context;
+}
+
+/**
+ * Surface a launch-time system fault as `evt:error` without crashing the process
+ * (AD-28). Main-process launch work (bootstrap, the migration barrier) must
+ * never throw into the event loop; a genuine fault here is caught, logged as a
+ * structured non-telemetry diagnostic, and broadcast to whatever window exists
+ * so the renderer can show a global error — not swallowed, and not escalated to
+ * an unhandled rejection.
+ */
+function surfaceLaunchFault(stage: string, err: unknown): void {
+  const message =
+    err instanceof Error ? err.message : "A startup error occurred.";
+  // Structured, non-telemetry diagnostic (AD-28). Stays local to the console.
+  console.error(`[subby] launch fault during "${stage}": ${message}`);
+  const win = getWindow();
+  if (win && !win.isDestroyed()) {
+    const error: AppError = { code: "unknown", message };
+    win.webContents.send(CH.events.error, error);
+  }
 }
 
 /**
@@ -259,35 +283,97 @@ function createWindow(): void {
 app.whenReady().then(async () => {
   applyProductionCsp();
 
-  // Build services and load+apply persisted settings before any window or
-  // handler touches data (Req 15.4).
-  appContext = await bootstrapContext();
+  // Ordered launch sequence with a migration barrier (AD-28). The steps run in a
+  // fixed order and the barrier (step 2) is a HARD gate: no scheduler and no IPC
+  // handler reads user data until any pending migration has completed (or safely
+  // no-opped at the live current=1). The whole sequence is wrapped so a genuine
+  // system fault degrades to `evt:error` and never throws into the event loop.
+  //
+  // `stage` is advanced explicitly at each step so a caught fault is labeled by
+  // the step that actually failed — never inferred from a module-level singleton
+  // (which a dev hot-reload re-init could leave non-null and mislabel).
+  let stage = "bootstrap";
+  try {
+    // (1) Bootstrap: build services + load/apply persisted settings and the
+    //     data-folder override before any window or handler touches data.
+    appContext = await bootstrapContext();
 
-  // Seed the Tray_Mode cache from persisted settings so the synchronous
-  // `window-all-closed` handler has a sane initial value (Req 13.3/13.4).
-  await refreshTrayMode();
+    // (2) Migration BARRIER: bring every user-data file to the current schema
+    //     version before anything reads it. Inert (no-op pass) at current=1;
+    //     load-bearing once Epic 3 flips CURRENT_VERSION. Nothing below runs
+    //     until this resolves. A migration fault propagates to the catch below,
+    //     so the scheduler is never constructed/started on un-migrated state.
+    stage = "barrier";
+    await runMigrationBarrier(appContext.storage);
 
-  // Construct the reminder scheduler now (started later, deferred after paint).
-  // It lives in the main process so reminders fire regardless of window
-  // visibility when Tray_Mode is on (Req 13.1, 13.2, 13.3).
-  scheduler = new Scheduler({
-    services: appContext.services,
-    notifier: new NotificationService(),
-  });
+    // (3) Scheduler: constructed now, STARTED later at the deferred first-tick
+    //     (post `ready-to-show`). Construction-to-start sits entirely after the
+    //     barrier so a catch-up/periodic read can only ever see migrated data.
+    stage = "scheduler";
+    scheduler = new Scheduler({
+      services: appContext.services,
+      notifier: new NotificationService(),
+    });
 
-  // Register IPC handlers once over the assembled services. Tearing down first
-  // makes registration idempotent and avoids duplicate-handler errors if the
-  // app is ever re-initialized in the same process (e.g. dev hot-reload).
-  unregisterIpcHandlers();
-  unregisterDialogChannels();
-  registerIpcHandlers(appContext.services, getWindow);
-  registerDialogChannels(appContext);
+    // Seed the Tray_Mode cache from (now barrier-passed) persisted settings so
+    // the synchronous `window-all-closed` handler has a sane initial value
+    // (Req 13.3/13.4). This reads user data, so it must follow the barrier.
+    await refreshTrayMode();
 
-  createWindow();
+    // Register IPC handlers once over the assembled services, after the barrier
+    // so a handler read never observes un-migrated data. Tearing down first makes
+    // registration idempotent and avoids duplicate-handler errors on a dev
+    // hot-reload re-init.
+    stage = "handlers";
+    unregisterIpcHandlers();
+    unregisterDialogChannels();
+    registerIpcHandlers(appContext.services, getWindow);
+    registerDialogChannels(appContext);
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
+    // (4) Window: on `ready-to-show` it presents and defers the scheduler
+    //     first-tick (that deferral still sits after this barrier — the barrier
+    //     gates construction-to-start, the deferral gates first-tick timing).
+    stage = "window";
+    createWindow();
+  } catch (err) {
+    // A bootstrap/barrier fault: degrade, do not crash (AD-28). The scheduler
+    // was not started on bad state, and because the fault occurred before
+    // handler registration there are NO IPC handlers — so the window opened here
+    // is an ERROR-SURFACE ONLY: it loads to display the `evt:error` toast and has
+    // no app functionality until the user relaunches. (We do not stand up a
+    // degraded-handler shim: with bootstrap failed there are no services to
+    // serve, so a shim would hang the same renderer invokes it pretends to fix.)
+    if (BrowserWindow.getAllWindows().length === 0) {
+      try {
+        createWindow();
+      } catch (windowErr) {
+        surfaceLaunchFault("createWindow", windowErr);
+      }
+    }
+    // Deliver the fault to the renderer EXACTLY ONCE. If a window already exists
+    // and is visible (fault late in launch), surface immediately. Otherwise the
+    // window is not yet painted (just created above, or still loading), so defer
+    // to its `ready-to-show` — surfacing now would send to a renderer that can't
+    // yet show a toast. Never both: a visible window skips the deferral.
+    const win = getWindow();
+    if (win && !win.isDestroyed() && win.isVisible()) {
+      surfaceLaunchFault(stage, err);
+    } else if (win && !win.isDestroyed()) {
+      win.once("ready-to-show", () => surfaceLaunchFault(stage, err));
+    } else {
+      // No window at all (createWindow itself failed above): log the fault so it
+      // is not swallowed, even though no renderer can receive it.
+      surfaceLaunchFault(stage, err);
+    }
+  }
+});
+
+// `activate` (macOS dock re-click) must survive a degraded launch: it is
+// registered at top level, OUTSIDE the launch try/catch, so a caught fault never
+// leaves the dock icon unable to recreate the window. Guarded to recreate only
+// when no window exists.
+app.on("activate", () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
 });
 
 app.on("window-all-closed", () => {
