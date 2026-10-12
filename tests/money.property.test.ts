@@ -11,8 +11,10 @@ import {
   InvalidAmountError,
   AmountOverflowError,
   MissingRateError,
+  InvalidRateError,
   type MoneyLine,
   type RateTable,
+  type RateSnapshot,
 } from "core/money";
 
 /**
@@ -260,6 +262,71 @@ describe("money I/O matrix (example tests)", () => {
     expect(() => homeTotal(lines, rates, "USD")).toThrow(MissingRateError);
   });
 
+  // --- Rate-table contract (the two Epic-1-deferred items, settled here) -----
+
+  it("rate-table contract: a Home rate ≠ 1 throws (never silently scales Home lines)", () => {
+    const lines: MoneyLine[] = [{ currency: "USD", amountMinor: 1000 }];
+    // Home = USD but the table claims 1 USD = 1.02 USD — a contract violation
+    // that would silently scale every Home line. It must throw loudly.
+    expect(() => homeTotal(lines, { USD: "1.02" }, "USD")).toThrow(InvalidRateError);
+    // Even an otherwise-valid mixed table is rejected if Home ≠ 1.
+    expect(() => homeTotal(lines, { USD: "1.02", EUR: "1.08" }, "USD")).toThrow(InvalidRateError);
+    // A Home rate of exactly 1 — in any decimal form — is accepted.
+    expect(homeTotal(lines, { USD: "1" }, "USD")).toBe(1000);
+    expect(homeTotal(lines, { USD: "1.000" }, "USD")).toBe(1000);
+    expect(homeTotal(lines, { USD: 1 }, "USD")).toBe(1000);
+  });
+
+  it("rate-table contract: a 0 / non-positive rate is rejected, never a silent zero conversion", () => {
+    // A zero rate for a line's currency would silently zero that currency's
+    // contribution — it is rejected like a bad/unfetched rate (InvalidAmountError),
+    // distinct from a valid positive conversion.
+    const lines: MoneyLine[] = [
+      { currency: "USD", amountMinor: 1000 },
+      { currency: "EUR", amountMinor: 1000 },
+    ];
+    expect(() => homeTotal(lines, { USD: "1", EUR: "0" }, "USD")).toThrow(InvalidAmountError);
+    expect(() => homeTotal(lines, { USD: "1", EUR: "0.000" }, "USD")).toThrow(InvalidAmountError);
+    expect(() => homeTotal(lines, { USD: "1", EUR: 0 }, "USD")).toThrow(InvalidAmountError);
+    expect(() => homeTotal(lines, { USD: "1", EUR: -0.5 }, "USD")).toThrow(InvalidAmountError);
+    // A valid positive EUR rate still converts normally (contrast with the 0 case).
+    expect(homeTotal(lines, { USD: "1", EUR: "1.08" }, "USD")).toBe(2080); // $10 + €10@1.08
+  });
+
+  it("rate-table contract: an ABSENT Home rate is not special-cased — a Home line still needs it", () => {
+    // The Home-rate guard only constrains a *present* Home rate. When a
+    // Home-currency line is present but the Home currency is absent from the
+    // table, the per-line loop throws MissingRateError (never an implicit 1).
+    const withHomeLine: MoneyLine[] = [
+      { currency: "USD", amountMinor: 1000 },
+      { currency: "EUR", amountMinor: 1000 },
+    ];
+    expect(() => homeTotal(withHomeLine, { EUR: "1.08" }, "USD")).toThrow(MissingRateError); // no USD rate
+
+    // But with NO Home-currency line, an absent Home rate is harmless: the other
+    // lines total normally (nothing ever looks up the Home rate).
+    const noHomeLine: MoneyLine[] = [{ currency: "EUR", amountMinor: 1000 }];
+    expect(homeTotal(noHomeLine, { EUR: "1.08" }, "USD")).toBe(1080); // €10 @1.08 = $10.80
+  });
+
+  it("rate-table contract: a negative STRING rate throws InvalidAmountError (parseRate sign branch)", () => {
+    const lines: MoneyLine[] = [
+      { currency: "USD", amountMinor: 1000 },
+      { currency: "EUR", amountMinor: 1000 },
+    ];
+    expect(() => homeTotal(lines, { USD: "1", EUR: "-0.5" }, "USD")).toThrow(InvalidAmountError);
+  });
+
+  it("rate-table contract: a dated RateSnapshot carries its asOf verbatim alongside the table", () => {
+    // The RateSnapshot type is the dated-rate input contract (Story 2.3 fills it
+    // from the bundle). homeTotal consumes `snapshot.rates`; the asOf travels
+    // with it for a surface to display "rates as of {asOf}".
+    const snapshot: RateSnapshot = { asOf: "2026-10-02", rates: { USD: "1", EUR: "1.08" } };
+    const lines: MoneyLine[] = [{ currency: "EUR", amountMinor: 1000 }];
+    expect(homeTotal(lines, snapshot.rates, "USD")).toBe(1080);
+    expect(snapshot.asOf).toBe("2026-10-02");
+  });
+
   it("rounding discipline: homeTotal equals the precise sum, NOT Σ of rounded rows (golden)", () => {
     // Three lines whose per-row Home values each have a sub-cent remainder that
     // rounds DOWN individually but carries UP when summed precisely.
@@ -301,7 +368,9 @@ describe("money I/O matrix (example tests)", () => {
     expect(() => minorUnits(huge, "JPY")).toThrow(AmountOverflowError);
 
     const lines: MoneyLine[] = [{ currency: "JPY", amountMinor: Number.MAX_SAFE_INTEGER }];
-    // Converting at a rate > 1 pushes the home total past the safe range.
-    expect(() => homeTotal(lines, { USD: "2", JPY: "2" }, "USD")).toThrow(AmountOverflowError);
+    // Converting a non-Home line at a rate > 1 pushes the home total past the
+    // safe range. (Home USD maps to 1 per the rate-table contract; the overflow
+    // is driven by the JPY line's rate, not by rescaling Home.)
+    expect(() => homeTotal(lines, { USD: "1", JPY: "2" }, "USD")).toThrow(AmountOverflowError);
   });
 });

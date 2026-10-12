@@ -240,6 +240,30 @@ export class MissingRateError extends Error {
 }
 
 /**
+ * Thrown when the rate table violates the Home-currency contract: the Home
+ * currency must map to a rate of exactly `1` (one Home major unit is worth one
+ * Home major unit). A Home rate other than 1 would silently scale every Home
+ * line, so it is a loud error here, never a silent rescaling.
+ */
+export class InvalidRateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidRateError";
+  }
+}
+
+/**
+ * A dated exchange-rate snapshot: the rate table plus the `asOf` date the rates
+ * were valid as of. This is the dated-rate input contract — Story 2.3 will
+ * populate it from the bundled FX snapshot; here it is the typed seam a total
+ * carries so a surface can render "rates as of {asOf}".
+ */
+export interface RateSnapshot {
+  asOf: string; // ISO date (YYYY-MM-DD) the rates are valid as of
+  rates: RateTable;
+}
+
+/**
  * Guard digits carried by the precise intermediate beyond the Home exponent.
  * The intermediate is Home minor units scaled by 10^GUARD_DIGITS, kept as an
  * exact BigInt, so per-line conversion keeps sub-minor-unit precision and only
@@ -248,12 +272,20 @@ export class MissingRateError extends Error {
  */
 const GUARD_DIGITS = 6;
 
-/** Split a decimal rate string into (scaledInteger, fractionalDigitCount). */
+/**
+ * Split a decimal rate string into (scaledInteger, fractionalDigitCount).
+ *
+ * A rate must be strictly **positive**: a `0` (or non-positive) rate is rejected
+ * the same loud way a negative is, because a zero rate is an unfetched / bad
+ * rate that would silently zero out a whole currency's contribution — never a
+ * legitimate conversion. (`0` is `rate must be positive`, settling the Epic-1
+ * deferral that `parseRate` previously rejected only negatives.)
+ */
 function parseRate(rate: string | number): { scaled: bigint; fracDigits: number } {
   let text: string;
   if (typeof rate === "number") {
-    if (!Number.isFinite(rate) || rate < 0) {
-      throw new InvalidAmountError(`rate must be a finite non-negative number, got ${rate}`);
+    if (!Number.isFinite(rate) || rate <= 0) {
+      throw new InvalidAmountError(`rate must be a finite positive number, got ${rate}`);
     }
     text = rate.toString();
   } else {
@@ -261,10 +293,16 @@ function parseRate(rate: string | number): { scaled: bigint; fracDigits: number 
   }
   const match = /^([+-]?)(\d+)(?:\.(\d+))?$/.exec(text);
   if (!match || match[1] === "-") {
-    throw new InvalidAmountError(`rate is not a valid non-negative decimal: ${JSON.stringify(rate)}`);
+    throw new InvalidAmountError(`rate is not a valid positive decimal: ${JSON.stringify(rate)}`);
   }
   const [, , intPart, fracPart = ""] = match;
-  return { scaled: BigInt(`${intPart}${fracPart}` || "0"), fracDigits: fracPart.length };
+  const scaled = BigInt(`${intPart}${fracPart}` || "0");
+  if (scaled === 0n) {
+    // A zero rate (e.g. "0", "0.000", an unfetched placeholder) would silently
+    // zero a currency's converted amount — reject it loudly, never convert at 0.
+    throw new InvalidAmountError(`rate must be positive, got ${JSON.stringify(rate)}`);
+  }
+  return { scaled, fracDigits: fracPart.length };
 }
 
 /** Round a BigInt quotient `num / den` to the nearest integer (half-up on ties). */
@@ -299,6 +337,25 @@ export function homeTotal(lines: readonly MoneyLine[], rates: RateTable, homeCur
   const homeExponent = exponentOf(homeCurrency);
   const homeFactor = scaleFactor(homeExponent);
   const guard = scaleFactor(GUARD_DIGITS);
+
+  // Rate-table contract: the Home currency, if present in the table, MUST map
+  // to exactly 1 (one Home major unit is worth one Home major unit). A Home
+  // rate other than 1 would silently scale every Home line, so reject it
+  // loudly here. This guard only constrains a *present* Home rate; an absent
+  // Home rate is not special-cased here — a Home-currency line whose rate is
+  // absent still throws MissingRateError in the per-line loop below, so callers
+  // that total Home lines must include `homeCurrency: 1` in the table.
+  const homeRateRaw = (rates as Record<string, string | number>)[homeCurrency];
+  if (homeRateRaw !== undefined) {
+    const { scaled: homeScaled, fracDigits: homeFrac } = parseRate(homeRateRaw);
+    // `1` as a scaled integer is exactly 10^fracDigits (e.g. "1" -> 1/1,
+    // "1.000" -> 1000/1000). Any other value is a contract violation.
+    if (homeScaled !== scaleFactor(homeFrac)) {
+      throw new InvalidRateError(
+        `Home currency ${JSON.stringify(homeCurrency)} must map to rate 1, got ${JSON.stringify(homeRateRaw)}`,
+      );
+    }
+  }
 
   // Accumulate in Home minor units * 10^GUARD_DIGITS as an exact integer.
   let acc = 0n;
