@@ -404,3 +404,128 @@ export function homeTotal(lines: readonly MoneyLine[], rates: RateTable, homeCur
   const totalMinor = divideRoundNearest(acc, guard);
   return toSafeNumber(totalMinor, "home total minor units");
 }
+
+// --- Stale-rate guard (AD-12) ------------------------------------------------
+//
+// The single staleness authority (AD-12, ARCHITECTURE-SPINE.md L113-116). When
+// the bundled FX snapshot is older than FX_STALE_DAYS AND the opt-in FX refresh
+// is off, Subby must NOT present a confident single converted total — a
+// years-stale rate shown as a current figure is the exact silent breakage this
+// product exists to prevent (FR-12). The verdict lives here, in exactly one
+// place, so no surface hard-codes its own threshold and the two can disagree.
+//
+// Purity (AD-1): `today` and `snapshotAsOf` are injected `YYYY-MM-DD` strings —
+// there is NO wall-clock read anywhere in this block. Day-age math is exact UTC
+// epoch-day arithmetic (same `Date.UTC(...)` convention as `core/renewal.ts`),
+// so DST / timezones never shift a verdict and the result is deterministic for
+// fixed inputs. Re-evaluation is a property of purity, not state: a new `today`,
+// a flipped `fxRefreshOn`, or a different `snapshotAsOf` yields the newly-correct
+// verdict on the next call (same inputs -> same output).
+
+/**
+ * The one staleness threshold every surface shares (AD-12): a snapshot more than
+ * this many days older than `today` is `"stale"` (when FX refresh is off). It is
+ * the ONLY numeric staleness threshold in shipped source — no surface duplicates
+ * a second 90, so Epic 3/6 must consult {@link rateConfidence} / this constant.
+ */
+export const FX_STALE_DAYS = 90;
+
+/** The staleness verdict a surface consults before showing a confident total. */
+export type RateConfidence = "confident" | "stale";
+
+/**
+ * Thrown when a date argument is not a valid `YYYY-MM-DD` string (bad shape or a
+ * non-finite / non-real calendar date). A corrupt date is NEVER silently treated
+ * as fresh (`"confident"`); it is a loud, named error, mirroring this module's
+ * error-class convention ({@link UnknownCurrencyError} / {@link MissingRateError}).
+ */
+export class InvalidDateError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidDateError";
+  }
+}
+
+/** `YYYY-MM-DD` shape (mirrors `core/fxSnapshot.ts`'s `AS_OF_RE`). */
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Parse a strict `YYYY-MM-DD` string into UTC year/month/day parts, throwing
+ * {@link InvalidDateError} on a bad shape or a value that is not a real calendar
+ * date (e.g. month 13 or day 99). The round-trip through `Date.UTC` rejects
+ * out-of-range components: a non-real date normalizes to different parts, so we
+ * compare them back and reject any mismatch.
+ */
+function parseISODateStrict(iso: string): { year: number; month: number; day: number } {
+  if (typeof iso !== "string" || !ISO_DATE_RE.test(iso)) {
+    throw new InvalidDateError(`date must be a YYYY-MM-DD string, got ${JSON.stringify(iso)}`);
+  }
+  const [year, month, day] = iso.split("-").map((part) => Number.parseInt(part, 10));
+  const utcMs = Date.UTC(year, month - 1, day);
+  const d = new Date(utcMs);
+  // Reject non-real dates: `Date.UTC` silently normalizes (e.g. month 13 -> next
+  // year, day 32 -> next month), so a valid date must round-trip to itself.
+  if (
+    !Number.isFinite(utcMs) ||
+    d.getUTCFullYear() !== year ||
+    d.getUTCMonth() + 1 !== month ||
+    d.getUTCDate() !== day
+  ) {
+    throw new InvalidDateError(`date is not a valid calendar date: ${JSON.stringify(iso)}`);
+  }
+  return { year, month, day };
+}
+
+/** Whole UTC days from `fromISO` to `toISO` (positive when `toISO` is later). */
+function daysBetweenUTC(fromISO: string, toISO: string): number {
+  const from = parseISODateStrict(fromISO);
+  const to = parseISODateStrict(toISO);
+  const MS_PER_DAY = 86_400_000;
+  const fromMs = Date.UTC(from.year, from.month - 1, from.day);
+  const toMs = Date.UTC(to.year, to.month - 1, to.day);
+  // Both are UTC midnights, so the difference is an exact whole-day multiple.
+  return (toMs - fromMs) / MS_PER_DAY;
+}
+
+/**
+ * The AD-12 staleness verdict: `"stale"` IFF the snapshot is strictly MORE than
+ * {@link FX_STALE_DAYS} days older than `today` AND `fxRefreshOn === false`;
+ * otherwise `"confident"`.
+ *
+ * Boundary: exactly {@link FX_STALE_DAYS} days old is `"confident"` (strictly
+ * greater is stale). A future-dated snapshot (negative age) or a same-day
+ * snapshot (age 0) is `"confident"`. FX refresh being on overrides age entirely.
+ *
+ * Pure (AD-1): both dates are injected `YYYY-MM-DD` strings; no wall-clock. Day
+ * age is exact UTC epoch-day arithmetic, so there is no timezone drift.
+ *
+ * @throws InvalidDateError if `snapshotAsOf` or `today` is not a valid
+ *                          `YYYY-MM-DD` date (never a silent `"confident"`).
+ */
+export function rateConfidence(snapshotAsOf: string, today: string, fxRefreshOn: boolean): RateConfidence {
+  const ageDays = daysBetweenUTC(snapshotAsOf, today);
+  return ageDays > FX_STALE_DAYS && !fxRefreshOn ? "stale" : "confident";
+}
+
+/**
+ * Whole completed calendar months `snapshotAsOf` is behind `today`, floored —
+ * display support for the "these rates are N months old" affordance copy. It is
+ * display-only and NEVER gates the verdict ({@link rateConfidence} is day-based
+ * per AD-12). Returns `0` when the snapshot is on/after `today` (newer-or-equal
+ * or future-dated).
+ *
+ * A "completed" month means the day-of-month has been reached: 2026-07-15 ->
+ * 2026-10-14 is 2 completed months (the 15th of the third month has not arrived
+ * yet), 2026-10-15 is 3.
+ *
+ * @throws InvalidDateError if either date is not a valid `YYYY-MM-DD` date.
+ */
+export function monthsStale(snapshotAsOf: string, today: string): number {
+  const from = parseISODateStrict(snapshotAsOf);
+  const to = parseISODateStrict(today);
+  let months = (to.year - from.year) * 12 + (to.month - from.month);
+  // If `today`'s day-of-month has not yet reached the snapshot's, the final
+  // month is not complete — subtract it. This floors to completed months.
+  if (to.day < from.day) months -= 1;
+  return months > 0 ? months : 0;
+}
