@@ -32,6 +32,17 @@ export type ThemePreference = Settings["theme"];
 const DARK_MEDIA_QUERY = "(prefers-color-scheme: dark)";
 
 /**
+ * The Warm Graphite default accent (light ochre). This is the sentinel value:
+ * when `settings.accentColor` equals it (or is blank), the renderer uses the
+ * per-theme `--accent` token from `globals.css` — ochre in light, amber in dark —
+ * instead of pinning a single inline hex. It MUST stay in lockstep with
+ * `DEFAULT_SETTINGS.accentColor` in `core/models/schema.ts`. (In 1.0 the accent
+ * is a theme token, not a free user hex — the Settings accent control is refined
+ * in Story 3.2.)
+ */
+export const DEFAULT_ACCENT = "#92400e";
+
+/**
  * Minimal subset of {@link MediaQueryList} this module relies on. Declaring our
  * own shape keeps the code testable: a fake implementing just these members can
  * stand in for the browser object.
@@ -104,14 +115,28 @@ export function applyTheme(
 }
 
 /**
- * Apply the accent color by writing the `--accent` CSS custom property on the
- * document root (Req 14.3). No-ops outside a DOM environment. Empty/blank
- * values are ignored so a missing setting can't blank out the accent.
+ * Apply the accent color (Req 14.3), keeping it theme-aware.
+ *
+ * In 1.0 the accent is a Warm Graphite theme token, not a free user hex: the
+ * per-theme `--accent` in `globals.css` resolves to ochre in light and amber in
+ * dark. So this only writes an inline override for a *genuine custom* value:
+ *   - blank/whitespace, or equal to {@link DEFAULT_ACCENT} (the default
+ *     sentinel) → CLEAR any prior inline `--accent` and return, so the per-theme
+ *     token wins. The `removeProperty` is load-bearing: it undoes a stale custom
+ *     override after a custom→default transition (so dark correctly flips back to
+ *     amber), satisfying the "default → token wins" contract even on that path.
+ *   - any other value → write it as the inline override.
+ *
+ * No-ops outside a DOM environment.
  */
 export function applyAccent(accentColor: string): void {
   if (typeof document === "undefined") return;
-  if (typeof accentColor !== "string" || accentColor.trim() === "") return;
-  document.documentElement.style.setProperty("--accent", accentColor);
+  const value = typeof accentColor === "string" ? accentColor.trim() : "";
+  if (value === "" || value.toLowerCase() === DEFAULT_ACCENT.toLowerCase()) {
+    document.documentElement.style.removeProperty("--accent");
+    return;
+  }
+  document.documentElement.style.setProperty("--accent", value);
 }
 
 /**

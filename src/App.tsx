@@ -69,12 +69,41 @@ const NAV_ITEMS: readonly NavItem[] = [
 ] as const;
 
 /**
- * Shared focus-ring utility so every interactive control has a visible,
- * consistent keyboard focus indicator (Req 22.1, 22.3). Uses the design's
- * `--ring` token via Tailwind's `ring` color.
+ * Shared focus-ring utilities (DESIGN §Focus ring; Req 22.1, 22.3). Every
+ * interactive control gets a visible 2px ring with a 2px offset; the ring color
+ * and offset surface change with the control so it never becomes an invisible
+ * accent-on-accent ring. There are exactly four variants, one per control class:
+ *
+ *   - {@link focusRing} — DEFAULT: the accent `--ring` offset against the main
+ *     `background`. Used by every main-surface control: the skip-link, the
+ *     top-bar Global Search trigger, and the top-bar theme toggle.
+ *   - {@link focusRingOnSidebar} — RESTING espresso nav items: amber `#f59e0b`
+ *     ring (ochre reads only ~3:1 on espresso) offset against the sidebar
+ *     surface `#1f1a14`, in BOTH themes (the ring tracks the surface, not the
+ *     global theme).
+ *   - {@link focusRingOnSidebarAccent} — the ACTIVE (accent-filled) nav item:
+ *     renders the ring in the element FOREGROUND (`--sidebar-accent-foreground`)
+ *     offset against the sidebar surface, so it reads against both the accent
+ *     fill and the espresso around it. The active nav item uses THIS, not
+ *     {@link focusRingOnAccent}.
+ *   - {@link focusRingOnAccent} — the top-bar primary "Add subscription" button
+ *     (accent-filled on the main surface): element-foreground ring
+ *     (`accent-foreground`) offset against `background`.
  */
 const focusRing =
   "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+/** Resting espresso nav item: amber ring, offset against the sidebar surface. */
+const focusRingOnSidebar =
+  "outline-none focus-visible:ring-2 focus-visible:ring-[#f59e0b] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--sidebar))]";
+
+/** Active (accent-filled) nav item: element-foreground ring, offset against the sidebar. */
+const focusRingOnSidebarAccent =
+  "outline-none focus-visible:ring-2 focus-visible:ring-[hsl(var(--sidebar-accent-foreground))] focus-visible:ring-offset-2 focus-visible:ring-offset-[hsl(var(--sidebar))]";
+
+/** Top-bar primary Add button (accent-filled): element-foreground ring, offset against background. */
+const focusRingOnAccent =
+  "outline-none focus-visible:ring-2 focus-visible:ring-accent-foreground focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 
 /**
  * Render the active view. Calendar/Analytics are lazy and wrapped in Suspense
@@ -231,14 +260,38 @@ export default function App(): JSX.Element {
         Dashboard, List, Calendar, Analytics, Settings, and About.
       </p>
 
-      {/* Left navigation rail — a labelled landmark (Req 22.3). */}
+      {/* Left navigation rail — the espresso sidebar surface (DESIGN: Sidebar),
+          a labelled landmark (Req 22.3). Espresso in BOTH themes: a 185deg
+          gradient over the solid fallback, a right border, and an inset amber
+          keyline (DESIGN labels this the "inset ochre keyline"; the rgba is
+          amber by design). */}
       <nav
         aria-label="Primary"
-        className="flex w-56 shrink-0 flex-col gap-1 border-r border-border bg-card p-3"
+        style={{
+          backgroundImage:
+            "linear-gradient(185deg, #241f17, #1d1813)",
+          boxShadow: "inset -1px 0 0 rgba(245, 158, 11, 0.08)",
+        }}
+        className="flex w-56 shrink-0 flex-col gap-1 border-r border-sidebar-border bg-sidebar p-3"
       >
-        <div className="mb-4 flex items-center gap-2 px-2">
-          <span className="text-lg font-semibold tracking-tight">Subby</span>
+        {/* Brandmark: an accent-filled tile + the wordmark on espresso. */}
+        <div className="mb-4 flex items-center gap-2 px-2 py-1">
+          <span
+            aria-hidden="true"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-sm font-semibold text-accent-foreground"
+          >
+            S
+          </span>
+          <span className="text-lg font-semibold tracking-tight text-sidebar-foreground">
+            Subby
+          </span>
         </div>
+
+        {/* Section label (DESIGN label-caps on espresso). */}
+        <p className="px-3 pb-1 text-[0.6875rem] font-semibold uppercase tracking-wider text-sidebar-section">
+          Navigate
+        </p>
+
         <ul className="flex flex-col gap-1">
           {NAV_ITEMS.map(({ key, label, icon: Icon }, index) => {
             const active = key === view;
@@ -250,11 +303,14 @@ export default function App(): JSX.Element {
                   title={`${label} (${index + 1})`}
                   onClick={() => setView(key)}
                   className={cn(
-                    "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
-                    focusRing,
+                    "flex w-full items-center gap-3 rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
                     active
-                      ? "bg-secondary text-secondary-foreground"
-                      : "text-muted-foreground hover:bg-secondary/60 hover:text-foreground",
+                      ? // Active item: solid accent fill + element-foreground ring.
+                        "bg-sidebar-accent text-sidebar-accent-foreground " +
+                        focusRingOnSidebarAccent
+                      : // Resting item: muted espresso label + amber ring.
+                        "text-sidebar-foreground hover:bg-white/5 hover:text-sidebar-foreground " +
+                        focusRingOnSidebar,
                   )}
                 >
                   <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -268,8 +324,8 @@ export default function App(): JSX.Element {
 
       {/* Right column: top bar + content. */}
       <div className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar landmark. */}
-        <header className="flex items-center justify-between gap-3 border-b border-border bg-card px-6 py-3">
+        {/* Top bar landmark — a resting card surface (DESIGN: elevation.card). */}
+        <header className="flex items-center justify-between gap-3 border-b border-border bg-card px-6 py-3 shadow-card">
           {/* Global Search trigger with Cmd/Ctrl-K affordance (task 22 wires it). */}
           <button
             type="button"
@@ -303,14 +359,15 @@ export default function App(): JSX.Element {
               <ThemeIcon className="h-4 w-4" aria-hidden="true" />
             </button>
 
-            {/* Primary action: Add subscription (task 19 opens the modal). */}
+            {/* Primary action: Add subscription (task 19 opens the modal).
+                Accent-filled → raised elevation + element-foreground focus ring. */}
             <button
               type="button"
               onClick={() => setAddOpen(true)}
               title="Add subscription (N)"
               className={cn(
-                "inline-flex items-center gap-2 rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-foreground hover:opacity-90",
-                focusRing,
+                "inline-flex items-center gap-2 rounded-lg bg-accent px-3 py-2 text-sm font-medium text-accent-foreground shadow-raised hover:opacity-90",
+                focusRingOnAccent,
               )}
             >
               <Plus className="h-4 w-4" aria-hidden="true" />

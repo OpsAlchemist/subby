@@ -117,7 +117,7 @@ const DEFAULT_SETTINGS: Settings = {
   notification: { enabled: true, leadTimes: ["same-day", "one-day", "three-days"] },
   backupFrequency: "weekly",
   theme: "dark",            // dark-first default
-  accentColor: "#7C5CFF",
+  accentColor: "#92400e",
   trayMode: false,
   dataFolder: null,
 };

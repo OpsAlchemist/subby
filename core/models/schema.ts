@@ -313,7 +313,10 @@ export const DEFAULT_SETTINGS: Settings = {
   },
   backupFrequency: "weekly",
   theme: "dark", // dark-first default (Req 14.4)
-  accentColor: "#7C5CFF",
+  // Warm Graphite default accent (ochre). This is the sentinel the Theme_Manager
+  // treats as "use the per-theme token" (ochre light / amber dark) rather than a
+  // custom user override. The old purple accent is retired.
+  accentColor: "#92400e",
   trayMode: false,
   dataFolder: null,
 };

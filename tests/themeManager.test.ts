@@ -8,6 +8,7 @@ import {
   applyTheme,
   resolveTheme,
   subscribeSystemTheme,
+  DEFAULT_ACCENT,
 } from "@/theme/themeManager";
 import type { MediaQuery, MediaQueryProvider } from "@/theme/themeManager";
 
@@ -143,46 +144,87 @@ describe("dark default (Req 14.4)", () => {
 });
 
 // --- Accent color application (Req 14.3) --------------------------------------
+//
+// In 1.0 the accent is a Warm Graphite theme token (ochre light / amber dark)
+// resolved in CSS. `applyAccent` only writes an inline override for a *genuine
+// custom* value; a blank/default value clears any prior override so the
+// per-theme token wins (theme-aware accent).
 
-describe("applyAccent (Req 14.3)", () => {
-  it("sets the --accent CSS variable on the document root", () => {
+describe("applyAccent sentinel/theme-aware behavior (Req 14.3)", () => {
+  it("writes an inline --accent override for a genuine custom value", () => {
     applyAccent("#123456");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
   });
 
-  it("ignores an empty value", () => {
+  it("writes a padded custom value trimmed (no surrounding whitespace)", () => {
+    applyAccent("  #123456  ");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+  });
+
+  it("does NOT write an inline override for the default sentinel (token wins)", () => {
+    applyAccent(DEFAULT_ACCENT);
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
+  });
+
+  it("clears a prior custom override on an empty value (token wins)", () => {
     applyAccent("#123456");
     applyAccent("");
-    // Unchanged: the empty value did not blank out the accent.
-    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
   });
 
-  it("ignores a blank/whitespace value", () => {
+  it("clears a prior custom override on a blank/whitespace value (token wins)", () => {
     applyAccent("#abcdef");
     applyAccent("   ");
-    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#abcdef");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
+  });
+
+  it("clears the stale override on a custom→default transition (token wins)", () => {
+    // User picks a custom accent, then reverts to the default: the inline
+    // override must be removed so the per-theme token (amber in dark) returns.
+    applyAccent("#123456");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+    applyAccent(DEFAULT_ACCENT);
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
+  });
+
+  it("uses the DEFAULT_SETTINGS accent as the default sentinel", () => {
+    // Guards against a purple regression: this only holds while the schema
+    // default equals DEFAULT_ACCENT (#92400e, purple retired).
+    expect(DEFAULT_SETTINGS.accentColor).toBe(DEFAULT_ACCENT);
+    applyAccent(DEFAULT_SETTINGS.accentColor);
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
   });
 });
 
 // --- Combined settings application --------------------------------------------
 
 describe("applySettingsTheme applies both theme and accent (Req 14.1, 14.3)", () => {
-  it("sets data-theme and --accent from a settings object", () => {
+  it("sets data-theme and writes a custom --accent from a settings object", () => {
     const resolved = applySettingsTheme({ theme: "light", accentColor: "#abcdef" });
     expect(resolved).toBe("light");
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#abcdef");
   });
 
-  it("resolves system theme via the injected provider", () => {
+  it("leaves no inline --accent for the default accent (per-theme token wins)", () => {
+    const resolved = applySettingsTheme(
+      { theme: "light", accentColor: DEFAULT_ACCENT },
+    );
+    expect(resolved).toBe("light");
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
+  });
+
+  it("resolves system theme via the injected provider (default accent → token)", () => {
     const mq = createFakeMediaQuery(true);
     const resolved = applySettingsTheme(
-      { theme: "system", accentColor: "#7C5CFF" },
+      { theme: "system", accentColor: DEFAULT_ACCENT },
       providerOf(mq),
     );
     expect(resolved).toBe("dark");
     expect(document.documentElement.dataset.theme).toBe("dark");
-    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#7C5CFF");
+    // No inline override, so the dark per-theme token (amber) applies.
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
   });
 });
 

@@ -266,6 +266,37 @@ describe("Accessibility: keyboard navigation (Req 22.1, 22.2)", () => {
     expect(screen.getByRole("main")).toHaveAttribute("aria-label", "List");
   });
 
+  it("renders the espresso sidebar nav with 6 buttons and an accent-filled active item", async () => {
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    const navButtons = within(nav).getAllByRole("button");
+    expect(navButtons.length).toBe(6);
+
+    // The six destinations, in order.
+    const labels = navButtons.map((b) => b.textContent?.trim());
+    expect(labels).toEqual([
+      "Dashboard",
+      "List",
+      "Calendar",
+      "Analytics",
+      "Settings",
+      "About",
+    ]);
+
+    // The active item (Dashboard on first paint) is accent-filled and marked
+    // aria-current="page"; the active fill uses the sidebar-accent token.
+    const dashboard = within(nav).getByRole("button", { name: /dashboard/i });
+    expect(dashboard).toHaveAttribute("aria-current", "page");
+    expect(dashboard.className).toContain("bg-sidebar-accent");
+
+    // Exactly one active item at a time.
+    const current = navButtons.filter(
+      (b) => b.getAttribute("aria-current") === "page",
+    );
+    expect(current.length).toBe(1);
+  });
+
   it("switches views with the digit shortcuts (Req 22.2)", async () => {
     const user = userEvent.setup();
     render(<App />);
@@ -352,5 +383,73 @@ describe("Accessibility: scalable fonts and high contrast (Req 22.4)", () => {
 
   it("includes a prefers-contrast media block for high-contrast displays", () => {
     expect(css).toMatch(/@media\s*\(prefers-contrast:\s*more\)/);
+  });
+
+  it("strengthens an espresso sidebar token under prefers-contrast: more (Req 22.4)", () => {
+    // The high-contrast block must also strengthen the espresso sidebar surface
+    // (not only the main-surface tokens).
+    const hcBlock = css.slice(css.indexOf("@media (prefers-contrast: more)"));
+    expect(hcBlock).toMatch(/--sidebar-foreground:/);
+    expect(hcBlock).toMatch(/--sidebar-border:/);
+    expect(hcBlock).toMatch(/--sidebar-section:/);
+  });
+});
+
+// --- Warm Graphite token layer, from CSS -------------------------------------
+
+describe("Warm Graphite token layer (DESIGN: Colors / Elevation)", () => {
+  let css: string;
+  let tw: string;
+
+  beforeEach(async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const root = dirname(dirname(fileURLToPath(import.meta.url)));
+    css = readFileSync(join(root, "src", "styles", "globals.css"), "utf8");
+    tw = readFileSync(join(root, "tailwind.config.js"), "utf8");
+  });
+
+  it("uses the Warm Graphite accent (ochre #92400e light / amber #f59e0b dark)", () => {
+    expect(css).toMatch(/--accent:\s*#92400e/);
+    expect(css).toMatch(/--accent:\s*#f59e0b/);
+  });
+
+  it("defines the espresso sidebar surface (#1f1a14 family + #241f17 gradient)", () => {
+    // The sidebar HSL tokens exist (espresso #1f1a14 ≈ 32.7 21.6% 10%).
+    expect(css).toMatch(/--sidebar:\s*32\.7 21\.6% 10%/);
+    // The gradient start color lives in the shell (App.tsx), asserted below.
+  });
+
+  it("authors the elevation scale as CSS vars", () => {
+    expect(css).toMatch(/--elevation-card:/);
+    expect(css).toMatch(/--elevation-raised:/);
+    expect(css).toMatch(/--elevation-modal:/);
+  });
+
+  it("exposes the elevation scale as Tailwind boxShadow utilities", () => {
+    expect(tw).toMatch(/card:\s*"var\(--elevation-card\)"/);
+    expect(tw).toMatch(/raised:\s*"var\(--elevation-raised\)"/);
+    expect(tw).toMatch(/popover:\s*"var\(--elevation-popover\)"/);
+    expect(tw).toMatch(/modal:\s*"var\(--elevation-modal\)"/);
+  });
+
+  it("contains no retired purple accent (#7c5cff)", () => {
+    expect(css.toLowerCase()).not.toContain("7c5cff");
+  });
+});
+
+// --- Espresso sidebar surface in the shell -----------------------------------
+
+describe("Espresso sidebar surface (DESIGN: Sidebar)", () => {
+  it("renders the sidebar as a #241f17 gradient over the bg-sidebar surface", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join, dirname } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const root = dirname(dirname(fileURLToPath(import.meta.url)));
+    const appTsx = readFileSync(join(root, "src", "App.tsx"), "utf8");
+    expect(appTsx).toMatch(/#241f17/);
+    expect(appTsx).toContain("bg-sidebar");
+    expect(appTsx.toLowerCase()).not.toContain("7c5cff");
   });
 });
