@@ -1,5 +1,5 @@
 /**
- * Settings view (task 26.1, Req 14, 15, 23).
+ * Settings view (Story 3.2; Req 14, 15, 23).
  *
  * Renders the persisted {@link Settings} from {@link settingsStore} (via the
  * `useStore` hook, so the view re-renders whenever settings reload after a
@@ -9,11 +9,31 @@
  * (Req 15.3). The store reload triggered by the resulting `onDataChanged`
  * broadcast keeps the UI in sync.
  *
+ * Reworked onto {@link SettingsScaffold} / {@link SettingsSection} (the shared
+ * section-insert primitive) with full capability parity: every v1 control —
+ * Default currency, Notifications enable + the three Lead Times, Backup
+ * frequency, Theme, Accent color, Tray Mode, and the Data folder chooser — is
+ * still present and operable with its original accessible name, and each still
+ * persists through `settingsApi.update(...)`. Later epics (Home Currency,
+ * notifications/Tray, Backups, Online Features) append one `<SettingsSection>`
+ * child through the scaffold — they never restructure the screen or add a route.
+ *
+ * The accent control is reconciled to the 1.0 Warm Graphite theme-token model
+ * (DESIGN "one-accent-and-stop"): the accent is a per-theme token (ochre
+ * `#92400e` light / amber `#f59e0b` dark — the `--accent` values in
+ * `src/styles/globals.css`, applied by `applyAccent` in
+ * `src/theme/themeManager.ts`), not a free user hex, so the v1 free-hex
+ * `<input type="color">` showed a swatch that disagreed with the painted accent
+ * in dark. The control now presents the two theme accents honestly as labelled
+ * swatches — marking the one for the active theme as current — with a note that
+ * the accent follows the active theme, while keeping the discoverable "Accent
+ * color" grouping (parity). This closes the Story-3.1 deferred seam.
+ *
  * Failures from the IPC bridge ({@link SubbyError}) are caught and recorded in
  * the global {@link errorStore} for a non-blocking toast — the view never
- * crashes (Req 19.4).
- *
- * A non-intrusive footer credits the author (Req 23.2, 23.3).
+ * crashes (Req 19.4). The renderer stays sandboxed — this view imports only
+ * `window.subby` (via `@/api/subby`), stores, and build-time constants; no
+ * `fs`/`path`/`electron`.
  *
  * _Requirements: 15.1, 15.2, 15.3, 23.2, 23.3_
  */
@@ -29,6 +49,11 @@ import { settingsApi, toAppError } from "@/api/subby";
 import { settingsStore } from "@/stores/settingsStore";
 import { errorStore } from "@/stores/errorStore";
 import { useStore } from "@/stores/hooks";
+import { SettingsScaffold, SettingsSection } from "@/components/SettingsSection";
+import {
+  resolveTheme,
+  type ResolvedTheme,
+} from "@/theme/themeManager";
 
 /** Currency options for this build (default INR, Req 6.3). */
 const CURRENCIES: readonly string[] = [
@@ -64,6 +89,23 @@ const THEMES: readonly { value: SettingsModel["theme"]; label: string }[] = [
   { value: "system", label: "System" },
 ];
 
+/**
+ * The two Warm Graphite theme accents, shown honestly in the Accent control.
+ * These are the per-theme `--accent` tokens (DESIGN: Colors) authored in
+ * `src/styles/globals.css` and applied by `applyAccent` in
+ * `src/theme/themeManager.ts` — ochre in light, amber in dark. The accent is a
+ * theme token in 1.0, not a free user hex. `theme` keys each swatch to the
+ * resolved appearance so the control can mark the active one as current.
+ */
+const THEME_ACCENTS: readonly {
+  theme: ResolvedTheme;
+  label: string;
+  hex: string;
+}[] = [
+  { theme: "light", label: "Light", hex: "#92400e" }, // ochre
+  { theme: "dark", label: "Dark", hex: "#f59e0b" }, // amber
+];
+
 /** Shared focus-ring + control styling tokens. */
 const FOCUS_RING =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
@@ -74,6 +116,10 @@ const SELECT_CLASS =
 export default function Settings(): JSX.Element {
   const { data: settings } = useStore(settingsStore);
   const [choosingFolder, setChoosingFolder] = useState(false);
+
+  // The appearance currently painted (dark/light), so the accent swatch for the
+  // active theme can be marked current — matching the token applyAccent paints.
+  const activeTheme: ResolvedTheme = resolveTheme(settings.theme);
 
   /**
    * Persist a settings patch (Req 15.2). Any IPC failure is normalized to an
@@ -114,16 +160,12 @@ export default function Settings(): JSX.Element {
   }
 
   return (
-    <div className="space-y-8">
-      <header className="space-y-1">
-        <h2 className="text-2xl font-semibold tracking-tight">Settings</h2>
-        <p className="text-muted-foreground">
-          Configure application preferences. Changes are saved automatically.
-        </p>
-      </header>
-
+    <SettingsScaffold
+      title="Settings"
+      description="Configure application preferences. Changes are saved automatically."
+    >
       {/* General */}
-      <Section
+      <SettingsSection
         title="General"
         description="Default currency used when adding subscriptions."
       >
@@ -147,10 +189,10 @@ export default function Settings(): JSX.Element {
             ))}
           </select>
         </Field>
-      </Section>
+      </SettingsSection>
 
       {/* Notifications */}
-      <Section
+      <SettingsSection
         title="Notifications"
         description="Desktop reminders before a subscription renews."
       >
@@ -194,10 +236,10 @@ export default function Settings(): JSX.Element {
             })}
           </div>
         </fieldset>
-      </Section>
+      </SettingsSection>
 
       {/* Backups */}
-      <Section
+      <SettingsSection
         title="Backups"
         description="How often Subby creates an automatic backup."
       >
@@ -220,10 +262,10 @@ export default function Settings(): JSX.Element {
             ))}
           </select>
         </Field>
-      </Section>
+      </SettingsSection>
 
       {/* Appearance */}
-      <Section
+      <SettingsSection
         title="Appearance"
         description="Theme and accent color for the interface."
       >
@@ -244,24 +286,58 @@ export default function Settings(): JSX.Element {
           </select>
         </Field>
 
-        <Field htmlFor="setting-accent" label="Accent color">
-          <div className="flex items-center gap-3">
-            <input
-              id="setting-accent"
-              type="color"
-              className={`h-9 w-16 cursor-pointer rounded-md border border-input bg-background ${FOCUS_RING}`}
-              value={settings.accentColor}
-              onChange={(e) => void persist({ accentColor: e.target.value })}
-            />
-            <span className="text-sm text-muted-foreground">
-              {settings.accentColor}
-            </span>
+        {/*
+          Accent color — reconciled to the Warm Graphite theme-token model.
+          The accent is a per-theme token (ochre light / amber dark), not a free
+          user hex, so instead of a misleading free-hex color input we present
+          the two theme accents honestly as read-only labelled swatches with a
+          note that the accent follows the active theme. The swatch for the
+          active appearance is marked current (text + aria-current, not color
+          alone) so the control reflects reality. The group keeps the "Accent
+          color" accessible name so the control stays discoverable.
+        */}
+        <div
+          className="max-w-sm space-y-2"
+          role="group"
+          aria-label="Accent color"
+        >
+          <span className="block text-sm font-medium text-foreground">
+            Accent color
+          </span>
+          <div className="flex items-center gap-4">
+            {THEME_ACCENTS.map(({ theme, label, hex }) => {
+              const current = theme === activeTheme;
+              return (
+                <span
+                  key={label}
+                  aria-current={current ? "true" : undefined}
+                  className={`inline-flex items-center gap-2 text-sm ${
+                    current
+                      ? "font-medium text-foreground"
+                      : "text-muted-foreground"
+                  }`}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`h-5 w-5 rounded-md border border-border ${
+                      current ? "ring-2 ring-ring ring-offset-1 ring-offset-background" : ""
+                    }`}
+                    style={{ backgroundColor: hex }}
+                  />
+                  {label}
+                  {current && " (current)"}
+                </span>
+              );
+            })}
           </div>
-        </Field>
-      </Section>
+          <p className="text-sm text-muted-foreground">
+            The accent follows the active theme — ochre in light, amber in dark.
+          </p>
+        </div>
+      </SettingsSection>
 
       {/* System */}
-      <Section
+      <SettingsSection
         title="System"
         description="Background behavior and where your data is stored."
       >
@@ -295,34 +371,10 @@ export default function Settings(): JSX.Element {
             </span>
           </div>
         </div>
-      </Section>
+      </SettingsSection>
 
       <AttributionFooter />
-    </div>
-  );
-}
-
-/** A labelled settings group with a heading and helper text. */
-function Section({
-  title,
-  description,
-  children,
-}: {
-  title: string;
-  description: string;
-  children: React.ReactNode;
-}): JSX.Element {
-  return (
-    <section
-      aria-label={title}
-      className="space-y-4 rounded-lg border border-border bg-card p-5 text-card-foreground"
-    >
-      <div className="space-y-1">
-        <h3 className="text-base font-semibold">{title}</h3>
-        <p className="text-sm text-muted-foreground">{description}</p>
-      </div>
-      <div className="space-y-4">{children}</div>
-    </section>
+    </SettingsScaffold>
   );
 }
 

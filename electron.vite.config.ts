@@ -2,11 +2,20 @@ import { resolve } from "node:path";
 import { defineConfig } from "electron-vite";
 import react from "@vitejs/plugin-react";
 
+import pkg from "./package.json";
+
 // Shared path aliases so `core/*`, `shared/*`, and `@/*` resolve in every target.
 const alias = {
   core: resolve(__dirname, "core"),
   shared: resolve(__dirname, "shared"),
   "@": resolve(__dirname, "src"),
+};
+
+// Bake the app version into the renderer bundle as a build-time string literal
+// (Story 3.2). `src/version.ts` re-exports it as `APP_VERSION`; the About screen
+// renders it. Compile-time constant → no IPC, renderer sandbox intact.
+const define = {
+  __APP_VERSION__: JSON.stringify(pkg.version),
 };
 
 export default defineConfig({
@@ -42,6 +51,7 @@ export default defineConfig({
   renderer: {
     root: resolve(__dirname, "src"),
     resolve: { alias },
+    define,
     plugins: [react()],
     build: {
       outDir: "out/renderer",

@@ -25,11 +25,61 @@ through `window.subby` (see [IPC & Renderer API](./ipc-api.md)).
 | Subscription List | `SubscriptionList.tsx` | Table/card layout; search, sort, filter, group, multi-select bulk actions, inline quick-edit. |
 | Calendar | `CalendarView.tsx` (lazy) | Monthly grid with renewal indicators + per-day side panel. Pure grid helpers in `calendarGrid.ts`. |
 | Analytics | `AnalyticsView.tsx` (lazy) | Monthly spend, category distribution, yearly projection, most-expensive, renewal timeline — inline SVG charts. |
-| Settings | `Settings.tsx` | Currency, notifications + lead times, backup frequency, theme, accent, Tray_Mode, data folder; persists each change. |
-| About | `About.tsx` | Name, tagline, and attribution. |
+| Settings | `Settings.tsx` | Currency, notifications + lead times, backup frequency, theme, accent, Tray_Mode, data folder; persists each change. Built on the section-insert scaffold (see below). |
+| About | `About.tsx` | Name, tagline, ECB exchange-rate attribution, app version (`src/version.ts`), and author credit. Built on the same section-insert scaffold. |
 
 All views derive their figures from `core/` functions (e.g. `core/analytics`,
 `core/search`) rather than re-implementing logic, and re-render on data change.
+
+## Settings & About section-insert pattern
+
+Settings (nav key `settings`, digit `5`) and About (nav key `about`, digit `6`)
+are the two Epic-3 nav destinations. Both are a **single stacked, scrolling
+column of titled sections** built on the shared scaffold in
+`src/components/SettingsSection.tsx`:
+
+- **`SettingsScaffold`** — the page `<header>` (screen title + optional
+  description) above the stacked column that renders its section children in
+  reading order. No sub-nav, no router.
+- **`SettingsSection`** — one titled panel. It renders a landmark `<section>`
+  whose **accessible name is its own visible `<h3>` heading** (wired via a
+  generated `aria-labelledby`), an optional description, and the section's own
+  controls. It owns the resting-card surface and vertical rhythm.
+
+Six later epics (Home Currency, notifications/Tray Mode, Backups, Online
+Features, and About's attribution/version/donate) contribute panels to these two
+screens. The contract they build against is deliberately small — **insert,
+don't restructure**:
+
+```tsx
+<SettingsScaffold title="Settings" description="…">
+  <SettingsSection title="General" description="Default currency…">…</SettingsSection>
+  {/* A later epic appends ONE child in reading order: */}
+  <SettingsSection title="Home Currency">{/* its own controls */}</SettingsSection>
+</SettingsScaffold>
+```
+
+Rules for later epics:
+
+1. **Append one `<SettingsSection title="…">` child** in reading order. The
+   primitive gives it a labelled landmark + heading + spacing/elevation, so the
+   insertion never re-lays-out sibling sections.
+2. **Never create a second Settings route.** There is exactly one `settings`
+   destination (and one `about`). Do not add a router or a two-column sub-nav.
+3. **Don't re-skin the card anatomy or add a per-section brand hue** — every
+   section inherits the same Warm Graphite resting-card surface.
+
+The accent control in Settings presents the Warm Graphite accent **honestly as a
+theme token** (ochre in light, amber in dark) rather than a free-hex color input:
+the 1.0 accent follows the active theme (DESIGN "one-accent-and-stop"), so the
+control shows the two theme accents with a note rather than a swatch that could
+disagree with the painted accent.
+
+The About version line reads from `src/version.ts` (`APP_VERSION`), which
+re-exports a build-time `__APP_VERSION__` literal injected by Vite (`define` in
+`electron.vite.config.ts` and `vitest.config.ts`) with a `"0.0.0-dev"` fallback.
+This is a compile-time constant — no IPC, no `fs`/`electron` — so the renderer
+sandbox stays intact.
 
 ## Components (`src/components/`)
 
@@ -42,6 +92,9 @@ All views derive their figures from `core/` functions (e.g. `core/analytics`,
 - **`GlobalSearch.tsx`** — a Cmd/Ctrl-K command palette using
   `core/search.fuzzySearch`. Keyboard-first (arrows to move, Enter to select,
   Escape to close), `role="combobox"`/`listbox` semantics, empty query lists all.
+- **`SettingsSection.tsx`** — `SettingsScaffold` + `SettingsSection`, the shared
+  section-insert scaffold used by both Settings and About. See
+  [Settings & About section-insert pattern](#settings--about-section-insert-pattern).
 
 ## Client stores (`src/stores/`)
 

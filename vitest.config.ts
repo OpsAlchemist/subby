@@ -1,6 +1,8 @@
 import { resolve } from "node:path";
 import { defineConfig } from "vitest/config";
 
+import pkg from "./package.json";
+
 // Vitest uses the same path aliases as the build so tests can import
 // `core/*`, `shared/*`, and `@/*` exactly like application code.
 export default defineConfig({
@@ -10,6 +12,11 @@ export default defineConfig({
       shared: resolve(__dirname, "shared"),
       "@": resolve(__dirname, "src"),
     },
+  },
+  // Mirror the renderer's build-time `__APP_VERSION__` literal (Story 3.2) so
+  // `src/version.ts` resolves under tests instead of a ReferenceError.
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
   },
   test: {
     globals: true,

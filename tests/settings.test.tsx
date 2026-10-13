@@ -2,16 +2,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cleanup,
-  fireEvent,
   render,
   screen,
   waitFor,
+  within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom/vitest";
 
 import Settings from "@/views/Settings";
 import About from "@/views/About";
+import {
+  SettingsScaffold,
+  SettingsSection,
+} from "@/components/SettingsSection";
+import { APP_VERSION } from "@/version";
+import pkg from "../package.json";
 import { setSubby } from "@/api/subby";
 import {
   initStores,
@@ -59,7 +65,7 @@ const KNOWN_SETTINGS: SettingsModel = {
   },
   backupFrequency: "weekly",
   theme: "dark",
-  accentColor: "#7c5cff",
+  accentColor: "#92400e", // Warm Graphite default (ochre); the old purple is retired
   trayMode: false,
   dataFolder: null,
 };
@@ -227,17 +233,6 @@ describe("Settings persistence calls updateSettings (Req 15.2)", () => {
     expect(fake.updateSpy).toHaveBeenCalledWith({ backupFrequency: "daily" });
   });
 
-  it("persists an accent color change", async () => {
-    render(<Settings />);
-
-    const accent = await screen.findByLabelText("Accent color");
-    // Color inputs are awkward for user-event typing; fire the change directly.
-    fireEvent.change(accent, { target: { value: "#ff0000" } });
-
-    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
-    expect(fake.updateSpy).toHaveBeenCalledWith({ accentColor: "#ff0000" });
-  });
-
   it("persists toggling Tray_Mode", async () => {
     const user = userEvent.setup();
     render(<Settings />);
@@ -305,5 +300,174 @@ describe("Settings footer attribution (Req 23.2, 23.3)", () => {
     expect(footer).toHaveTextContent("Mr. K");
     expect(footer).toHaveTextContent("@KubeMonk");
     expect(footer).toHaveTextContent("OpsAlchemist");
+  });
+});
+
+// --- Section-insert scaffold: labelled landmarks (Story 3.2 AC) --------------
+
+describe("Settings section-insert scaffold (Story 3.2)", () => {
+  it("renders every Settings section as a labelled landmark region", async () => {
+    render(<Settings />);
+    await screen.findByLabelText("Theme");
+
+    // Each v1 group is now a <section> landmark whose accessible name is its
+    // own visible heading (region role requires an accessible name to resolve).
+    for (const name of [
+      "General",
+      "Notifications",
+      "Backups",
+      "Appearance",
+      "System",
+    ]) {
+      expect(
+        screen.getByRole("region", { name }),
+        `missing labelled section "${name}"`,
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("renders a region whose accessible name IS its own visible heading", () => {
+    render(
+      <SettingsScaffold title="Settings">
+        <SettingsSection title="Backups" description="…">
+          <button type="button">a control</button>
+        </SettingsSection>
+      </SettingsScaffold>,
+    );
+
+    const region = screen.getByRole("region", { name: "Backups" });
+    const heading = screen.getByRole("heading", { name: "Backups" });
+    // The section's accessible name comes from its own heading (aria-labelledby
+    // → the h3 id), not a separate aria-label.
+    expect(region).toHaveAttribute("aria-labelledby", heading.id);
+    expect(region).not.toHaveAttribute("aria-label");
+  });
+
+  it("inserting one SettingsSection is additive — siblings are unchanged", () => {
+    // Baseline: two sections.
+    const { rerender } = render(
+      <SettingsScaffold title="Settings">
+        <SettingsSection title="General">
+          <span>general controls</span>
+        </SettingsSection>
+        <SettingsSection title="Appearance">
+          <span>appearance controls</span>
+        </SettingsSection>
+      </SettingsScaffold>,
+    );
+
+    expect(screen.getAllByRole("region")).toHaveLength(2);
+
+    // A later epic appends ONE child in reading order (insert, don't
+    // restructure): the new titled landmark appears and the originals persist.
+    rerender(
+      <SettingsScaffold title="Settings">
+        <SettingsSection title="General">
+          <span>general controls</span>
+        </SettingsSection>
+        <SettingsSection title="Appearance">
+          <span>appearance controls</span>
+        </SettingsSection>
+        <SettingsSection title="Home Currency">
+          <span>home currency controls</span>
+        </SettingsSection>
+      </SettingsScaffold>,
+    );
+
+    const regions = screen.getAllByRole("region");
+    expect(regions).toHaveLength(3);
+    expect(regions.map((r) => r.getAttribute("aria-labelledby"))).toHaveLength(3);
+    expect(screen.getByRole("region", { name: "General" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Appearance" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Home Currency" }),
+    ).toBeInTheDocument();
+  });
+
+  it("omits the description paragraph when none is provided", () => {
+    render(
+      <SettingsScaffold title="Settings">
+        <SettingsSection title="Home Currency">
+          <span>controls</span>
+        </SettingsSection>
+      </SettingsScaffold>,
+    );
+
+    const region = screen.getByRole("region", { name: "Home Currency" });
+    // Only the heading text — no description <p> is emitted when omitted.
+    expect(region.querySelector("p")).toBeNull();
+  });
+});
+
+// --- Accent reconciliation: honest theme-token presentation (Story 3.2) ------
+
+describe("Settings accent control reconciliation (Story 3.1 deferred seam)", () => {
+  it("keeps a discoverable 'Accent color' control", async () => {
+    render(<Settings />);
+    await screen.findByLabelText("Theme");
+
+    expect(
+      screen.getByRole("group", { name: "Accent color" }),
+    ).toBeInTheDocument();
+  });
+
+  it("presents the theme accents honestly — no misleading free-hex input", async () => {
+    render(<Settings />);
+    const group = await screen.findByRole("group", { name: "Accent color" });
+
+    // No free-hex color input that would disagree with the painted token.
+    expect(group.querySelector('input[type="color"]')).toBeNull();
+    // The two theme accents are explained as following the active theme.
+    expect(
+      within(group).getByText(/follows the active theme/i),
+    ).toBeInTheDocument();
+    // Both swatches are shown (the active one carries a "(current)" marker).
+    expect(within(group).getByText("Light")).toBeInTheDocument();
+    expect(within(group).getByText(/^Dark/)).toBeInTheDocument();
+  });
+
+  it("marks the active-theme swatch as current (dark-seeded → amber/Dark)", async () => {
+    // KNOWN_SETTINGS.theme is "dark" → the Dark (amber) swatch is current.
+    render(<Settings />);
+    const group = await screen.findByRole("group", { name: "Accent color" });
+
+    // The current marker is text (never color-only) + aria-current.
+    const current = within(group).getByText(/current/i);
+    expect(current).toHaveTextContent("Dark (current)");
+    expect(current).toHaveAttribute("aria-current", "true");
+
+    // Exactly one swatch is marked current, and it is the Dark one.
+    const marked = within(group)
+      .getAllByText(/^(Light|Dark)/)
+      .filter((el) => el.getAttribute("aria-current") === "true");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toHaveTextContent("Dark");
+  });
+});
+
+// --- About: app version + single ECB attribution (Story 3.2) -----------------
+
+describe("About version and attribution scaffold (Story 3.2)", () => {
+  it("renders the app-version line with the real package.json version", () => {
+    render(<About />);
+
+    // The build-time constant is pinned to the real package version (not the
+    // "0.0.0-dev" fallback), and that exact string is rendered.
+    expect(APP_VERSION).toBe(pkg.version);
+    expect(screen.getByText("Version", { exact: false })).toBeInTheDocument();
+    expect(screen.getByText(pkg.version)).toBeInTheDocument();
+  });
+
+  it("hosts the single ECB attribution section (not duplicated)", () => {
+    render(<About />);
+
+    expect(
+      screen.getAllByText(/European Central Bank/),
+    ).toHaveLength(1);
+    expect(
+      screen.getAllByRole("region", { name: "Exchange rates" }),
+    ).toHaveLength(1);
   });
 });
