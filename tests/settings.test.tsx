@@ -286,6 +286,11 @@ describe("About branding and attribution (Req 23.1, 23.2)", () => {
     expect(screen.getByText("Mr. K")).toBeInTheDocument();
     expect(screen.getByText("@KubeMonk")).toBeInTheDocument();
     expect(screen.getByText("OpsAlchemist")).toBeInTheDocument();
+    // ECB exchange-rate attribution (Story 2.3 binding condition).
+    expect(
+      screen.getByRole("heading", { name: "Exchange rates" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/European Central Bank/)).toBeInTheDocument();
   });
 });
 

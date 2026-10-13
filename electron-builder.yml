@@ -20,6 +20,17 @@ files:
   - out/**
   - package.json
 
+# Bundled, read-only resources shipped OUTSIDE the asar archive (AD-24, AD-30).
+# `resources/**` (the offline ECB FX snapshot `fx-snapshot.json`) is placed in
+# the packaged app's Resources directory under `resources/`, so the main-process
+# resource reader resolves it via `process.resourcesPath` with ordinary node:fs
+# in every target. Keeping it outside the asar avoids the asar-aware fs shim.
+extraResources:
+  - from: resources
+    to: resources
+    filter:
+      - "**/*"
+
 # Pack into an asar archive (smaller, faster startup).
 asar: true
 

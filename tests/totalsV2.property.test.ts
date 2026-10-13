@@ -86,6 +86,26 @@ const BASE_RATES: Record<string, string> = {
   BHD: "2.65",
   KWD: "3.25",
   OMR: "2.60",
+  // Common world majors added to the exponent table in Story 2.3 (ship list).
+  // These are TEST-FIXTURE USD-base rates (USD per 1 unit) only — their
+  // absolute values are deliberately kept in the same moderate band as the
+  // existing entries so the re-anchoring in `snapshotFor` stays within the
+  // documented ≤500k-minor / ≤20-sub overflow envelope (CYCLE_SCALE × a very
+  // weak 2-exponent Home would otherwise overflow). The REAL, realistic ECB
+  // values live in resources/fx-snapshot.json and tests/fxSnapshot.property.test.ts;
+  // this fixture only exercises internal consistency against its own oracle.
+  PLN: "0.256",
+  CZK: "0.045",
+  HUF: "0.08",
+  RON: "0.22",
+  TRY: "0.0285",
+  ILS: "0.2656",
+  AED: "0.2723",
+  SAR: "0.2666",
+  THB: "0.0291",
+  MYR: "0.2238",
+  IDR: "0.065",
+  PHP: "0.0177",
 };
 
 /** Rate-string decimals used when re-anchoring {@link snapshotFor}. */

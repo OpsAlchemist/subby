@@ -44,6 +44,18 @@ export default function About(): JSX.Element {
         </p>
       </section>
 
+      <section
+        aria-label="Exchange rate attribution"
+        className="space-y-2 rounded-lg border border-border bg-card p-6 text-card-foreground"
+      >
+        <h3 className="text-sm font-semibold">Exchange rates</h3>
+        <p className="max-w-prose text-sm text-muted-foreground">
+          European Central Bank (ECB) euro foreign exchange reference rates, as
+          of Oct 1, 2026. Rates are bundled with the app and used offline — no
+          network request is ever made.
+        </p>
+      </section>
+
       <footer className="text-sm text-muted-foreground">
         <p>
           Crafted by{" "}

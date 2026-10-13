@@ -16,6 +16,24 @@ verified to keep your data on your device.
 
 These are enforced and continuously verified — see "Verification" below.
 
+## Exchange rates (bundled, offline)
+
+Exchange rates ship with the app as a **bundled, read-only FX snapshot** — there
+is no live request for rates. The dataset is **European Central Bank (ECB) euro
+foreign exchange reference rates, as of Oct 1, 2026**, stored at
+`resources/fx-snapshot.json`:
+
+- **Offline and read-only.** The snapshot is loaded from the app's bundled
+  `resources/` directory through a main-process resource reader using only
+  `node:fs` — no network, and the file is never written back.
+- **Dated.** It carries its own `asOf` date (`2026-10-01`) and a schema version,
+  so a surface can show "rates as of {date}" and a corrupt/unknown-version bundle
+  fails loudly rather than producing a silently wrong total.
+- **ECB attribution** is shown in the About screen.
+
+The opt-in online rate *refresh* (which would update rates from the network) is
+a separate, explicitly opt-in feature and is off by default.
+
 ## Renderer security posture
 
 The renderer is treated as untrusted and tightly sandboxed:

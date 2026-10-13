@@ -27,12 +27,14 @@
 /**
  * Currency -> minor-unit exponent (number of fractional digits).
  *
- * The exact ~30-currency ship list is OPEN (PRD Q1) and does not block this
- * table mechanism; this covers the current app's 8 currencies plus the common
- * majors and the known non-2-exponent cases the model must handle correctly
- * (JPY/KRW = 0 decimals; BHD/KWD/OMR = 3 decimals). Add entries here as the
- * ship list is finalized — the lookup throws on anything absent, so a missing
- * currency is a loud error, never a silent wrong-exponent default.
+ * The ~30-currency ship list is now FINALIZED (PRD Q1, resolved in Story 2.3):
+ * the 8 current options plus the common world majors — 31 currencies the
+ * bundled FX snapshot ships rates for. This table is the single exponent seam
+ * every one of them must be known at (JPY/KRW = 0 decimals; everything else in
+ * the ship list = 2 decimals). The 3-decimal entries (BHD/KWD/OMR) remain as a
+ * harmless superset: they are exponent-known but are not in the shipped rate
+ * set. The lookup throws on anything absent, so a missing currency is a loud
+ * error, never a silent wrong-exponent default.
  */
 export const MINOR_UNIT_EXPONENT: Readonly<Record<string, number>> = Object.freeze({
   // 2-decimal majors (the common case).
@@ -53,10 +55,23 @@ export const MINOR_UNIT_EXPONENT: Readonly<Record<string, number>> = Object.free
   ZAR: 2,
   MXN: 2,
   BRL: 2,
+  // Common world majors added for the finalized ship list (all 2-decimal).
+  PLN: 2,
+  CZK: 2,
+  HUF: 2,
+  RON: 2,
+  TRY: 2,
+  ILS: 2,
+  AED: 2,
+  SAR: 2,
+  THB: 2,
+  MYR: 2,
+  IDR: 2,
+  PHP: 2,
   // 0-decimal currencies (minor unit == major unit).
   JPY: 0,
   KRW: 0,
-  // 3-decimal currencies.
+  // 3-decimal currencies (exponent-known superset; not in the shipped rate set).
   BHD: 3,
   KWD: 3,
   OMR: 3,
