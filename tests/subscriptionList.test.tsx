@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { axe } from "jest-axe";
 
 import SubscriptionList from "@/views/SubscriptionList";
 import { setSubby } from "@/api/subby";
@@ -303,9 +304,11 @@ describe("bulk actions (Req 9.6)", () => {
     expect(calledIds).not.toContain("c");
   });
 
-  it("removes every selected subscription when delete is confirmed", async () => {
+  it("removes every selected subscription via the branded confirm dialog (never window.confirm)", async () => {
     const user = userEvent.setup();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    // The bulk delete must NEVER fall back to the native window.confirm — if it
+    // is called, this spy fails the test.
+    const confirmSpy = vi.spyOn(window, "confirm");
 
     await renderList([
       makeSub({ id: "a", name: "Netflix" }),
@@ -318,7 +321,15 @@ describe("bulk actions (Req 9.6)", () => {
 
     await user.click(screen.getByRole("button", { name: /Delete/ }));
 
-    expect(confirmSpy).toHaveBeenCalled();
+    // A branded in-app alertdialog opens naming the exact count impact; nothing
+    // is deleted yet.
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText(/2 subscriptions/)).toBeInTheDocument();
+    expect(fake.deleteSubscription).not.toHaveBeenCalled();
+
+    // Confirm the destructive action in the dialog (its own "Delete" button).
+    await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+
     await waitFor(() =>
       expect(fake.deleteSubscription).toHaveBeenCalledTimes(2),
     );
@@ -326,6 +337,36 @@ describe("bulk actions (Req 9.6)", () => {
       (c) => c[0],
     );
     expect(removedIds.sort()).toEqual(["a", "b"]);
+    // The selection is cleared and the dialog is dismissed.
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    // The native confirm is never consulted.
+    expect(confirmSpy).not.toHaveBeenCalled();
+  });
+
+  it("cancelling the branded delete dialog keeps the selection and deletes nothing", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix" }),
+      makeSub({ id: "b", name: "Spotify" }),
+    ]);
+
+    const table = screen.getByRole("table");
+    await user.click(within(table).getByLabelText("Select Netflix"));
+    await user.click(within(table).getByLabelText("Select Spotify"));
+    await user.click(screen.getByRole("button", { name: /Delete/ }));
+
+    const dialog = await screen.findByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument(),
+    );
+    expect(fake.deleteSubscription).not.toHaveBeenCalled();
+    // The selection survives — the bulk-actions bar still shows the count.
+    const bulkBar = screen.getByRole("region", { name: "Bulk actions" });
+    expect(within(bulkBar).getByText("2 selected")).toBeInTheDocument();
   });
 });
 
@@ -406,5 +447,337 @@ describe("category color dot + tag chips (Story 3.4)", () => {
     const table = screen.getByRole("table");
     expect(within(table).getByText("Shared")).toBeInTheDocument();
     expect(within(table).getByText("Family")).toBeInTheDocument();
+  });
+});
+
+// --- Tag filter (Story 3.5, FR-4) --------------------------------------------
+
+describe("tag filter (Story 3.5, FR-4)", () => {
+  it("shows only subscriptions carrying the selected tag and composes with other filters", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", tags: ["Work", "Home"] }),
+      makeSub({ id: "b", name: "Spotify", tags: ["Home"] }),
+      makeSub({ id: "c", name: "Hulu", tags: [] }),
+    ]);
+
+    // All rows at rest (tag axis defaults to "all" — a no-op).
+    expect(tableRowNames()).toEqual(["Netflix", "Spotify", "Hulu"]);
+
+    // Picking "Work" leaves only subs whose tags include that EXACT tag.
+    await user.selectOptions(screen.getByLabelText("Tag"), "Work");
+    expect(tableRowNames()).toEqual(["Netflix"]);
+
+    // Switching to "Home" matches both Netflix and Spotify.
+    await user.selectOptions(screen.getByLabelText("Tag"), "Home");
+    expect(tableRowNames()).toEqual(["Netflix", "Spotify"]);
+
+    // "All tags" is a no-op again.
+    await user.selectOptions(screen.getByLabelText("Tag"), "all");
+    expect(tableRowNames()).toEqual(["Netflix", "Spotify", "Hulu"]);
+  });
+
+  it("lists distinct exact-case tags as options in first-seen order", async () => {
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", tags: ["Work", "Home"] }),
+      makeSub({ id: "b", name: "Spotify", tags: ["work"] }),
+      makeSub({ id: "c", name: "Hulu", tags: [] }),
+    ]);
+
+    const select = screen.getByLabelText("Tag") as HTMLSelectElement;
+    const options = Array.from(select.options).map((o) => o.value);
+    // "all" placeholder first, then distinct tags in first-seen order; "Work"
+    // and "work" are DISTINCT (exact-case); the empty-tag sub contributes none.
+    expect(options).toEqual(["all", "Work", "Home", "work"]);
+  });
+
+  it("intersects the Tag axis with a Category filter", async () => {
+    const user = userEvent.setup();
+    await renderList(
+      [
+        makeSub({ id: "a", name: "Netflix", category: "Streaming", tags: ["Work"] }),
+        makeSub({ id: "b", name: "Hulu", category: "Streaming", tags: ["Home"] }),
+        makeSub({ id: "c", name: "Blog", category: "Writing", tags: ["Work"] }),
+      ],
+      [makeCategory("Streaming"), makeCategory("Writing")],
+    );
+
+    await user.selectOptions(screen.getByLabelText("Category"), "Streaming");
+    await user.selectOptions(screen.getByLabelText("Tag"), "Work");
+    // Only the sub matching BOTH axes shows.
+    expect(tableRowNames()).toEqual(["Netflix"]);
+  });
+});
+
+// --- Quick-edit validation (Story 3.5, Req 9.7) ------------------------------
+
+describe("quick-edit validation (Story 3.5, Req 9.7)", () => {
+  it("keeps the editor open with an announced alert on an invalid amount, persisting nothing", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+    ]);
+
+    // See the note in the valid-amount test: neutralize focus() so the twin
+    // card-layout input cannot steal focus and blur-close this editor.
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Edit amount for Netflix" }),
+    );
+
+    const input = await within(table).findByRole("spinbutton", {
+      name: "Edit amount for Netflix",
+    });
+    fireEvent.change(input, { target: { value: "abc" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    // The editor STAYS open with an announced role="alert" inline error; nothing
+    // was persisted.
+    const alert = await within(table).findByRole("alert");
+    expect(alert).toHaveTextContent(/valid amount/i);
+    expect(
+      within(table).getByRole("spinbutton", { name: "Edit amount for Netflix" }),
+    ).toBeInTheDocument();
+    expect(fake.updateSubscription).not.toHaveBeenCalled();
+  });
+
+  it("keeps the editor open with an alert on an invalid date, persisting nothing", async () => {
+    const user = userEvent.setup();
+    await renderList([makeSub({ id: "a", name: "Netflix" })]);
+
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Edit next renewal for Netflix" }),
+    );
+
+    const input = await within(table).findByLabelText("Edit next renewal for Netflix");
+    // A bare `type="date"` input in jsdom accepts arbitrary strings; feed a
+    // non-ISO value to trip the regex guard.
+    fireEvent.change(input, { target: { value: "nope" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const alert = await within(table).findByRole("alert");
+    expect(alert).toHaveTextContent(/valid date/i);
+    expect(fake.updateSubscription).not.toHaveBeenCalled();
+  });
+
+  it("cancels on Esc and returns focus to the originating cell trigger", async () => {
+    await renderList([makeSub({ id: "a", name: "Netflix" })]);
+
+    const table = screen.getByRole("table");
+    const trigger = within(table).getByRole("button", {
+      name: "Edit amount for Netflix",
+    });
+
+    // Make the trigger the active element BEFORE neutralizing focus(), so
+    // startEdit captures it as the focus-return target. (jsdom renders both the
+    // table and card layouts; the twin autoFocus inputs would otherwise steal
+    // focus and blur-close the editor — the global focus() no-op prevents that
+    // race, matching the existing valid-amount test.)
+    trigger.focus();
+    expect(trigger).toHaveFocus();
+    const focusSpy = vi
+      .spyOn(HTMLElement.prototype, "focus")
+      .mockImplementation(() => {});
+
+    fireEvent.click(trigger);
+    const input = await within(table).findByRole("spinbutton", {
+      name: "Edit amount for Netflix",
+    });
+
+    // The focus-return target is the originating trigger; spy on ITS focus.
+    const triggerFocus = vi.spyOn(trigger, "focus");
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    // The editor closed, nothing persisted, and focus was returned to the
+    // originating cell's quick-edit button.
+    await waitFor(() =>
+      expect(
+        within(table).queryByRole("spinbutton", {
+          name: "Edit amount for Netflix",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(triggerFocus).toHaveBeenCalled();
+    expect(fake.updateSubscription).not.toHaveBeenCalled();
+
+    focusSpy.mockRestore();
+  });
+
+  it("reverts on an invalid blur — nothing persisted and no dangling alert", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+    ]);
+
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Edit amount for Netflix" }),
+    );
+
+    const input = await within(table).findByRole("spinbutton", {
+      name: "Edit amount for Netflix",
+    });
+    fireEvent.change(input, { target: { value: "abc" } });
+    // Blur with an invalid value reverts (cancels) — it never persists bad data,
+    // and leaves no dangling alert behind.
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(
+        within(table).queryByRole("spinbutton", {
+          name: "Edit amount for Netflix",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(within(table).queryByRole("alert")).not.toBeInTheDocument();
+    expect(fake.updateSubscription).not.toHaveBeenCalled();
+  });
+
+  it("commits a VALID blur — persists the edit and closes the editor", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+    ]);
+
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Edit amount for Netflix" }),
+    );
+
+    const input = await within(table).findByRole("spinbutton", {
+      name: "Edit amount for Netflix",
+    });
+    fireEvent.change(input, { target: { value: "999" } });
+    // Blur with a VALID value still commits (preserves the existing behavior).
+    fireEvent.blur(input);
+
+    await waitFor(() =>
+      expect(fake.updateSubscription).toHaveBeenCalledTimes(1),
+    );
+    // minorUnits("999", "INR") === 99900 (exponent 2).
+    expect(fake.updateSubscription).toHaveBeenCalledWith("a", { amountMinor: 99900 });
+    // The editor closed.
+    await waitFor(() =>
+      expect(
+        within(table).queryByRole("spinbutton", {
+          name: "Edit amount for Netflix",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("recovers from an invalid Enter: fixing the value and committing clears the alert and persists", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+    ]);
+
+    vi.spyOn(HTMLElement.prototype, "focus").mockImplementation(() => {});
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Edit amount for Netflix" }),
+    );
+
+    const input = await within(table).findByRole("spinbutton", {
+      name: "Edit amount for Netflix",
+    });
+
+    // Invalid commit: the editor holds open, the alert appears, nothing persists.
+    fireEvent.change(input, { target: { value: "abc" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(await within(table).findByRole("alert")).toBeInTheDocument();
+    expect(fake.updateSubscription).not.toHaveBeenCalled();
+
+    // Fix the value and commit again: the alert clears, the edit persists, and
+    // the editor closes.
+    fireEvent.change(input, { target: { value: "999" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(fake.updateSubscription).toHaveBeenCalledTimes(1),
+    );
+    expect(fake.updateSubscription).toHaveBeenCalledWith("a", { amountMinor: 99900 });
+    await waitFor(() => {
+      expect(within(table).queryByRole("alert")).not.toBeInTheDocument();
+      expect(
+        within(table).queryByRole("spinbutton", {
+          name: "Edit amount for Netflix",
+        }),
+      ).not.toBeInTheDocument();
+    });
+  });
+});
+
+// --- Selection count live region (Story 3.5, Req 9.6) ------------------------
+
+describe("selection-count live region (Story 3.5, Req 9.6)", () => {
+  it("announces the selection count through a persistent polite status region", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix" }),
+      makeSub({ id: "b", name: "Spotify" }),
+    ]);
+
+    // The region is mounted UNCONDITIONALLY (empty at rest) so a change is
+    // observed by assistive tech — present before the count changes.
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("");
+
+    const table = screen.getByRole("table");
+    await user.click(within(table).getByLabelText("Select Netflix"));
+    expect(status).toHaveTextContent("1 selected");
+
+    await user.click(within(table).getByLabelText("Select Spotify"));
+    expect(status).toHaveTextContent("2 selected");
+
+    // Clearing the selection empties the region again.
+    await user.click(within(table).getByLabelText("Select Netflix"));
+    await user.click(within(table).getByLabelText("Select Spotify"));
+    expect(status).toHaveTextContent("");
+  });
+});
+
+// --- Accessibility of the new surfaces (Story 3.5) ---------------------------
+
+describe("new-surface accessibility (Story 3.5)", () => {
+  it("the List with the Tag filter has no serious/critical axe violations", async () => {
+    await renderList(
+      [makeSub({ id: "a", name: "Netflix", tags: ["Work"] })],
+      [makeCategory("Streaming")],
+    );
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
+  });
+
+  it("the branded delete dialog is axe-clean when open", async () => {
+    const user = userEvent.setup();
+    await renderList([makeSub({ id: "a", name: "Netflix" })]);
+    const table = screen.getByRole("table");
+    await user.click(within(table).getByLabelText("Select Netflix"));
+    await user.click(screen.getByRole("button", { name: /Delete/ }));
+    await screen.findByRole("alertdialog");
+
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
   });
 });

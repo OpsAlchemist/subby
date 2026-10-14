@@ -167,3 +167,33 @@ export function or(...predicates: SubscriptionPredicate[]): SubscriptionPredicat
 export function activeSubscriptions(subs: Subscription[]): Subscription[] {
   return filterByPredicate(subs, isActive);
 }
+
+// --- Tags --------------------------------------------------------------------
+
+/**
+ * Collect the distinct tags across every subscription in first-seen order,
+ * backing the List's Tag filter option list (Req 9.4, FR-4).
+ *
+ * Pure and platform-independent (like every helper above): the input is never
+ * mutated and no wall clock is read. Dedup is **exact-case** — `"Work"` and
+ * `"work"` are distinct options, matching how tags are stored/compared
+ * elsewhere — and order follows first appearance across the list (within a
+ * sub, left-to-right). Blank / whitespace-only tags contribute nothing, so a
+ * sub with `tags: []` (or stray empties) never seeds a spurious option.
+ *
+ * The parameter is the minimal structural shape (`{ tags: string[] }`), so this
+ * one helper serves both the v1 and v2 subscription records.
+ */
+export function distinctTags(subs: readonly { tags: string[] }[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const sub of subs) {
+    for (const tag of sub.tags) {
+      if (tag.trim() === "") continue; // drop blank / whitespace-only tags
+      if (seen.has(tag)) continue; // exact-case dedup, first-seen wins
+      seen.add(tag);
+      result.push(tag);
+    }
+  }
+  return result;
+}

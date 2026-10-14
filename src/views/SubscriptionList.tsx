@@ -23,7 +23,7 @@
  * visible focus rings.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -42,12 +42,14 @@ import type {
 import { fuzzySearch } from "core/search";
 import { minorUnits, toMajor } from "core/money";
 import { monthlyAmount } from "core/billing";
+import { distinctTags } from "core/subscriptions";
 import { subscriptionsApi, isSubbyError } from "@/api/subby";
 import { subscriptionsStore } from "@/stores/subscriptionsStore";
 import { categoriesStore } from "@/stores/categoriesStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
 import CategoryColorDot from "@/components/CategoryColorDot";
+import ConfirmDialog from "@/components/ConfirmDialog";
 
 // --- Local types -------------------------------------------------------------
 
@@ -64,7 +66,19 @@ interface EditState {
   id: string;
   field: "amount" | "nextRenewal";
   value: string;
+  /**
+   * An inline validation message shown (via `role="alert"`) when an invalid
+   * commit kept the editor open. Absent while the current value is unvalidated
+   * or valid (Req 9.7 / Story 3.5 — invalid input is never silently discarded).
+   */
+  error?: string;
 }
+
+/** Inline-validation copy for a rejected quick-edit commit (Story 3.5). */
+const QUICK_EDIT_ERRORS = {
+  amount: "Enter a valid amount (e.g. 12.50).",
+  nextRenewal: "Enter a valid date (YYYY-MM-DD).",
+} as const;
 
 /** All billing cycles, for the cycle filter control. */
 const BILLING_CYCLES: readonly BillingCycle[] = [
@@ -207,15 +221,22 @@ export default function SubscriptionList(): JSX.Element {
   const [sortColumn, setSortColumn] = useState<SortColumn | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [filterCategory, setFilterCategory] = useState<string>("all");
+  const [filterTag, setFilterTag] = useState<string>("all");
   const [filterStatus, setFilterStatus] = useState<StatusFilter>("all");
   const [filterCycle, setFilterCycle] = useState<BillingCycle | "all">("all");
   const [groupBy, setGroupBy] = useState<GroupBy>("none");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [edit, setEdit] = useState<EditState | null>(null);
+  // The pending bulk-delete request, if any — mounts the branded ConfirmDialog
+  // naming the exact impact (count) instead of the native `window.confirm`.
+  const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
 
   // Ref to the header "select all" checkbox so we can drive its indeterminate
   // visual state (partial selection) — not expressible declaratively in React.
   const selectAllRef = useRef<HTMLInputElement>(null);
+  // The element that opened the current quick-edit (a QuickEditButton), so Esc
+  // can return focus to the originating cell trigger (Req 9.7 / Story 3.5).
+  const editTriggerRef = useRef<HTMLElement | null>(null);
 
   // --- Derivation pipeline: search → filter → sort → group -------------------
 
@@ -226,14 +247,22 @@ export default function SubscriptionList(): JSX.Element {
 
   const filtered = useMemo(() => {
     // Compose the active filters inline over the v2 shape (Req 9.4): Category by
-    // name, State by the three-way enum, Billing Cycle by value.
+    // name, Tag by membership, State by the three-way enum, Billing Cycle by
+    // value. Filters intersect — a sub shows only if it matches every active
+    // axis; an "all" selection on any axis is a no-op.
     return searched.filter((s) => {
       if (filterCategory !== "all" && s.category !== filterCategory) return false;
+      if (filterTag !== "all" && !s.tags.includes(filterTag)) return false;
       if (filterStatus !== "all" && s.state !== filterStatus) return false;
       if (filterCycle !== "all" && s.billingCycle !== filterCycle) return false;
       return true;
     });
-  }, [searched, filterCategory, filterStatus, filterCycle]);
+  }, [searched, filterCategory, filterTag, filterStatus, filterCycle]);
+
+  // Distinct tag options for the Tag filter — the exact-case, first-seen set
+  // across ALL subscriptions (not just the filtered view), via the pure core
+  // helper. Keeps the option list stable as other filters narrow the rows.
+  const tagOptions = useMemo(() => distinctTags(subscriptions), [subscriptions]);
 
   const sorted = useMemo(
     () => sortSubscriptions(filtered, sortColumn, sortDir), // Req 9.3
@@ -308,17 +337,25 @@ export default function SubscriptionList(): JSX.Element {
     }
   }
 
-  /** Delete every selected subscription after confirmation (Req 9.6). */
-  async function bulkDelete(): Promise<void> {
+  /**
+   * Begin a bulk delete (Req 9.6). Instead of the native `window.confirm`, open
+   * the branded in-app {@link ConfirmDialog} naming the exact count impact; the
+   * actual removal happens in {@link confirmDelete} on confirm.
+   */
+  function bulkDelete(): void {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    const confirmed =
-      typeof window === "undefined" ||
-      typeof window.confirm !== "function" ||
-      window.confirm(
-        `Delete ${ids.length} subscription${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
-      );
-    if (!confirmed) return;
+    setPendingDelete(ids);
+  }
+
+  /**
+   * Resolve the pending bulk delete: remove each id through the api (exactly as
+   * before), clear the selection, and dismiss the dialog. A per-id failure is
+   * logged and the loop continues (Req 9.6, 19.4).
+   */
+  async function confirmDelete(): Promise<void> {
+    const ids = pendingDelete ?? [];
+    setPendingDelete(null);
     setSelectedIds(new Set());
     for (const id of ids) {
       try {
@@ -331,6 +368,9 @@ export default function SubscriptionList(): JSX.Element {
   }
 
   function startEdit(sub: SubscriptionV2, field: EditState["field"]): void {
+    // Capture the triggering control so Esc can return focus to it (Req 9.7).
+    editTriggerRef.current =
+      (document.activeElement as HTMLElement | null) ?? null;
     setEdit({
       id: sub.id,
       field,
@@ -343,36 +383,80 @@ export default function SubscriptionList(): JSX.Element {
     });
   }
 
-  /** Persist the current quick-edit via the api (sets `updatedAt`) (Req 9.7). */
-  async function commitEdit(): Promise<void> {
-    if (!edit) return;
-    const current = edit;
-    const sub = subscriptions.find((s) => s.id === current.id);
-    setEdit(null);
-
-    let patch: { amountMinor: number } | { nextRenewal: string } | null = null;
+  /**
+   * Parse the current edit value into a persistable patch through the SAME
+   * seams the field already uses — `core/money.minorUnits` for amount (its throw
+   * is the invalid signal) and the ISO-date regex for next renewal. Returns
+   * `null` when the value is invalid; never a second parser.
+   */
+  function parseEdit(
+    current: EditState,
+  ): { amountMinor: number } | { nextRenewal: string } | null {
     if (current.field === "amount") {
-      // Parse the entered MAJOR amount into integer minor units in the sub's
-      // own currency through the money seam. Invalid/over-precise input throws,
-      // which we treat as a discarded edit (Story 3.5 adds the inline error).
-      if (sub) {
-        try {
-          patch = { amountMinor: minorUnits(current.value, sub.currency) };
-        } catch {
-          patch = null;
-        }
+      const sub = subscriptions.find((s) => s.id === current.id);
+      if (!sub) return null;
+      try {
+        return { amountMinor: minorUnits(current.value, sub.currency) };
+      } catch {
+        return null;
       }
-    } else if (/^\d{4}-\d{2}-\d{2}$/.test(current.value)) {
-      patch = { nextRenewal: current.value };
     }
-    if (!patch) return; // invalid input: discard the edit silently
+    return /^\d{4}-\d{2}-\d{2}$/.test(current.value)
+      ? { nextRenewal: current.value }
+      : null;
+  }
 
+  /** Persist a valid patch via the api (sets `updatedAt`) (Req 9.7). */
+  async function persistEdit(
+    id: string,
+    patch: { amountMinor: number } | { nextRenewal: string },
+  ): Promise<void> {
     try {
-      await subscriptionsApi.update(current.id, patch); // Req 9.7
+      await subscriptionsApi.update(id, patch); // Req 9.7
     } catch (err) {
       if (isSubbyError(err)) console.error(err.appError);
       else console.error(err);
     }
+  }
+
+  /**
+   * Commit the current quick-edit on Enter (Req 9.7 / Story 3.5). A VALID value
+   * persists and closes the editor; an INVALID value keeps the editor open,
+   * sets an inline `role="alert"` error naming the problem, and leaves focus in
+   * the input (nothing is persisted — invalid input is never silently
+   * discarded).
+   */
+  async function commitEdit(): Promise<void> {
+    if (!edit) return;
+    const current = edit;
+    const patch = parseEdit(current);
+    if (!patch) {
+      // Invalid: hold the editor open with an announced inline error.
+      setEdit({ ...current, error: QUICK_EDIT_ERRORS[current.field] });
+      return;
+    }
+    setEdit(null);
+    await persistEdit(current.id, patch);
+  }
+
+  /**
+   * Blur policy (Story 3.5 Design Notes): a VALID value still commits (preserves
+   * the existing behavior tests rely on); an INVALID value reverts — cancel
+   * without persisting and leave no dangling alert, so bad data is never
+   * silently written and focus is never trapped in the cell being left.
+   */
+  async function blurEdit(): Promise<void> {
+    if (!edit) return;
+    const current = edit;
+    const patch = parseEdit(current);
+    setEdit(null);
+    if (patch) await persistEdit(current.id, patch);
+  }
+
+  /** Cancel the current edit and return focus to the originating cell trigger. */
+  function cancelEdit(): void {
+    setEdit(null);
+    editTriggerRef.current?.focus?.();
   }
 
   function onEditKeyDown(e: React.KeyboardEvent): void {
@@ -381,7 +465,7 @@ export default function SubscriptionList(): JSX.Element {
       void commitEdit();
     } else if (e.key === "Escape") {
       e.preventDefault();
-      setEdit(null);
+      cancelEdit();
     }
   }
 
@@ -480,6 +564,25 @@ export default function SubscriptionList(): JSX.Element {
         </div>
 
         <div className="flex flex-col gap-1">
+          <label htmlFor="filter-tag" className="text-xs text-muted-foreground">
+            Tag
+          </label>
+          <select
+            id="filter-tag"
+            value={filterTag}
+            onChange={(e) => setFilterTag(e.target.value)}
+            className={controlClass}
+          >
+            <option value="all">All tags</option>
+            {tagOptions.map((tag) => (
+              <option key={tag} value={tag}>
+                {tag}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div className="flex flex-col gap-1">
           <label htmlFor="group-by" className="text-xs text-muted-foreground">
             Group by
           </label>
@@ -496,6 +599,16 @@ export default function SubscriptionList(): JSX.Element {
         </div>
       </div>
 
+      {/*
+        Persistent polite live region announcing the selection count (Req 9.6).
+        Mounted UNCONDITIONALLY (not with the bulk bar) so a screen reader
+        observes the text CHANGE — a region that appears at the same moment as
+        its content is not reliably announced.
+      */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {selectedIds.size > 0 ? `${selectedIds.size} selected` : ""}
+      </div>
+
       {/* Bulk actions bar (Req 9.6). */}
       {selectedIds.size > 0 && (
         <div
@@ -503,7 +616,12 @@ export default function SubscriptionList(): JSX.Element {
           aria-label="Bulk actions"
           className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card px-3 py-2"
         >
-          <span className="text-sm font-medium">
+          {/*
+            Visible count is aria-hidden so only the persistent polite live
+            region (above) speaks it — otherwise a screen reader would announce
+            the same "N selected" twice.
+          */}
+          <span aria-hidden="true" className="text-sm font-medium">
             {selectedIds.size} selected
           </span>
           <div className="ml-auto flex flex-wrap items-center gap-2">
@@ -531,7 +649,7 @@ export default function SubscriptionList(): JSX.Element {
             </button>
             <button
               type="button"
-              onClick={() => void bulkDelete()}
+              onClick={bulkDelete}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-md border border-destructive/50 px-2.5 py-1.5 text-sm text-destructive hover:bg-destructive/10",
                 focusRing,
@@ -656,19 +774,15 @@ export default function SubscriptionList(): JSX.Element {
                     </td>
                     <td className="px-3 py-2">
                       {edit && edit.id === sub.id && edit.field === "amount" ? (
-                        <input
-                          autoFocus
+                        <QuickEditField
                           type="number"
-                          min={0}
-                          step="0.01"
                           value={edit.value}
-                          onChange={(e) =>
-                            setEdit({ ...edit, value: e.target.value })
-                          }
-                          onBlur={() => void commitEdit()}
+                          error={edit.error}
+                          label={`Edit amount for ${sub.name}`}
+                          inputClassName={cn(controlClass, "h-8 w-28")}
+                          onChange={(value) => setEdit({ ...edit, value })}
+                          onBlur={() => void blurEdit()}
                           onKeyDown={onEditKeyDown}
-                          aria-label={`Edit amount for ${sub.name}`}
-                          className={cn(controlClass, "h-8 w-28")}
                         />
                       ) : (
                         <QuickEditButton
@@ -683,17 +797,15 @@ export default function SubscriptionList(): JSX.Element {
                       {edit &&
                       edit.id === sub.id &&
                       edit.field === "nextRenewal" ? (
-                        <input
-                          autoFocus
+                        <QuickEditField
                           type="date"
                           value={edit.value}
-                          onChange={(e) =>
-                            setEdit({ ...edit, value: e.target.value })
-                          }
-                          onBlur={() => void commitEdit()}
+                          error={edit.error}
+                          label={`Edit next renewal for ${sub.name}`}
+                          inputClassName={cn(controlClass, "h-8")}
+                          onChange={(value) => setEdit({ ...edit, value })}
+                          onBlur={() => void blurEdit()}
                           onKeyDown={onEditKeyDown}
-                          aria-label={`Edit next renewal for ${sub.name}`}
-                          className={cn(controlClass, "h-8")}
                         />
                       ) : (
                         <QuickEditButton
@@ -782,19 +894,15 @@ export default function SubscriptionList(): JSX.Element {
                             {edit &&
                             edit.id === sub.id &&
                             edit.field === "amount" ? (
-                              <input
-                                autoFocus
+                              <QuickEditField
                                 type="number"
-                                min={0}
-                                step="0.01"
                                 value={edit.value}
-                                onChange={(e) =>
-                                  setEdit({ ...edit, value: e.target.value })
-                                }
-                                onBlur={() => void commitEdit()}
+                                error={edit.error}
+                                label={`Edit amount for ${sub.name}`}
+                                inputClassName={cn(controlClass, "h-8 w-full")}
+                                onChange={(value) => setEdit({ ...edit, value })}
+                                onBlur={() => void blurEdit()}
                                 onKeyDown={onEditKeyDown}
-                                aria-label={`Edit amount for ${sub.name}`}
-                                className={cn(controlClass, "h-8 w-full")}
                               />
                             ) : (
                               <QuickEditButton
@@ -814,17 +922,15 @@ export default function SubscriptionList(): JSX.Element {
                             {edit &&
                             edit.id === sub.id &&
                             edit.field === "nextRenewal" ? (
-                              <input
-                                autoFocus
+                              <QuickEditField
                                 type="date"
                                 value={edit.value}
-                                onChange={(e) =>
-                                  setEdit({ ...edit, value: e.target.value })
-                                }
-                                onBlur={() => void commitEdit()}
+                                error={edit.error}
+                                label={`Edit next renewal for ${sub.name}`}
+                                inputClassName={cn(controlClass, "h-8 w-full")}
+                                onChange={(value) => setEdit({ ...edit, value })}
+                                onBlur={() => void blurEdit()}
                                 onKeyDown={onEditKeyDown}
-                                aria-label={`Edit next renewal for ${sub.name}`}
-                                className={cn(controlClass, "h-8 w-full")}
                               />
                             ) : (
                               <QuickEditButton
@@ -845,6 +951,28 @@ export default function SubscriptionList(): JSX.Element {
           ))}
         </div>
       )}
+
+      {/*
+        Branded bulk-delete confirmation (Req 9.6, DESIGN "Branded confirmation")
+        — reuses the Story 3.4 ConfirmDialog instead of the native
+        `window.confirm`. It names the exact count impact, lands focus on the
+        safe/cancel button (the destructive action is non-default), and Esc /
+        backdrop cancel. Kept mounted so `open` can toggle.
+      */}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="Delete subscriptions?"
+        message={
+          pendingDelete
+            ? `Delete ${pendingDelete.length} subscription${
+                pendingDelete.length === 1 ? "" : "s"
+              }? This cannot be undone.`
+            : ""
+        }
+        confirmLabel="Delete"
+        onConfirm={() => void confirmDelete()}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
@@ -925,6 +1053,57 @@ function QuickEditButton({
         aria-hidden="true"
       />
     </button>
+  );
+}
+
+/**
+ * The active quick-edit input plus its inline validation alert (Req 9.7 / Story
+ * 3.5). An invalid commit holds the editor open and renders a `role="alert"`
+ * message adjacent to the input, `aria-describedby`-linked and announced; the
+ * input is marked `aria-invalid`. Enter commits/holds, Esc cancels, and blur
+ * reverts-on-invalid / commits-on-valid — the parent owns those handlers.
+ */
+function QuickEditField({
+  type,
+  value,
+  error,
+  label,
+  inputClassName,
+  onChange,
+  onBlur,
+  onKeyDown,
+}: {
+  type: "number" | "date";
+  value: string;
+  error: string | undefined;
+  label: string;
+  inputClassName: string;
+  onChange: (value: string) => void;
+  onBlur: () => void;
+  onKeyDown: (e: React.KeyboardEvent) => void;
+}): JSX.Element {
+  const errorId = useId();
+  return (
+    <span className="inline-flex flex-col gap-1">
+      <input
+        autoFocus
+        type={type}
+        {...(type === "number" ? { min: 0, step: "0.01" } : {})}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        onKeyDown={onKeyDown}
+        aria-label={label}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={error ? errorId : undefined}
+        className={inputClassName}
+      />
+      {error && (
+        <span id={errorId} role="alert" className="text-xs text-destructive">
+          {error}
+        </span>
+      )}
+    </span>
   );
 }
 
