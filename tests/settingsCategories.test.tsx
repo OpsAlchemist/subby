@@ -9,6 +9,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { axe } from "jest-axe";
 import "@testing-library/jest-dom/vitest";
 
 import SettingsCategories from "@/components/SettingsCategories";
@@ -354,5 +355,44 @@ describe("delete via branded confirmation (Story 3.4)", () => {
     await screen.findByRole("alertdialog");
 
     expect(confirmSpy).not.toHaveBeenCalled();
+  });
+});
+
+// --- Accessibility: axe scan of the section (Story 3.7) ----------------------
+
+describe("accessibility of the Categories section (Story 3.7)", () => {
+  it("the Categories section has no serious/critical axe violations (closed)", async () => {
+    await renderSection([
+      cat({ id: "c1", name: "Streaming", color: "#db2777" }),
+      cat({ id: "c2", name: "Spare", isDefault: false }),
+    ]);
+
+    // jsdom cannot compute color contrast (the sanctioned exception); every
+    // other rule stays on — mirrors the List/palette scans.
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
+  });
+
+  it("the branded delete confirmation is axe-clean when open", async () => {
+    const user = userEvent.setup();
+    // Seed an in-use category so Delete opens the branded alertdialog.
+    fake.inUse = { c1: 3 };
+    await renderSection([cat({ id: "c1", name: "Streaming" })]);
+
+    await user.click(screen.getByRole("button", { name: "Delete Streaming" }));
+    await screen.findByRole("alertdialog");
+
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
   });
 });

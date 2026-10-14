@@ -794,6 +794,99 @@ describe("selection-count live region (Story 3.5, Req 9.6)", () => {
   });
 });
 
+// --- Bulk-select keyboard model (Story 3.7) ----------------------------------
+
+describe("bulk-select keyboard model (Story 3.7)", () => {
+  it("toggles a focused row checkbox with the Space key (name 'Select <name>' unchanged)", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix" }),
+      makeSub({ id: "b", name: "Spotify" }),
+    ]);
+
+    const table = screen.getByRole("table");
+    const status = screen.getByRole("status");
+    // Accessible name is preserved and used to locate the control.
+    const netflix = within(table).getByLabelText(
+      "Select Netflix",
+    ) as HTMLInputElement;
+    expect(netflix).not.toBeChecked();
+
+    // Keyboard operation: focus the checkbox and press Space to toggle it.
+    netflix.focus();
+    expect(netflix).toHaveFocus();
+    await user.keyboard(" ");
+
+    expect(netflix).toBeChecked();
+    // The selection-count live region reflects the keyboard toggle.
+    expect(status).toHaveTextContent("1 selected");
+
+    // Space again unchecks it.
+    await user.keyboard(" ");
+    expect(netflix).not.toBeChecked();
+    expect(status).toHaveTextContent("");
+  });
+
+  it("toggles every visible row via the keyboard-operable 'Select all subscriptions' control", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({ id: "a", name: "Netflix" }),
+      makeSub({ id: "b", name: "Spotify" }),
+      makeSub({ id: "c", name: "Hulu" }),
+    ]);
+
+    const table = screen.getByRole("table");
+    const status = screen.getByRole("status");
+    // Accessible name is preserved and used to locate the control.
+    const selectAll = within(table).getByLabelText(
+      "Select all subscriptions",
+    ) as HTMLInputElement;
+
+    // Keyboard operation: focus Select-all and press Space to select every row.
+    selectAll.focus();
+    expect(selectAll).toHaveFocus();
+    await user.keyboard(" ");
+
+    for (const name of ["Netflix", "Spotify", "Hulu"]) {
+      expect(within(table).getByLabelText(`Select ${name}`)).toBeChecked();
+    }
+    expect(status).toHaveTextContent("3 selected");
+
+    // Space again clears every row.
+    await user.keyboard(" ");
+    for (const name of ["Netflix", "Spotify", "Hulu"]) {
+      expect(within(table).getByLabelText(`Select ${name}`)).not.toBeChecked();
+    }
+    expect(status).toHaveTextContent("");
+  });
+});
+
+// --- StatusBadge text-not-color contract (Story 3.7) -------------------------
+
+describe("StatusBadge conveys state by text, not color alone (Story 3.7)", () => {
+  it.each(["Active", "Paused", "Trial"] as const)(
+    "renders the literal '%s' label with an aria-hidden decorative dot",
+    async (state) => {
+      await renderList([makeSub({ id: "a", name: "Netflix", state })]);
+
+      // Scope to the table row (the badge is also mirrored in the card list).
+      const table = screen.getByRole("table");
+      const row = within(table)
+        .getByLabelText("Select Netflix")
+        .closest("tr") as HTMLElement;
+
+      // The badge carries a VISIBLE text label naming the state — color is never
+      // the sole carrier.
+      const badge = within(row).getByText(state);
+      expect(badge).toBeInTheDocument();
+
+      // The leading decorative dot is hidden from assistive tech.
+      const dot = badge.querySelector('[aria-hidden="true"]');
+      expect(dot).not.toBeNull();
+    },
+  );
+});
+
 // --- Accessibility of the new surfaces (Story 3.5) ---------------------------
 
 describe("new-surface accessibility (Story 3.5)", () => {

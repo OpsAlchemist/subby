@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { axe } from "jest-axe";
 import "@testing-library/jest-dom/vitest";
 
 import SubscriptionModal from "@/components/SubscriptionModal";
@@ -519,5 +520,89 @@ describe("inline add-category in the modal (Story 3.4)", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Category")).toHaveValue("Newsletters"),
     );
+  });
+});
+
+// --- Accessibility: axe scan + focus trap/return (Story 3.7) -----------------
+
+describe("accessibility of the open modal (Story 3.7)", () => {
+  it("the open Add/Edit modal has no serious/critical axe violations", async () => {
+    render(<SubscriptionModal open onClose={() => {}} />);
+    await screen.findByRole("dialog", { name: /add subscription/i });
+
+    // Mirror the List/palette scans: jsdom cannot compute color contrast, so
+    // that one rule stays disabled (the sanctioned exception) — nothing else.
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
+  });
+
+  it("traps Tab / Shift-Tab within the dialog (focus never reaches the page behind)", async () => {
+    const user = userEvent.setup();
+    // A page-behind button that must NEVER receive focus from within the modal.
+    const behind = document.createElement("button");
+    behind.textContent = "behind";
+    document.body.appendChild(behind);
+
+    render(<SubscriptionModal open onClose={() => {}} />);
+    const dialog = await screen.findByRole("dialog", {
+      name: /add subscription/i,
+    });
+
+    // Derive the first/last focusables from the SAME selector the component's
+    // trap uses, so the test pins the real wrap boundaries (not a brittle
+    // "last control happens to be a button" assumption).
+    const focusables = dialog.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    );
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+
+    // Tab from the LAST focusable must wrap to the FIRST (trap, not escape).
+    last.focus();
+    expect(last).toHaveFocus();
+    await user.tab();
+    expect(document.activeElement).toBe(first);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(behind).not.toHaveFocus();
+
+    // Shift-Tab from the FIRST focusable must wrap to the LAST (the branch at
+    // SubscriptionModal.tsx:526-528), never out to the page behind.
+    first.focus();
+    expect(first).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(last);
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(behind).not.toHaveFocus();
+
+    behind.remove();
+  });
+
+  it("returns focus to the triggering element when it closes", async () => {
+    // A trigger focused BEFORE the modal opens, standing in for the top-bar Add
+    // button; focus must return here on close (Cancel / Esc / backdrop all route
+    // through the controlled `open` prop going false).
+    const trigger = document.createElement("button");
+    trigger.textContent = "open add";
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(trigger).toHaveFocus();
+
+    const onClose = vi.fn();
+    const { rerender } = render(
+      <SubscriptionModal open onClose={onClose} />,
+    );
+    await screen.findByRole("dialog", { name: /add subscription/i });
+
+    // Closing (open → false) runs the focus-management cleanup that restores
+    // focus to whatever was focused when the modal opened.
+    rerender(<SubscriptionModal open={false} onClose={onClose} />);
+
+    await waitFor(() => expect(trigger).toHaveFocus());
+    trigger.remove();
   });
 });
