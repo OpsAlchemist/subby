@@ -7,9 +7,9 @@ import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
 import { planImport } from "core/import";
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Integration tests for export-to-chosen-path and data-folder switching
@@ -39,13 +39,15 @@ async function isFile(path: string): Promise<boolean> {
 }
 
 /** Build a complete, schema-valid subscription for seeding. */
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(
+  overrides: Partial<SubscriptionV2> = {},
+): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -55,7 +57,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -71,7 +75,7 @@ let services: AppServices;
 beforeEach(async () => {
   userData = await mkdtemp(join(tmpdir(), "subby-export-userdata-"));
   chosenDir = await mkdtemp(join(tmpdir(), "subby-export-chosen-"));
-  storage = new JsonFileStorage(userData);
+  storage = new JsonFileStorage(userData, null, 2);
   services = buildAppServices(storage);
 });
 
@@ -84,7 +88,7 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
   it("writes JSON export containing all subscriptions and settings to the chosen path", async () => {
     const subs = [
       makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amount: 119 }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
     ];
     await storage.writeSubscriptions(subs);
 
@@ -99,18 +103,18 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
 
     // Its parsed contents carry every subscription and the settings (Req 17.1).
     const parsed = JSON.parse(await readFile(exportPath, "utf8")) as {
-      subscriptions: Subscription[];
-      settings: Settings;
+      subscriptions: SubscriptionV2[];
+      settings: SettingsV2;
     };
     expect(parsed.subscriptions.map((s) => s.id).sort()).toEqual(["sub-1", "sub-2"]);
     expect(parsed.subscriptions.map((s) => s.name).sort()).toEqual(["Netflix", "Spotify"]);
-    expect(parsed.settings).toMatchObject(DEFAULT_SETTINGS);
+    expect(parsed.settings).toMatchObject(DEFAULT_SETTINGS_V2);
   });
 
   it("round-trips a written JSON export back through planImport to reproduce the set (Req 17.3)", async () => {
     const subs = [
       makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amount: 119 }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
     ];
     await storage.writeSubscriptions(subs);
 
@@ -130,8 +134,8 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
   it("writes CSV export with a header row plus one row per subscription to the chosen path", async () => {
     const subs = [
       makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amount: 119 }),
-      makeSubscription({ id: "sub-3", name: "Disney+", category: "Streaming", amount: 299 }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
+      makeSubscription({ id: "sub-3", name: "Disney+", category: "Streaming", amountMinor: 29900 }),
     ];
     await storage.writeSubscriptions(subs);
 
@@ -158,7 +162,7 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
   it("round-trips a written CSV export back through planImport to reproduce the set (Req 17.3)", async () => {
     const subs = [
       makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amount: 119 }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
     ];
     await storage.writeSubscriptions(subs);
 
@@ -197,7 +201,7 @@ describe("Data folder switch uses the new location (Req 15.3)", () => {
     // Dir A still holds its own, untouched copy ([a]).
     const aFile = JSON.parse(
       await readFile(join(userData, fileNames.subscriptions), "utf8"),
-    ) as { subscriptions: Subscription[] };
+    ) as { subscriptions: SubscriptionV2[] };
     expect(aFile.subscriptions.map((s) => s.id)).toEqual(["a"]);
   });
 
@@ -212,7 +216,7 @@ describe("Data folder switch uses the new location (Req 15.3)", () => {
     expect(await isFile(join(chosenDir, fileNames.settings))).toBe(true);
     const settingsFile = JSON.parse(
       await readFile(join(chosenDir, fileNames.settings), "utf8"),
-    ) as Settings;
+    ) as SettingsV2;
     expect(settingsFile.dataFolder).toBe(chosenDir);
   });
 

@@ -11,8 +11,8 @@ import {
   renewalTimeline,
 } from "core/analytics";
 import { monthlyAmount } from "core/billing";
-import { activeSubscriptions } from "core/subscriptions";
-import type { Subscription } from "core/models/subscription";
+import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Property-based tests for analytics aggregations (task 3.4).
@@ -82,12 +82,12 @@ const amountArb = fc.double({
 
 /** A billing cycle, including Custom with a valid positive interval. */
 const billingArb: fc.Arbitrary<
-  Pick<Subscription, "billingCycle" | "customInterval">
+  Pick<SubscriptionV2, "billingCycle" | "customInterval">
 > = fc.oneof(
   fc
     .constantFrom("Weekly", "Monthly", "Quarterly", "Half-Yearly", "Yearly")
     .map((billingCycle) => ({
-      billingCycle: billingCycle as Subscription["billingCycle"],
+      billingCycle: billingCycle as SubscriptionV2["billingCycle"],
       customInterval: undefined,
     })),
   fc
@@ -97,7 +97,7 @@ const billingArb: fc.Arbitrary<
     })
     .map((customInterval) => ({
       billingCycle: "Custom" as const,
-      customInterval: customInterval as Subscription["customInterval"],
+      customInterval: customInterval as SubscriptionV2["customInterval"],
     })),
 );
 
@@ -107,11 +107,11 @@ const subFieldsArb = fc
     name: fc.string(),
     provider: fc.string(),
     category: categoryArb,
-    amount: amountArb,
+    amountMinor: amountArb,
     billing: billingArb,
     nextRenewal: isoDateArb,
     startDate: isoDateArb,
-    isActive: fc.boolean(),
+    active: fc.boolean(),
     autoRenew: fc.boolean(),
     updatedAt: isoDateTimeArb,
   })
@@ -119,7 +119,7 @@ const subFieldsArb = fc
     name: r.name,
     provider: r.provider,
     category: r.category,
-    amount: r.amount,
+    amountMinor: r.amountMinor,
     currency: "INR",
     billingCycle: r.billing.billingCycle,
     customInterval: r.billing.customInterval,
@@ -130,14 +130,16 @@ const subFieldsArb = fc
     notes: "",
     color: "#000000",
     icon: "box",
-    isActive: r.isActive,
+    state: (r.active ? "Active" : "Paused") as SubscriptionV2["state"],
+    priceHistory: [],
+    tags: [],
     autoRenew: r.autoRenew,
     createdAt: r.updatedAt,
     updatedAt: r.updatedAt,
   }));
 
 /** Assign unique ids by index so multiset/permutation checks are exact. */
-function withIds(fields: Omit<Subscription, "id">[], prefix = "s"): Subscription[] {
+function withIds(fields: Omit<SubscriptionV2, "id">[], prefix = "s"): SubscriptionV2[] {
   return fields.map((f, i) => ({ ...f, id: `${prefix}-${i}` }));
 }
 
@@ -163,14 +165,14 @@ describe("Feature: subby, Property 4: Active totals and active count use only ac
       .array(subFieldsArb, { maxLength: 8 })
       .map((fields) =>
         withIds(
-          fields.map((f) => ({ ...f, isActive: false })),
+          fields.map((f) => ({ ...f, state: "Paused" as const })),
           "x",
         ),
       );
 
     fc.assert(
       fc.property(subsArb, extraInactiveArb, (base, extraInactive) => {
-        const baseActive = activeSubscriptions(base);
+        const baseActive = activeSpendSubscriptionsV2(base);
 
         // Totals over the active subset (the form the dashboard consumes).
         const baseMonthly = totalMonthly(baseActive);
@@ -178,13 +180,15 @@ describe("Feature: subby, Property 4: Active totals and active count use only ac
 
         // Appending inactive subscriptions leaves the active set unchanged.
         const withInactive = [...base, ...extraInactive];
-        const withInactiveActive = activeSubscriptions(withInactive);
+        const withInactiveActive = activeSpendSubscriptionsV2(withInactive);
 
         expectClose(totalMonthly(withInactiveActive), baseMonthly);
         expectClose(totalYearly(withInactiveActive), baseYearly);
 
-        // activeCount over the FULL set counts exactly the isActive subs (Req 8.3).
-        const manualCount = base.filter((s) => s.isActive).length;
+        // activeCount over the FULL set counts exactly the live subs (Req 8.3).
+        // The generator produces only Active/Paused (no Trial), so the live
+        // count equals the number of Active subs.
+        const manualCount = base.filter((s) => s.state === "Active").length;
         expect(activeCount(base)).toBe(manualCount);
         // The appended inactive subs never inflate the count.
         expect(activeCount(withInactive)).toBe(manualCount);
@@ -211,10 +215,10 @@ describe("Feature: subby, Property 4: Active totals and active count use only ac
  * top-n (no excluded element outranks an included one).
  */
 function assertTopNDescending(
-  input: Subscription[],
-  result: Subscription[],
+  input: SubscriptionV2[],
+  result: SubscriptionV2[],
   n: number,
-  key: (s: Subscription) => number | string,
+  key: (s: SubscriptionV2) => number | string,
 ): void {
   const expectedLength = Math.min(Math.max(0, n), input.length);
   expect(result).toHaveLength(expectedLength);
@@ -288,7 +292,7 @@ describe("Feature: subby, Property 14: Partitions conserve and correctly key all
   it("Feature: subby, Property 14: categoryDistribution conserves total monthly spend and keys each subscription under its own category (Req 11.2, 9.5)", () => {
     fc.assert(
       fc.property(subsArb, (subs) => {
-        const active = activeSubscriptions(subs);
+        const active = activeSpendSubscriptionsV2(subs);
         const dist = categoryDistribution(active);
 
         // Conservation: the sum of group spend equals the active total.

@@ -29,8 +29,8 @@ import {
   ListChecks,
   type LucideIcon,
 } from "lucide-react";
-import type { Subscription } from "core/models/subscription";
-import { activeSubscriptions } from "core/subscriptions";
+import type { SubscriptionV2 } from "core/models/subscription";
+import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
 import {
   activeCount,
   recentlyChanged,
@@ -38,6 +38,7 @@ import {
   totalMonthly,
   totalYearly,
 } from "core/analytics";
+import { exponentOf } from "core/money";
 import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
 
@@ -50,6 +51,23 @@ const RECENT_CHANGED_COUNT = 5;
 /** Today as an ISO date (`YYYY-MM-DD`); passed to the pure analytics helpers. */
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Convert a summed **minor-unit** total into a major-unit number for the
+ * currency formatter. Story 3.3 keeps totals a direct same-currency minor-unit
+ * sum (no FX; the convert-before-sum Home total is Epic 6), so a scale by the
+ * Home Currency's exponent is the honest display of that sum. An unknown
+ * currency falls back to a 2-decimal scale rather than throwing in the UI.
+ */
+function minorToMajorNumber(minor: number, currency: string): number {
+  let exponent: number;
+  try {
+    exponent = exponentOf(currency);
+  } catch {
+    exponent = 2;
+  }
+  return minor / 10 ** exponent;
 }
 
 /** Build a currency formatter for the configured default currency (INR here). */
@@ -114,8 +132,8 @@ function SubscriptionPanel({
   title: string;
   icon: LucideIcon;
   emptyLabel: string;
-  items: Subscription[];
-  renderMeta: (s: Subscription) => string;
+  items: SubscriptionV2[];
+  renderMeta: (s: SubscriptionV2) => string;
 }): JSX.Element {
   return (
     <section className="rounded-lg border border-border bg-card p-4">
@@ -154,10 +172,12 @@ export default function Dashboard(): JSX.Element {
 
   const today = todayISO();
 
-  // Recompute derived metrics only when the inputs change (Req 8.6).
-  const active = useMemo(() => activeSubscriptions(subs), [subs]);
-  const monthly = useMemo(() => totalMonthly(active), [active]);
-  const yearly = useMemo(() => totalYearly(active), [active]);
+  // Recompute derived metrics only when the inputs change (Req 8.6). The month/
+  // year totals sum the plain-Active subset only (Trials excluded, Paused
+  // excluded — AD-17); the "Active count" is Active + Trial via `activeCount`.
+  const active = useMemo(() => activeSpendSubscriptionsV2(subs), [subs]);
+  const monthlyMinor = useMemo(() => totalMonthly(active), [active]);
+  const yearlyMinor = useMemo(() => totalYearly(active), [active]);
   const count = useMemo(() => activeCount(subs), [subs]);
   const renewingSoon = useMemo(
     () => renewingWithin(subs, RENEWAL_WINDOW_DAYS, today),
@@ -169,9 +189,12 @@ export default function Dashboard(): JSX.Element {
   );
 
   const currency = useMemo(
-    () => makeCurrencyFormatter(settings.defaultCurrency),
-    [settings.defaultCurrency],
+    () => makeCurrencyFormatter(settings.homeCurrency),
+    [settings.homeCurrency],
   );
+  // Totals are minor-unit sums (Story 3.3, no FX); render in Home-Currency major.
+  const monthly = minorToMajorNumber(monthlyMinor, settings.homeCurrency);
+  const yearly = minorToMajorNumber(yearlyMinor, settings.homeCurrency);
 
   return (
     <div className="space-y-6">

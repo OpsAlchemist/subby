@@ -45,9 +45,9 @@ import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import { ZodError } from "zod";
 
 import type { Category } from "core/models/category";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
-import type { SubscriptionPatch } from "core/subscriptions";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
+import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { CreateCategoryResult } from "core/categories";
 import type { ImportOutcome } from "core/import";
 import type {
@@ -195,32 +195,32 @@ export function registerIpcHandlers(
 
   // --- Subscriptions (Req 3) -------------------------------------------------
 
-  handle<IpcResult<Subscription[]>>(CH.subs.list, () =>
+  handle<IpcResult<SubscriptionV2[]>>(CH.subs.list, () =>
     query(() => services.listSubscriptions()),
   );
 
-  handle<IpcResult<Subscription[]>>(
+  handle<IpcResult<SubscriptionV2[]>>(
     CH.subs.create,
     (_event, input: Parameters<AppServices["createSubscription"]>[0]) =>
       mutate(() => services.createSubscription(input)),
   );
 
-  handle<IpcResult<Subscription[]>>(
+  handle<IpcResult<SubscriptionV2[]>>(
     CH.subs.update,
-    (_event, payload: { id: string; patch: SubscriptionPatch }) =>
+    (_event, payload: { id: string; patch: SubscriptionPatchV2 }) =>
       mutate(() => services.updateSubscription(payload.id, payload.patch)),
   );
 
-  handle<IpcResult<Subscription[]>>(
+  handle<IpcResult<SubscriptionV2[]>>(
     CH.subs.remove,
     // Backup-before-delete is sequenced inside the service (Req 3.3).
     (_event, id: string) => mutate(() => services.deleteSubscription(id)),
   );
 
-  handle<IpcResult<Subscription[]>>(
-    CH.subs.toggleActive,
-    (_event, payload: { id: string; value: boolean }) =>
-      mutate(() => services.toggleActive(payload.id, payload.value)),
+  handle<IpcResult<SubscriptionV2[]>>(
+    CH.subs.setState,
+    (_event, payload: { id: string; state: SubscriptionState }) =>
+      mutate(() => services.setState(payload.id, payload.state)),
   );
 
   // --- Categories (Req 7) ----------------------------------------------------
@@ -304,13 +304,13 @@ export function registerIpcHandlers(
   // Note: `settings:chooseDataFolder` (native dialog) is registered by the
   // dialog service in task 14, not here.
 
-  handle<IpcResult<Settings>>(CH.settings.get, () =>
+  handle<IpcResult<SettingsV2>>(CH.settings.get, () =>
     query(() => services.getSettings()),
   );
 
-  handle<IpcResult<Settings>>(
+  handle<IpcResult<SettingsV2>>(
     CH.settings.update,
-    (_event, patch: Partial<Settings>) =>
+    (_event, patch: Partial<SettingsV2>) =>
       mutate(() => services.updateSettings(patch)),
   );
 
@@ -349,7 +349,7 @@ export function registerIpcHandlers(
     query(() => services.listBackups()),
   );
 
-  handle<IpcResult<Subscription[]>>(
+  handle<IpcResult<SubscriptionV2[]>>(
     CH.data.restoreBackup,
     // Backup-current-then-restore is sequenced inside the service (Req 18.3).
     (_event, name: string) => mutate(() => services.restoreBackup(name)),
@@ -365,7 +365,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.subs.create,
   CH.subs.update,
   CH.subs.remove,
-  CH.subs.toggleActive,
+  CH.subs.setState,
   CH.categories.list,
   CH.categories.create,
   CH.categories.remove,

@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS, DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { SubscriptionInput } from "shared/types";
 import type { SubbyApi } from "shared/subbyApi";
 
@@ -40,14 +40,14 @@ import type { SubbyApi } from "shared/subbyApi";
  *   - 18.3: Restore backs up current data before applying.
  */
 
-/** Build a complete, schema-valid subscription for direct storage seeding. */
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+/** Build a complete, schema-valid v2 subscription for direct storage seeding. */
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -57,7 +57,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -65,10 +67,28 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
   };
 }
 
-/** Build a user-supplied subscription input (no system-managed fields). */
+/** Build a user-supplied v2 subscription input (no system-managed fields). */
 function makeInput(overrides: Partial<SubscriptionInput> = {}): SubscriptionInput {
-  const { id: _id, createdAt: _c, updatedAt: _u, ...rest } = makeSubscription();
-  return { ...rest, ...overrides };
+  return {
+    name: "Netflix",
+    provider: "Netflix Inc.",
+    category: "Streaming",
+    amountMajor: "499",
+    currency: "INR",
+    billingCycle: "Monthly",
+    nextRenewal: "2025-02-01",
+    startDate: "2024-01-01",
+    paymentMethod: "Card",
+    website: "https://netflix.com",
+    notes: "",
+    color: "#E50914",
+    icon: "netflix",
+    state: "Active",
+    priceHistory: [],
+    tags: [],
+    autoRenew: true,
+    ...overrides,
+  };
 }
 
 let userData: string;
@@ -113,27 +133,27 @@ describe("AppServices subscription round-trips (Req 2.3)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(Date.parse(originalUpdatedAt) + 60_000));
 
-    const updated = await services.updateSubscription(id, { name: "Spotify Family", amount: 199 });
+    const updated = await services.updateSubscription(id, { name: "Spotify Family", amountMinor: 19900 });
     vi.useRealTimers();
 
     const target = updated.find((s) => s.id === id)!;
     expect(target.name).toBe("Spotify Family");
-    expect(target.amount).toBe(199);
+    expect(target.amountMinor).toBe(19900);
     expect(Date.parse(target.updatedAt)).toBeGreaterThan(Date.parse(originalUpdatedAt));
 
     const listed = await services.listSubscriptions();
     expect(listed.find((s) => s.id === id)!.name).toBe("Spotify Family");
   });
 
-  it("toggleActive flips isActive and persists", async () => {
-    const created = await services.createSubscription(makeInput({ isActive: true }));
+  it("setState changes the state and persists", async () => {
+    const created = await services.createSubscription(makeInput({ state: "Active" }));
     const id = created[0].id;
 
-    const toggled = await services.toggleActive(id, false);
-    expect(toggled.find((s) => s.id === id)!.isActive).toBe(false);
+    const toggled = await services.setState(id, "Paused");
+    expect(toggled.find((s) => s.id === id)!.state).toBe("Paused");
 
     const listed = await services.listSubscriptions();
-    expect(listed.find((s) => s.id === id)!.isActive).toBe(false);
+    expect(listed.find((s) => s.id === id)!.state).toBe("Paused");
   });
 
   it("delete removes exactly the targeted subscription", async () => {
@@ -183,7 +203,7 @@ describe("AppServices category round-trips (Req 2.3)", () => {
 describe("AppServices settings round-trips (Req 2.3)", () => {
   it("getSettings returns defaults; updateSettings persists the patch", async () => {
     const settings = await services.getSettings();
-    expect(settings).toMatchObject(DEFAULT_SETTINGS);
+    expect(settings).toMatchObject(DEFAULT_SETTINGS_V2);
 
     const merged = await services.updateSettings({ theme: "light", accentColor: "#00FF00" });
     expect(merged.theme).toBe("light");
@@ -201,9 +221,9 @@ describe("AppServices export / import round-trips (Req 2.3)", () => {
 
     const json = await services.exportData("json");
     expect(typeof json).toBe("string");
-    const parsed = JSON.parse(json) as { subscriptions: Subscription[]; settings: Settings };
+    const parsed = JSON.parse(json) as { subscriptions: SubscriptionV2[]; settings: SettingsV2 };
     expect(parsed.subscriptions.map((s) => s.name)).toContain("Disney+");
-    expect(parsed.settings).toMatchObject(DEFAULT_SETTINGS);
+    expect(parsed.settings).toMatchObject(DEFAULT_SETTINGS_V2);
   });
 
   it("exportData('csv') returns a CSV string with a header row", async () => {
@@ -371,7 +391,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "createSubscription",
     "updateSubscription",
     "deleteSubscription",
-    "toggleActive",
+    "setState",
     "listCategories",
     "createCategory",
     "deleteCategory",

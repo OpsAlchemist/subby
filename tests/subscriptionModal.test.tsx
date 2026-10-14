@@ -14,9 +14,9 @@ import {
   errorStore,
 } from "@/stores";
 
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { IpcResult, SubscriptionInput } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -47,13 +47,13 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
 
 // --- Fixture factories --------------------------------------------------------
 
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -63,7 +63,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#e50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -85,23 +87,26 @@ interface FakeApi extends SubbyApi {
   createSpy: ReturnType<typeof vi.fn>;
   updateSpy: ReturnType<typeof vi.fn>;
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
-    settings: Settings;
+    settings: SettingsV2;
   };
 }
 
 function createFakeApi(): FakeApi {
-  const settings: Settings = {
-    ...DEFAULT_SETTINGS,
-    defaultCurrency: "GBP",
+  const settings: SettingsV2 = {
+    ...DEFAULT_SETTINGS_V2,
+    homeCurrency: "GBP",
     accentColor: "#123456",
   };
 
-  const createSpy = vi.fn((input: SubscriptionInput) =>
-    ok<Subscription[]>([makeSubscription({ ...input, id: "new-id" })]),
+  // The create/update spies only need to resolve successfully. The modal sends a
+  // v2 input (with `amountMajor`), which does not spread cleanly into a
+  // SubscriptionV2, so we ignore the input fields and return a canonical v2 sub.
+  const createSpy = vi.fn((_input: SubscriptionInput) =>
+    ok<SubscriptionV2[]>([makeSubscription({ id: "new-id" })]),
   );
-  const updateSpy = vi.fn(() => ok<Subscription[]>([makeSubscription()]));
+  const updateSpy = vi.fn(() => ok<SubscriptionV2[]>([makeSubscription()]));
 
   const fake: FakeApi = {
     createSpy,
@@ -117,7 +122,7 @@ function createFakeApi(): FakeApi {
     createSubscription: createSpy as SubbyApi["createSubscription"],
     updateSubscription: updateSpy as SubbyApi["updateSubscription"],
     deleteSubscription: () => ok(fake.state.subscriptions),
-    toggleActive: () => ok(fake.state.subscriptions),
+    setState: () => ok(fake.state.subscriptions),
 
     // --- Categories ---
     listCategories: () => ok(fake.state.categories),
@@ -129,7 +134,7 @@ function createFakeApi(): FakeApi {
     // --- Settings ---
     getSettings: () => ok(fake.state.settings),
     updateSettings: () => ok(fake.state.settings),
-    chooseDataFolder: () => ok<Settings | null>(fake.state.settings),
+    chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -160,7 +165,7 @@ async function seedStores(): Promise<void> {
     expect(categoriesStore.getSnapshot().loaded).toBe(true);
   });
   // Confirm the seeded (non-default) currency actually landed in the store.
-  expect(settingsStore.getSnapshot().data.defaultCurrency).toBe("GBP");
+  expect(settingsStore.getSnapshot().data.homeCurrency).toBe("GBP");
 }
 
 beforeEach(async () => {
@@ -180,7 +185,7 @@ afterEach(() => {
 // --- Tests --------------------------------------------------------------------
 
 describe("default currency pre-fill (Req 4.3)", () => {
-  it("pre-fills the currency field from settings.defaultCurrency in CREATE mode", () => {
+  it("pre-fills the currency field from settings.homeCurrency in CREATE mode", () => {
     render(<SubscriptionModal open onClose={() => {}} />);
 
     expect(screen.getByLabelText(/Currency/)).toHaveValue("GBP");
@@ -193,7 +198,7 @@ describe("edit pre-population (Req 4.2)", () => {
       id: "edit-me",
       name: "Spotify",
       provider: "Spotify AB",
-      amount: 119,
+      amountMinor: 11900, // USD exponent 2: 119 major = 11900 minor
       currency: "USD",
       billingCycle: "Yearly",
       website: "https://spotify.com",
@@ -279,8 +284,11 @@ describe("inline validation names the offending field (Req 3.5, 3.6)", () => {
       .closest("form") as HTMLFormElement;
     fireEvent.submit(form);
 
+    // A non-empty but negative amount is a parse-level failure: the money seam
+    // (`minorUnits`) rejects it, so the modal shows the "valid amount" message
+    // (the "non-negative number" copy is reserved for an EMPTY amount).
     expect(
-      await screen.findByText("Amount must be a non-negative number."),
+      await screen.findByText("Enter a valid amount for this currency."),
     ).toBeInTheDocument();
     expect(fake.createSpy).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
@@ -302,7 +310,9 @@ describe("happy path create (Req 3.1, 4.4)", () => {
 
     const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
     expect(payload.name).toBe("Disney+");
-    expect(payload.amount).toBe(299);
+    // The modal sends the user-entered MAJOR amount as a string (`amountMajor`);
+    // core parses it into integer minor units.
+    expect(payload.amountMajor).toBe("299");
     // Currency defaults from settings (Req 4.3).
     expect(payload.currency).toBe("GBP");
     // System-managed fields are NOT supplied by the modal.
@@ -312,5 +322,56 @@ describe("happy path create (Req 3.1, 4.4)", () => {
 
     expect(fake.updateSpy).not.toHaveBeenCalled();
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+  });
+
+  it("omits `trial` from the create payload for a non-Trial state", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Disney+");
+    await user.type(screen.getByLabelText(/^Amount/), "299");
+
+    // The default State is Active, so the trial fields are not even rendered.
+    expect(screen.queryByLabelText(/Trial end date/)).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.state).toBe("Active");
+    expect(payload.trial).toBeUndefined();
+  });
+});
+
+describe("Trial state reveals the trial fields and carries them in the payload (AD-17, AD-18)", () => {
+  it("selecting Trial reveals the trial fields; create carries trial:{endDate,postAmountMinor}", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<SubscriptionModal open onClose={onClose} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Trial Service");
+    await user.type(screen.getByLabelText(/^Amount/), "0");
+
+    // Trial fields are hidden until the Trial state is selected.
+    expect(screen.queryByLabelText(/Trial end date/)).toBeNull();
+
+    // Select the Trial option in the segmented State radiogroup.
+    await user.click(screen.getByRole("radio", { name: "Trial" }));
+
+    // The minimal trial block is now revealed (AD-18 minimal fields).
+    const trialEnd = await screen.findByLabelText(/Trial end date/);
+    const trialAmount = screen.getByLabelText(/Amount after trial/);
+
+    fireEvent.change(trialEnd, { target: { value: "2026-12-31" } });
+    await user.type(trialAmount, "9.99");
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.state).toBe("Trial");
+    // The entered post-trial MAJOR amount (9.99 GBP, exp 2) is parsed to minor units.
+    expect(payload.trial).toEqual({ endDate: "2026-12-31", postAmountMinor: 999 });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

@@ -18,8 +18,9 @@
 
 import { Notification } from "electron";
 
+import { toMajor } from "core/money";
 import type { ReminderLeadTime } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /** A renderable desktop notification payload. */
 export interface NotificationPayload {
@@ -64,12 +65,12 @@ export const electronNotifier: Notifier = ({ title, body }) => {
  * (amount/currency only included when an amount is present).
  */
 export function renderReminder(
-  sub: Subscription,
+  sub: SubscriptionV2,
   leadTime: ReminderLeadTime,
 ): NotificationPayload {
   const phrase = LEAD_TIME_PHRASE[leadTime];
   const title = `${sub.name} ${phrase}`;
-  const amountPart = `${sub.currency} ${sub.amount}`;
+  const amountPart = `${sub.currency} ${toMajor(sub.amountMinor, sub.currency)}`;
   const body = `${amountPart} • renews on ${sub.nextRenewal}`;
   return { title, body };
 }
@@ -96,7 +97,7 @@ export class NotificationService {
    * summary copy and hands it to the injected {@link Notifier}. Offline by
    * construction (Req 13.2).
    */
-  notify(sub: Subscription, leadTime: ReminderLeadTime): void {
+  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime): void {
     this.notifier(renderReminder(sub, leadTime));
   }
 }

@@ -27,9 +27,10 @@ import {
   totalMonthly,
   totalYearly,
 } from "core/analytics";
-import { activeSubscriptions } from "core/subscriptions";
+import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
 import { monthlyAmount } from "core/billing";
-import type { Subscription } from "core/models/subscription";
+import { toMajor } from "core/money";
+import type { SubscriptionV2 } from "core/models/subscription";
 import { subscriptionsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
 
@@ -42,6 +43,16 @@ const money = new Intl.NumberFormat("en-IN", {
   currency: "INR",
   maximumFractionDigits: 0,
 });
+
+/**
+ * Scale a summed **minor-unit** figure to INR major units for display. Story 3.3
+ * totals are a direct same-currency minor-unit sum (no FX); INR is 2-decimal, so
+ * dividing by 100 renders the major amount this view formats. The convert-before-
+ * sum Home total is Epic 6.
+ */
+function toMajorNumber(minor: number): number {
+  return minor / 100;
+}
 
 /** Friendly date formatter for the renewal timeline. */
 const dateFmt = new Intl.DateTimeFormat("en-IN", {
@@ -64,7 +75,7 @@ export default function AnalyticsView(): JSX.Element {
   const today = new Date().toISOString().slice(0, 10);
 
   const analytics = useMemo(() => {
-    const active = activeSubscriptions(subscriptions);
+    const active = activeSpendSubscriptionsV2(subscriptions);
     return {
       active,
       monthly: totalMonthly(active),
@@ -101,12 +112,12 @@ export default function AnalyticsView(): JSX.Element {
           <div className="grid gap-4 sm:grid-cols-2">
             <StatCard
               label="Monthly spend"
-              value={money.format(Math.round(monthly))}
+              value={money.format(Math.round(toMajorNumber(monthly)))}
               hint="Sum of normalized monthly amounts"
             />
             <StatCard
               label="Yearly projection"
-              value={money.format(Math.round(yearly))}
+              value={money.format(Math.round(toMajorNumber(yearly)))}
               hint="Projected from current active subscriptions"
             />
           </div>
@@ -218,7 +229,7 @@ function StackedBar({
   const summary =
     segments.length === 0
       ? "No spend to display."
-      : `Monthly spend by category, total ${money.format(Math.round(total))}: ` +
+      : `Monthly spend by category, total ${money.format(Math.round(toMajorNumber(total)))}: ` +
         segments
           .map(
             (seg) =>
@@ -297,7 +308,7 @@ function CategoryBars({
         categories
           .map(
             (c) =>
-              `${c.category} ${money.format(Math.round(c.monthly))}, ${Math.round(
+              `${c.category} ${money.format(Math.round(toMajorNumber(c.monthly)))}, ${Math.round(
                 (c.monthly / safeTotal) * 100,
               )}%`,
           )
@@ -315,7 +326,7 @@ function CategoryBars({
             <div className="flex items-baseline justify-between gap-3 text-sm">
               <span className="font-medium">{c.category}</span>
               <span className="text-muted-foreground">
-                {money.format(Math.round(c.monthly))}
+                {money.format(Math.round(toMajorNumber(c.monthly)))}
                 <span className="ml-2 tabular-nums">{pct}%</span>
               </span>
             </div>
@@ -343,7 +354,7 @@ function CategoryBars({
 }
 
 /** Ranked list of the most expensive subscriptions by monthly amount (Req 11.4). */
-function MostExpensiveList({ subs }: { subs: Subscription[] }): JSX.Element {
+function MostExpensiveList({ subs }: { subs: SubscriptionV2[] }): JSX.Element {
   return (
     <ol className="space-y-2">
       {subs.map((s, i) => (
@@ -363,7 +374,7 @@ function MostExpensiveList({ subs }: { subs: Subscription[] }): JSX.Element {
             </div>
           </div>
           <span className="shrink-0 font-medium tabular-nums">
-            {money.format(Math.round(monthlyAmount(s)))}
+            {money.format(Math.round(toMajorNumber(monthlyAmount(s))))}
             <span className="ml-1 text-xs font-normal text-muted-foreground">
               /mo
             </span>
@@ -381,7 +392,7 @@ function MostExpensiveList({ subs }: { subs: Subscription[] }): JSX.Element {
 function RenewalTimeline({
   timeline,
 }: {
-  timeline: { date: string; subs: Subscription[] }[];
+  timeline: { date: string; subs: SubscriptionV2[] }[];
 }): JSX.Element {
   if (timeline.length === 0) {
     return (
@@ -407,7 +418,7 @@ function RenewalTimeline({
               >
                 <span className="truncate text-muted-foreground">{s.name}</span>
                 <span className="shrink-0 tabular-nums text-muted-foreground">
-                  {money.format(Math.round(s.amount))}
+                  {s.currency} {toMajor(s.amountMinor, s.currency)}
                 </span>
               </li>
             ))}

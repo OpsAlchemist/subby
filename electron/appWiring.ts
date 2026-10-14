@@ -19,14 +19,14 @@
  */
 
 import * as catCore from "core/categories";
-import * as subsCore from "core/subscriptions";
+import * as subsCore from "core/subscriptionsV2";
 import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import type { Category } from "core/models/category";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
-import type { ConflictMode, SubscriptionInput } from "shared/types";
+import type { ConflictMode, SubscriptionInputV2 } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
 import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
@@ -130,18 +130,21 @@ export type DeleteCategoryOutcome =
 export interface AppServices {
   // --- Subscriptions (Req 3) ---
   /** Read all subscriptions. */
-  listSubscriptions(): Promise<Subscription[]>;
+  listSubscriptions(): Promise<SubscriptionV2[]>;
   /** Create a subscription (unique id, createdAt === updatedAt); returns the new full set. */
-  createSubscription(input: SubscriptionInput): Promise<Subscription[]>;
+  createSubscription(input: SubscriptionInputV2): Promise<SubscriptionV2[]>;
   /** Apply a patch to a subscription and advance `updatedAt`; returns the new full set. */
   updateSubscription(
     id: string,
-    patch: subsCore.SubscriptionPatch,
-  ): Promise<Subscription[]>;
+    patch: subsCore.SubscriptionPatchV2,
+  ): Promise<SubscriptionV2[]>;
   /** Backup, then remove a subscription; returns the new full set (Req 3.3). */
-  deleteSubscription(id: string): Promise<Subscription[]>;
-  /** Set `isActive` on a subscription; returns the new full set (Req 3.7). */
-  toggleActive(id: string, value: boolean): Promise<Subscription[]>;
+  deleteSubscription(id: string): Promise<SubscriptionV2[]>;
+  /** Set the three-way `state` on a subscription; returns the new full set (Req 3.7, AD-17). */
+  setState(
+    id: string,
+    state: SubscriptionV2["state"],
+  ): Promise<SubscriptionV2[]>;
 
   // --- Categories (Req 7) ---
   /** Read all categories. */
@@ -160,11 +163,11 @@ export interface AppServices {
 
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
-  getSettings(): Promise<Settings>;
+  getSettings(): Promise<SettingsV2>;
   /** Merge and persist a settings patch; returns the merged settings (Req 15.2). */
-  updateSettings(patch: Partial<Settings>): Promise<Settings>;
+  updateSettings(patch: Partial<SettingsV2>): Promise<SettingsV2>;
   /** Switch the active data folder and persist it into settings (Req 15.3). */
-  setDataFolder(path: string | null): Promise<Settings>;
+  setDataFolder(path: string | null): Promise<SettingsV2>;
 
   // --- Import / Export (Req 16, 17) ---
   /** Backup, then plan + persist an import; returns the outcome (Req 16.4). */
@@ -180,7 +183,7 @@ export interface AppServices {
   /** List backup file names, newest first (Req 18.2). */
   listBackups(): Promise<string[]>;
   /** Backup current data, then restore subscriptions from `name` (Req 18.2, 18.3). */
-  restoreBackup(name: string): Promise<Subscription[]>;
+  restoreBackup(name: string): Promise<SubscriptionV2[]>;
 
   // --- Shared destructive helper ---
   /** Create a timestamped backup of the current subscriptions (Req 18.1). */
@@ -273,8 +276,20 @@ export function buildAppServices(storage: StoragePort): AppServices {
 
     createSubscription(input) {
       return lock("subscriptions", async () => {
-        const existing = await storage.readSubscriptions();
-        const next = subsCore.createSubscription(existing, input, nowIso());
+        // `createSubscriptionV2` needs the Home Currency for its
+        // default-to-Home rule (an unspecified Native Currency becomes Home).
+        // Settings is now v2, so `homeCurrency` is read here (the migrator maps
+        // v1 `defaultCurrency` → `homeCurrency`).
+        const [existing, settings] = await Promise.all([
+          storage.readSubscriptions(),
+          storage.readSettings(),
+        ]);
+        const next = subsCore.createSubscriptionV2(
+          existing,
+          input,
+          settings.homeCurrency,
+          nowIso(),
+        );
         await storage.writeSubscriptions(next);
         return next;
       });
@@ -283,7 +298,7 @@ export function buildAppServices(storage: StoragePort): AppServices {
     updateSubscription(id, patch) {
       return lock("subscriptions", async () => {
         const existing = await storage.readSubscriptions();
-        const next = subsCore.editSubscription(existing, id, patch, nowIso());
+        const next = subsCore.editSubscriptionV2(existing, id, patch, nowIso());
         await storage.writeSubscriptions(next);
         return next;
       });
@@ -296,16 +311,16 @@ export function buildAppServices(storage: StoragePort): AppServices {
         // subscriptions mutation can interleave between them (AD-29).
         await storage.createBackup("pre-delete");
         const existing = await storage.readSubscriptions();
-        const next = subsCore.deleteSubscription(existing, id);
+        const next = subsCore.deleteSubscriptionV2(existing, id);
         await storage.writeSubscriptions(next);
         return next;
       });
     },
 
-    toggleActive(id, value) {
+    setState(id, state) {
       return lock("subscriptions", async () => {
         const existing = await storage.readSubscriptions();
-        const next = subsCore.toggleActive(existing, id, value, nowIso());
+        const next = subsCore.setSubscriptionState(existing, id, state, nowIso());
         await storage.writeSubscriptions(next);
         return next;
       });

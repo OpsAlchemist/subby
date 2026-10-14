@@ -12,8 +12,8 @@ import {
   StorageMigrationError,
 } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { Settings, SettingsV2 } from "core/models/settings";
+import type { Subscription, SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Launch-ordering tests for the migration barrier (Story 1.6 / AD-28).
@@ -84,10 +84,10 @@ afterEach(async () => {
 
 describe("migration barrier at current = 1 (inert no-op pass; live behavior unchanged)", () => {
   it("a barrier over already-current files does NOT migrate, write back, or back up", async () => {
-    const storage = new JsonFileStorage(userData); // live current = 1
+    const storage = new JsonFileStorage(userData, null, 1); // live current = 1
     const subs = [v1Subscription({ id: "a" }), v1Subscription({ id: "b", isActive: false })];
-    await storage.writeSubscriptions(subs);
-    await storage.writeSettings(v1Settings());
+    await storage.writeSubscriptions(subs as unknown as SubscriptionV2[]);
+    await storage.writeSettings(v1Settings() as unknown as SettingsV2);
 
     const subsPath = join(userData, fileNames.subscriptions);
     const settingsPath = join(userData, fileNames.settings);
@@ -106,7 +106,7 @@ describe("migration barrier at current = 1 (inert no-op pass; live behavior unch
   });
 
   it("on a fresh install the barrier recreates defaults (bootstrap), still a pass", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     await runMigrationBarrier(storage);
 
     // Default files were created at version 1 — no migration occurred.
@@ -117,8 +117,8 @@ describe("migration barrier at current = 1 (inert no-op pass; live behavior unch
   });
 
   it("the barrier completes before a simulated scheduler/handler read observes data", async () => {
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription({ id: "a" })]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription({ id: "a" })] as unknown as SubscriptionV2[]);
 
     // Model the launch ordering: a reader (scheduler catch-up / handler) is only
     // allowed to touch user data AFTER the barrier resolves. We assert the
@@ -137,13 +137,13 @@ describe("migration barrier at current = 1 (inert no-op pass; live behavior unch
 describe("migration barrier at injected current = 2 (load-bearing; migrates before readers)", () => {
   it("a v1 file is migrated to completion by the barrier before any reader observes it", async () => {
     // Write a genuine v1 file with a current=1 adapter.
-    const writer = new JsonFileStorage(userData);
+    const writer = new JsonFileStorage(userData, null, 1);
     const v1Subs = [
       v1Subscription({ id: "a", amount: 499, currency: "INR", isActive: true }),
       v1Subscription({ id: "b", amount: 9.99, currency: "USD", isActive: false }),
     ];
-    await writer.writeSubscriptions(v1Subs);
-    await writer.writeSettings(v1Settings({ defaultCurrency: "EUR" }));
+    await writer.writeSubscriptions(v1Subs as unknown as SubscriptionV2[]);
+    await writer.writeSettings(v1Settings({ defaultCurrency: "EUR" }) as unknown as SettingsV2);
 
     const subsPath = join(userData, fileNames.subscriptions);
     const settingsPath = join(userData, fileNames.settings);
@@ -180,12 +180,12 @@ describe("migration barrier at injected current = 2 (load-bearing; migrates befo
   });
 
   it("a second launch (barrier re-run) sees already-migrated data and does not re-migrate", async () => {
-    const writer = new JsonFileStorage(userData);
-    await writer.writeSubscriptions([v1Subscription({ id: "a" })]);
+    const writer = new JsonFileStorage(userData, null, 1);
+    await writer.writeSubscriptions([v1Subscription({ id: "a" })] as unknown as SubscriptionV2[]);
     // Seed a genuine v1 settings file so the barrier migrates REAL settings into
     // valid v2 (rather than recreating defaults, whose v2 shape is an Epic-3
     // concern not covered by scope-A defaults).
-    await writer.writeSettings(v1Settings());
+    await writer.writeSettings(v1Settings() as unknown as SettingsV2);
 
     const migrator = new JsonFileStorage(userData, null, 2);
     await runMigrationBarrier(migrator); // first launch migrates

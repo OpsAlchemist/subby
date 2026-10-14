@@ -10,7 +10,7 @@ import {
 } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
 import { DEFAULT_CATEGORIES, DEFAULT_SETTINGS } from "core/models/schema";
-import type { Subscription } from "core/models/subscription";
+import type { Subscription, SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Integration tests for storage bootstrap (Task 12.2).
@@ -75,7 +75,7 @@ let storage: JsonFileStorage;
 
 beforeEach(async () => {
   userData = await mkdtemp(join(tmpdir(), "subby-storage-"));
-  storage = new JsonFileStorage(userData);
+  storage = new JsonFileStorage(userData, null, 1);
 });
 
 afterEach(async () => {
@@ -230,7 +230,7 @@ describe("JsonFileStorage backup round-trip (Req 18.1, 18.2)", () => {
       makeSubscription({ id: "sub-1", name: "Netflix" }),
       makeSubscription({ id: "sub-2", name: "Spotify", category: "Music" }),
     ];
-    await storage.writeSubscriptions(subs);
+    await storage.writeSubscriptions(subs as unknown as SubscriptionV2[]);
 
     const backupName = await storage.createBackup("test-backup");
     expect(backupName).toMatch(/\.json$/);

@@ -8,7 +8,7 @@
  * ordered, plain string comparison is sufficient for chronological ordering.
  */
 
-import type { BillingCycle, CustomInterval, Subscription } from "./models/subscription";
+import type { BillingCycle, CustomInterval } from "./models/subscription";
 
 /** ISO date string in the form `YYYY-MM-DD`. */
 export type ISODate = string;
@@ -103,14 +103,29 @@ export function advanceRenewal(date: ISODate, cycle: BillingCycle, custom?: Cust
 }
 
 /**
+ * The renewal-relevant fields `rollForward` reads — identical across the v1 and
+ * v2 subscription shapes. Keeping the signature structural (a `Pick` of just
+ * these fields) lets the one implementation serve both the v2 scheduler and any
+ * v1 test caller without a breaking retype and without duplicating the logic.
+ */
+export interface RenewalFields {
+  autoRenew: boolean;
+  nextRenewal: ISODate;
+  billingCycle: BillingCycle;
+  customInterval?: CustomInterval;
+}
+
+/**
  * Rolls a past `nextRenewal` forward when `autoRenew` is true, advancing by
  * whole billing intervals until it is on or after `today` (Req 5.3, 5.4).
  *
- * Returns the same object reference when nothing changes (autoRenew is false,
- * or `nextRenewal` is already on/after `today`); otherwise returns a new object
- * with the updated `nextRenewal`.
+ * Generic over any subscription-like value `T` carrying the {@link RenewalFields}
+ * (v1 `Subscription` or v2 `SubscriptionV2`): it reads only those fields and
+ * returns the same shape it was given. Returns the same object reference when
+ * nothing changes (autoRenew is false, or `nextRenewal` is already on/after
+ * `today`); otherwise returns a new object with the updated `nextRenewal`.
  */
-export function rollForward(s: Subscription, today: ISODate): Subscription {
+export function rollForward<T extends RenewalFields>(s: T, today: ISODate): T {
   if (!s.autoRenew) return s;
   let next = s.nextRenewal;
   // Lexicographic comparison is valid for `YYYY-MM-DD` strings.

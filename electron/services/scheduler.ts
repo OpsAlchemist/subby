@@ -29,12 +29,12 @@
 
 import { dueLeadTimes } from "core/notify";
 import { rollForward, type ISODate } from "core/renewal";
-import type { ReminderLeadTime, Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { ReminderLeadTime, SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /** Emits one desktop reminder for a `(subscription, leadTime)` pair. */
 export interface SubscriptionNotifier {
-  notify(sub: Subscription, leadTime: ReminderLeadTime): void;
+  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime): void;
 }
 
 /**
@@ -44,9 +44,9 @@ export interface SubscriptionNotifier {
  */
 export interface SchedulerServices {
   /** Read the persisted settings (re-read each cycle — Req 13.5). */
-  getSettings(): Promise<Settings>;
+  getSettings(): Promise<SettingsV2>;
   /** Read all subscriptions. */
-  listSubscriptions(): Promise<Subscription[]>;
+  listSubscriptions(): Promise<SubscriptionV2[]>;
 }
 
 /** Default periodic evaluation interval: every 30 minutes. */
@@ -167,7 +167,9 @@ export class Scheduler {
         // Roll a past renewal forward (autoRenew only) so the evaluated date is
         // the genuine upcoming renewal.
         const evaluated = rollForward(sub, today);
-        if (!evaluated.isActive) continue;
+        // Paused subscriptions never generate reminders (AD-17); Active and
+        // Trial are both reminder-eligible.
+        if (evaluated.state === "Paused") continue;
 
         // (3) Pure due-decision.
         const due = dueLeadTimes(evaluated, today, enabled);

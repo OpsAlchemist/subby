@@ -113,8 +113,8 @@ export const subscriptionsApi = {
     patch: Parameters<SubbyApi["updateSubscription"]>[1],
   ) => unwrap(getSubby().updateSubscription(id, patch)),
   remove: (id: string) => unwrap(getSubby().deleteSubscription(id)),
-  toggleActive: (id: string, value: boolean) =>
-    unwrap(getSubby().toggleActive(id, value)),
+  setState: (id: string, state: Parameters<SubbyApi["setState"]>[1]) =>
+    unwrap(getSubby().setState(id, state)),
 } as const;
 
 /** Category operations (Req 7). */

@@ -15,8 +15,8 @@ import {
 import { fileNames } from "../electron/storage/paths";
 import { safeReadVersionedJson } from "../electron/storage/safeJson";
 import { migrateSubscriptionV1toV2 } from "core/migrations";
-import type { Subscription } from "core/models/subscription";
-import type { Settings } from "core/models/settings";
+import type { Subscription, SubscriptionV2 } from "core/models/subscription";
+import type { Settings, SettingsV2 } from "core/models/settings";
 
 /**
  * Integration tests for the migrate-before-validate version-gated read path
@@ -137,9 +137,9 @@ describe("safeReadVersionedJson (version-detection seam)", () => {
 
 describe("version gating at current = 1 (live scope-A behavior preserved)", () => {
   it("equal version: a v1 file validates and returns unchanged with NO write-back", async () => {
-    const storage = new JsonFileStorage(userData); // default current = 1
+    const storage = new JsonFileStorage(userData, null, 1); // default current = 1
     const subs = [v1Subscription({ id: "a" }), v1Subscription({ id: "b", isActive: false })];
-    await storage.writeSubscriptions(subs);
+    await storage.writeSubscriptions(subs as unknown as SubscriptionV2[]);
 
     const subsPath = join(userData, fileNames.subscriptions);
     const before = await readFile(subsPath, "utf8");
@@ -155,8 +155,8 @@ describe("version gating at current = 1 (live scope-A behavior preserved)", () =
   });
 
   it("equal version: a v1 settings file reads back unchanged, no write-back", async () => {
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSettings(v1Settings());
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSettings(v1Settings() as unknown as SettingsV2);
     const settingsPath = join(userData, fileNames.settings);
     const before = await readFile(settingsPath, "utf8");
 
@@ -166,14 +166,14 @@ describe("version gating at current = 1 (live scope-A behavior preserved)", () =
   });
 
   it("missing file: recreates defaults at version 1", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     const subs = await storage.readSubscriptions();
     expect(subs).toEqual([]);
     expect((await readJson(join(userData, fileNames.subscriptions))).version).toBe(1);
   });
 
   it("newer version: a v2 file against current = 1 is REFUSED and left untouched", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     const subsPath = join(userData, fileNames.subscriptions);
     const v2File = { version: 2, subscriptions: [] };
     await writeFile(subsPath, JSON.stringify(v2File), "utf8");
@@ -197,8 +197,8 @@ describe("version gating at current = 1 (live scope-A behavior preserved)", () =
   });
 
   it("malformed/corrupt at target: still a StorageCorruptError, not overwritten", async () => {
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription()]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
     await storage.createBackup("test"); // so canRestoreBackup can be true
 
     const subsPath = join(userData, fileNames.subscriptions);
@@ -219,7 +219,7 @@ describe("version gating at current = 1 (live scope-A behavior preserved)", () =
   });
 
   it("corrupt at target (valid JSON, bad shape at v1): StorageCorruptError", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     const subsPath = join(userData, fileNames.subscriptions);
     // version 1, but subscriptions is the wrong type -> fails the v1 schema.
     await writeFile(subsPath, JSON.stringify({ version: 1, subscriptions: "nope" }), "utf8");
@@ -237,12 +237,12 @@ describe("version gating at current = 1 (live scope-A behavior preserved)", () =
 describe("version gating at injected current = 2 (migrate-before-validate)", () => {
   it("older version: v1 subscriptions -> pre-migration backup, migrate, validate v2, write back, return", async () => {
     // Write a v1 file via a current=1 adapter so the on-disk file is genuine v1.
-    const writer = new JsonFileStorage(userData); // current = 1
+    const writer = new JsonFileStorage(userData, null, 1); // current = 1
     const v1Subs = [
       v1Subscription({ id: "a", amount: 499, currency: "INR", isActive: true }),
       v1Subscription({ id: "b", amount: 9.99, currency: "USD", isActive: false }),
     ];
-    await writer.writeSubscriptions(v1Subs);
+    await writer.writeSubscriptions(v1Subs as unknown as SubscriptionV2[]);
 
     const subsPath = join(userData, fileNames.subscriptions);
     const rawBeforeMigration = await readJson(subsPath);
@@ -299,8 +299,8 @@ describe("version gating at injected current = 2 (migrate-before-validate)", () 
   });
 
   it("older version: v1 settings migrate to v2 (homeCurrency + online), write back", async () => {
-    const writer = new JsonFileStorage(userData); // current = 1
-    await writer.writeSettings(v1Settings({ defaultCurrency: "EUR" }));
+    const writer = new JsonFileStorage(userData, null, 1); // current = 1
+    await writer.writeSettings(v1Settings({ defaultCurrency: "EUR" }) as unknown as SettingsV2);
     const settingsPath = join(userData, fileNames.settings);
     expect((await readJson(settingsPath)).version).toBe(1);
 
@@ -470,7 +470,7 @@ describe("version gating at injected current = 2 (migrate-before-validate)", () 
       createdAt: "2024-01-01T00:00:00.000Z",
       updatedAt: "2024-01-01T00:00:00.000Z",
     };
-    await storage.writeSubscriptions([v2Sub] as unknown as Subscription[]);
+    await storage.writeSubscriptions([v2Sub] as unknown as SubscriptionV2[]);
 
     const subsPath = join(userData, fileNames.subscriptions);
     // The written file is stamped at the injected current (2), not 1.
@@ -495,7 +495,7 @@ describe("version gating at injected current = 2 (migrate-before-validate)", () 
       trayMode: false,
       dataFolder: null,
       online: { liveLogoFetch: false, fxRefresh: false },
-    } as unknown as Settings);
+    } as unknown as SettingsV2);
     const settingsPath = join(userData, fileNames.settings);
     expect((await readJson(settingsPath)).version).toBe(2);
     const settingsBytes = await readFile(settingsPath, "utf8");

@@ -12,8 +12,27 @@
  */
 
 import type { Category } from "./models/category";
-import type { Subscription } from "./models/subscription";
-import type { Settings } from "./models/settings";
+
+/**
+ * The only subscription field these category helpers read: the assigned
+ * category name. Structural so both v1 `Subscription` and v2 `SubscriptionV2`
+ * satisfy it (the field is identical across versions).
+ */
+interface CategorizedSubscription {
+  category: string;
+}
+
+/**
+ * The only settings shape {@link mergeSettings} depends on: a `notification`
+ * block it deep-merges (its other top-level fields are shallow-merged untyped).
+ * Structural so it serves both v1 `Settings` and v2 `SettingsV2` unchanged.
+ */
+interface MergeableSettings {
+  notification: {
+    enabled: boolean;
+    leadTimes: string[];
+  };
+}
 
 /**
  * Generate a unique identifier for a new category (uuid v4).
@@ -91,7 +110,7 @@ export function createCategory(
  * deleting a category that is still in use.
  */
 export function categoryAssignmentCount(
-  subs: Subscription[],
+  subs: CategorizedSubscription[],
   categoryName: string,
 ): number {
   return subs.reduce(
@@ -106,7 +125,7 @@ export function categoryAssignmentCount(
  * completing the deletion when this returns `true`.
  */
 export function isCategoryInUse(
-  subs: Subscription[],
+  subs: CategorizedSubscription[],
   categoryName: string,
 ): boolean {
   return categoryAssignmentCount(subs, categoryName) > 0;
@@ -126,19 +145,22 @@ export function deleteCategory(existing: Category[], id: string): Category[] {
 // --- Settings merge (Req 15.2) -----------------------------------------------
 
 /**
- * Apply `patch` to `current`, returning a NEW Settings object (the input is
+ * Apply `patch` to `current`, returning a NEW settings object (the input is
  * never mutated) (Req 15.2).
  *
- * Top-level fields are shallow-merged. The nested `notification` object is
- * deep-merged so a patch may update `enabled` and `leadTimes` independently
- * without dropping the unspecified field. The `leadTimes` array is copied so
- * the result never shares a mutable reference with the patch or `current`.
+ * Generic over the settings shape `T` (v1 `Settings` or v2 `SettingsV2`): it
+ * reads only the shared `notification` block, so the same merge serves both and
+ * returns the caller's own type. Top-level fields are shallow-merged; the nested
+ * `notification` object is deep-merged so a patch may update `enabled` and
+ * `leadTimes` independently without dropping the unspecified field. The
+ * `leadTimes` array is copied so the result never shares a mutable reference
+ * with the patch or `current`.
  */
-export function mergeSettings(
-  current: Settings,
-  patch: Partial<Settings>,
-): Settings {
-  const merged: Settings = { ...current, ...patch };
+export function mergeSettings<T extends MergeableSettings>(
+  current: T,
+  patch: Partial<T>,
+): T {
+  const merged: T = { ...current, ...patch };
 
   if (patch.notification !== undefined) {
     const notification = { ...current.notification, ...patch.notification };

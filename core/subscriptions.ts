@@ -15,7 +15,14 @@ import type {
   BillingCycle,
   Subscription,
 } from "./models/subscription";
-import type { SubscriptionInput } from "shared/types";
+
+/**
+ * v1 create input: a v1 subscription without the system-managed fields. Defined
+ * locally because the shared IPC `SubscriptionInput` is now the v2 shape (Story
+ * 3.3 cutover) — this v1 module is retained as the mirror reference for the v2
+ * mutators in `core/subscriptionsV2.ts` and is no longer on the live write path.
+ */
+type SubscriptionInput = Omit<Subscription, "id" | "createdAt" | "updatedAt">;
 
 /**
  * Fields a caller may change on an existing subscription. System-managed

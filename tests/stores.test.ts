@@ -14,9 +14,9 @@ import {
   errorStore,
 } from "@/stores";
 
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { AppError, IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -49,9 +49,9 @@ function fail<T>(error: AppError): Promise<IpcResult<T>> {
 interface FakeApi extends SubbyApi {
   /** Mutable backing data the test changes between reloads. */
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
-    settings: Settings;
+    settings: SettingsV2;
   };
   /** When set, the corresponding `list`/`get` resolves to a failure result. */
   failures: {
@@ -67,13 +67,13 @@ interface FakeApi extends SubbyApi {
   emitError(error: AppError): void;
 }
 
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -83,7 +83,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -100,7 +102,7 @@ function createFakeApi(): FakeApi {
     state: {
       subscriptions: [makeSubscription({ id: "sub-1", name: "Netflix" })],
       categories: [makeCategory({ id: "cat-1", name: "Streaming" })],
-      settings: { ...DEFAULT_SETTINGS },
+      settings: { ...DEFAULT_SETTINGS_V2 },
     },
     failures: { subscriptions: null, categories: null, settings: null },
     dataChangedListeners: [],
@@ -116,12 +118,12 @@ function createFakeApi(): FakeApi {
     // --- Subscriptions ---
     listSubscriptions: () =>
       fake.failures.subscriptions
-        ? fail<Subscription[]>(fake.failures.subscriptions)
+        ? fail<SubscriptionV2[]>(fake.failures.subscriptions)
         : ok(fake.state.subscriptions),
     createSubscription: () => ok(fake.state.subscriptions),
     updateSubscription: () => ok(fake.state.subscriptions),
     deleteSubscription: () => ok(fake.state.subscriptions),
-    toggleActive: () => ok(fake.state.subscriptions),
+    setState: () => ok(fake.state.subscriptions),
 
     // --- Categories ---
     listCategories: () =>
@@ -135,10 +137,10 @@ function createFakeApi(): FakeApi {
     // --- Settings ---
     getSettings: () =>
       fake.failures.settings
-        ? fail<Settings>(fake.failures.settings)
+        ? fail<SettingsV2>(fake.failures.settings)
         : ok(fake.state.settings),
     updateSettings: () => ok(fake.state.settings),
-    chooseDataFolder: () => ok<Settings | null>(fake.state.settings),
+    chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),

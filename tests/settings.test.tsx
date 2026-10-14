@@ -27,8 +27,8 @@ import {
   errorStore,
 } from "@/stores";
 
-import type { Settings as SettingsModel } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { SettingsV2 as SettingsModel } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -58,7 +58,7 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
 
 /** A known, fully-specified settings object so control state is deterministic. */
 const KNOWN_SETTINGS: SettingsModel = {
-  defaultCurrency: "INR",
+  homeCurrency: "INR",
   notification: {
     enabled: true,
     leadTimes: ["same-day", "one-day", "three-days"],
@@ -68,6 +68,7 @@ const KNOWN_SETTINGS: SettingsModel = {
   accentColor: "#92400e", // Warm Graphite default (ochre); the old purple is retired
   trayMode: false,
   dataFolder: null,
+  online: { liveLogoFetch: false, fxRefresh: false },
 };
 
 // --- Fake SubbyApi facade -----------------------------------------------------
@@ -76,7 +77,7 @@ interface FakeApi extends SubbyApi {
   updateSpy: ReturnType<typeof vi.fn>;
   chooseFolderSpy: ReturnType<typeof vi.fn>;
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsModel;
   };
@@ -109,7 +110,7 @@ function createFakeApi(): FakeApi {
     createSubscription: () => ok(fake.state.subscriptions),
     updateSubscription: () => ok(fake.state.subscriptions),
     deleteSubscription: () => ok(fake.state.subscriptions),
-    toggleActive: () => ok(fake.state.subscriptions),
+    setState: () => ok(fake.state.subscriptions),
 
     // --- Categories ---
     listCategories: () => ok(fake.state.categories),

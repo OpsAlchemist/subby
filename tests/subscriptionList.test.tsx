@@ -14,9 +14,9 @@ import {
   errorStore,
 } from "@/stores";
 
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { AppError, IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -27,7 +27,7 @@ import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
  * The view reads live data from the client stores. We install a fake
  * {@link SubbyApi} via `setSubby(...)` whose `list*`/`get*` methods return
  * controllable {@link IpcResult} data and whose mutation methods
- * (`toggleActive`/`deleteSubscription`/`updateSubscription`) are spies. We
+ * (`setState`/`deleteSubscription`/`updateSubscription`) are spies. We
  * `initStores()` so the stores populate, then render `<SubscriptionList/>`.
  *
  * Note on layout: the view renders BOTH a wide `<table>` (`hidden md:block`)
@@ -44,22 +44,22 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
 
 interface FakeApi extends SubbyApi {
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
-    settings: Settings;
+    settings: SettingsV2;
   };
   dataChangedListeners: Array<() => void>;
   errorListeners: Array<(error: AppError) => void>;
   emitDataChanged(): void;
 }
 
-function makeSub(overrides: Partial<Subscription> = {}): Subscription {
+function makeSub(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -69,7 +69,9 @@ function makeSub(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -86,7 +88,7 @@ function createFakeApi(): FakeApi {
     state: {
       subscriptions: [],
       categories: [],
-      settings: { ...DEFAULT_SETTINGS },
+      settings: { ...DEFAULT_SETTINGS_V2 },
     },
     dataChangedListeners: [],
     errorListeners: [],
@@ -99,7 +101,7 @@ function createFakeApi(): FakeApi {
     createSubscription: vi.fn(() => ok(fake.state.subscriptions)),
     updateSubscription: vi.fn(() => ok(fake.state.subscriptions)),
     deleteSubscription: vi.fn(() => ok(fake.state.subscriptions)),
-    toggleActive: vi.fn(() => ok(fake.state.subscriptions)),
+    setState: vi.fn(() => ok(fake.state.subscriptions)),
 
     // --- Categories ---
     listCategories: vi.fn(() => ok(fake.state.categories)),
@@ -111,7 +113,7 @@ function createFakeApi(): FakeApi {
     // --- Settings ---
     getSettings: vi.fn(() => ok(fake.state.settings)),
     updateSettings: () => ok(fake.state.settings),
-    chooseDataFolder: () => ok<Settings | null>(fake.state.settings),
+    chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -143,7 +145,7 @@ let teardown: () => void;
 
 /** Seed data, wire stores, and render the list. Resilient to async loads. */
 async function renderList(
-  subs: Subscription[],
+  subs: SubscriptionV2[],
   categories: Category[] = [],
 ): Promise<void> {
   fake.state.subscriptions = subs;
@@ -230,11 +232,12 @@ describe("filtering (Req 9.4)", () => {
   it("shows only subscriptions matching the selected status", async () => {
     const user = userEvent.setup();
     await renderList([
-      makeSub({ id: "a", name: "Netflix", isActive: true }),
-      makeSub({ id: "b", name: "Hulu", isActive: false }),
+      makeSub({ id: "a", name: "Netflix", state: "Active" }),
+      makeSub({ id: "b", name: "Hulu", state: "Paused" }),
     ]);
 
-    await user.selectOptions(screen.getByLabelText("Status"), "inactive");
+    // The v2 State filter is labelled "State" with options Active/Trial/Paused.
+    await user.selectOptions(screen.getByLabelText("State"), "Paused");
     expect(tableRowNames()).toEqual(["Hulu"]);
   });
 });
@@ -272,7 +275,7 @@ describe("grouping (Req 9.5)", () => {
 // --- Bulk actions (Req 9.6) ---------------------------------------------------
 
 describe("bulk actions (Req 9.6)", () => {
-  it("deactivates every selected subscription via toggleActive(id, false)", async () => {
+  it("sets every selected subscription to Paused via setState(id,'Paused')", async () => {
     const user = userEvent.setup();
     await renderList([
       makeSub({ id: "a", name: "Netflix" }),
@@ -284,17 +287,16 @@ describe("bulk actions (Req 9.6)", () => {
     await user.click(within(table).getByLabelText("Select Netflix"));
     await user.click(within(table).getByLabelText("Select Spotify"));
 
-    await user.click(screen.getByRole("button", { name: /Deactivate/ }));
+    // The bulk bar now offers "Set Active" and "Set Paused" (no boolean toggle).
+    await user.click(screen.getByRole("button", { name: /Set Paused/ }));
 
-    await waitFor(() =>
-      expect(fake.toggleActive).toHaveBeenCalledTimes(2),
-    );
-    const calledIds = (fake.toggleActive as ReturnType<typeof vi.fn>).mock.calls.map(
+    await waitFor(() => expect(fake.setState).toHaveBeenCalledTimes(2));
+    const calledIds = (fake.setState as ReturnType<typeof vi.fn>).mock.calls.map(
       (c) => c[0],
     );
     expect(calledIds.sort()).toEqual(["a", "b"]);
-    for (const call of (fake.toggleActive as ReturnType<typeof vi.fn>).mock.calls) {
-      expect(call[1]).toBe(false);
+    for (const call of (fake.setState as ReturnType<typeof vi.fn>).mock.calls) {
+      expect(call[1]).toBe("Paused");
     }
     // The untouched subscription was not affected.
     expect(calledIds).not.toContain("c");
@@ -329,9 +331,11 @@ describe("bulk actions (Req 9.6)", () => {
 // --- Quick-edit (Req 9.7) -----------------------------------------------------
 
 describe("quick-edit (Req 9.7)", () => {
-  it("persists an edited amount via update(id, { amount })", async () => {
+  it("persists an edited amount via update(id, { amountMinor })", async () => {
     const user = userEvent.setup();
-    await renderList([makeSub({ id: "a", name: "Netflix", amount: 499 })]);
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+    ]);
 
     // jsdom renders BOTH the wide table and the narrow card layout (no CSS to
     // hide either), so two `autoFocus` edit inputs mount at once. jsdom also
@@ -354,6 +358,8 @@ describe("quick-edit (Req 9.7)", () => {
     fireEvent.keyDown(input, { key: "Enter" });
 
     await waitFor(() => expect(fake.updateSubscription).toHaveBeenCalledTimes(1));
-    expect(fake.updateSubscription).toHaveBeenCalledWith("a", { amount: 999 });
+    // The List parses the entered MAJOR amount into integer minor units in the
+    // sub's own currency: minorUnits("999", "INR") === 99900 (exponent 2).
+    expect(fake.updateSubscription).toHaveBeenCalledWith("a", { amountMinor: 99900 });
   });
 });

@@ -16,7 +16,14 @@
  * `Date.getMonth()` convention used by callers.
  */
 
-import type { Subscription } from "core/models/subscription";
+/**
+ * The only subscription field {@link indexByRenewalDate} reads: the renewal
+ * date. Structural so it serves both v1 `Subscription` and v2 `SubscriptionV2`
+ * (the field is identical across versions).
+ */
+interface RenewableSubscription {
+  nextRenewal: string;
+}
 
 /** A single cell in the month grid. */
 export interface MonthGridCell {
@@ -152,10 +159,10 @@ export function buildMonthGrid(year: number, month: number): MonthGrid {
  * built once over all subscriptions; the view looks up indicators/lists by the
  * cell's date string, so navigating months reuses the same map (Req 10.3).
  */
-export function indexByRenewalDate(
-  subs: Subscription[],
-): Map<string, Subscription[]> {
-  const map = new Map<string, Subscription[]>();
+export function indexByRenewalDate<T extends RenewableSubscription>(
+  subs: T[],
+): Map<string, T[]> {
+  const map = new Map<string, T[]>();
   for (const sub of subs) {
     const key = sub.nextRenewal;
     const bucket = map.get(key);

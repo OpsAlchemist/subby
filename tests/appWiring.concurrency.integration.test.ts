@@ -6,10 +6,10 @@ import { join } from "node:path";
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import type { Category } from "core/models/category";
-import type { Settings } from "core/models/settings";
-import type { Subscription, SubscriptionsFile } from "core/models/subscription";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionsFileV2, SubscriptionV2 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
-import { DEFAULT_SETTINGS } from "core/models/schema";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SubscriptionInput } from "shared/types";
 
 /**
@@ -53,16 +53,16 @@ function microtaskGap(): Promise<void> {
  * atomicity under the lock).
  */
 class InstrumentedStorage implements StoragePort {
-  subscriptions: Subscription[] = [];
-  settings: Settings = { ...DEFAULT_SETTINGS };
+  subscriptions: SubscriptionV2[] = [];
+  settings: SettingsV2 = { ...DEFAULT_SETTINGS_V2 };
   categories: Category[] = [];
-  backups: SubscriptionsFile[] = [];
+  backups: SubscriptionsFileV2[] = [];
   readonly log: string[] = [];
   private backupSeq = 0;
   /** When > 0, the next N `writeSubscriptions` calls reject (fault injection). */
   failNextSubsWrites = 0;
 
-  async readSubscriptions(): Promise<Subscription[]> {
+  async readSubscriptions(): Promise<SubscriptionV2[]> {
     this.log.push("read:subs:start");
     await microtaskGap();
     this.log.push("read:subs:end");
@@ -70,7 +70,7 @@ class InstrumentedStorage implements StoragePort {
     return this.subscriptions.map((s) => ({ ...s }));
   }
 
-  async writeSubscriptions(subs: Subscription[]): Promise<void> {
+  async writeSubscriptions(subs: SubscriptionV2[]): Promise<void> {
     this.log.push("write:subs:start");
     await microtaskGap();
     if (this.failNextSubsWrites > 0) {
@@ -82,14 +82,14 @@ class InstrumentedStorage implements StoragePort {
     this.log.push("write:subs:end");
   }
 
-  async readSettings(): Promise<Settings> {
+  async readSettings(): Promise<SettingsV2> {
     this.log.push("read:settings:start");
     await microtaskGap();
     this.log.push("read:settings:end");
     return { ...this.settings };
   }
 
-  async writeSettings(settings: Settings): Promise<void> {
+  async writeSettings(settings: SettingsV2): Promise<void> {
     this.log.push("write:settings:start");
     await microtaskGap();
     this.settings = { ...settings };
@@ -113,7 +113,7 @@ class InstrumentedStorage implements StoragePort {
   async createBackup(_reason: string): Promise<string> {
     this.log.push("backup:start");
     await microtaskGap();
-    this.backups.push({ version: 1, subscriptions: this.subscriptions.map((s) => ({ ...s })) });
+    this.backups.push({ version: 2, subscriptions: this.subscriptions.map((s) => ({ ...s })) });
     const name = `backup-${this.backupSeq++}.json`;
     this.log.push("backup:end");
     return name;
@@ -123,7 +123,7 @@ class InstrumentedStorage implements StoragePort {
     return this.backups.map((_b, i) => `backup-${i}.json`);
   }
 
-  async readBackup(name: string): Promise<SubscriptionsFile> {
+  async readBackup(name: string): Promise<SubscriptionsFileV2> {
     const match = /backup-(\d+)\.json/.exec(name);
     const idx = match ? Number(match[1]) : -1;
     const file = this.backups[idx];
@@ -145,7 +145,7 @@ function makeInput(overrides: Partial<SubscriptionInput> = {}): SubscriptionInpu
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMajor: "499",
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -155,19 +155,21 @@ function makeInput(overrides: Partial<SubscriptionInput> = {}): SubscriptionInpu
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     ...overrides,
   };
 }
 
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -177,7 +179,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -230,20 +234,20 @@ describe("per-file write serialization (AD-29): same-file concurrency loses noth
     expect(listed.find((s) => s.id === "a")!.name).toBe("A2");
   });
 
-  it("a burst of concurrent toggles all land (no lost write across the burst)", async () => {
+  it("a burst of concurrent setState calls all land (no lost write across the burst)", async () => {
     const storage = new InstrumentedStorage();
     storage.subscriptions = Array.from({ length: 5 }, (_v, i) =>
-      makeSubscription({ id: `s${i}`, name: `S${i}`, isActive: true }),
+      makeSubscription({ id: `s${i}`, name: `S${i}`, state: "Active" }),
     );
     const services = buildAppServices(storage);
 
-    // Toggle all five OFF concurrently. If writes clobbered, some would stay ON.
+    // Pause all five concurrently. If writes clobbered, some would stay Active.
     await Promise.all(
-      storage.subscriptions.map((s) => services.toggleActive(s.id, false)),
+      storage.subscriptions.map((s) => services.setState(s.id, "Paused")),
     );
 
     const listed = await services.listSubscriptions();
-    expect(listed.every((s) => s.isActive === false)).toBe(true);
+    expect(listed.every((s) => s.state === "Paused")).toBe(true);
     expect(listed).toHaveLength(5);
   });
 });

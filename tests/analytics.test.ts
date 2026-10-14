@@ -10,7 +10,8 @@ import {
   topByMonthly,
   renewalTimeline,
 } from "core/analytics";
-import type { Subscription } from "core/models/subscription";
+import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Unit tests for analytics aggregations and orderings
@@ -20,13 +21,13 @@ import type { Subscription } from "core/models/subscription";
 
 // --- Fixtures ----------------------------------------------------------------
 
-function sub(overrides: Partial<Subscription> = {}): Subscription {
+function sub(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: overrides.id ?? `sub-${Math.random()}`,
     name: "Service",
     provider: "Provider",
     category: "Entertainment",
-    amount: 100,
+    amountMinor: 100,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-01-01",
@@ -36,7 +37,9 @@ function sub(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#000000",
     icon: "box",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -49,9 +52,9 @@ function sub(overrides: Partial<Subscription> = {}): Subscription {
 describe("totalMonthly (Req 8.1, 11.1)", () => {
   it("sums normalized monthly amounts directly", () => {
     const active = [
-      sub({ amount: 100, billingCycle: "Monthly" }), // 100
-      sub({ amount: 1200, billingCycle: "Yearly" }), // 100
-      sub({ amount: 300, billingCycle: "Quarterly" }), // 100
+      sub({ amountMinor: 100, billingCycle: "Monthly" }), // 100
+      sub({ amountMinor: 1200, billingCycle: "Yearly" }), // 100
+      sub({ amountMinor: 300, billingCycle: "Quarterly" }), // 100
     ];
     expect(totalMonthly(active)).toBeCloseTo(300);
   });
@@ -64,16 +67,16 @@ describe("totalMonthly (Req 8.1, 11.1)", () => {
 describe("totalYearly (Req 8.2, 11.3)", () => {
   it("sums yearly amounts (monthly * 12)", () => {
     const active = [
-      sub({ amount: 100, billingCycle: "Monthly" }), // 1200/yr
-      sub({ amount: 1200, billingCycle: "Yearly" }), // 1200/yr
+      sub({ amountMinor: 100, billingCycle: "Monthly" }), // 1200/yr
+      sub({ amountMinor: 1200, billingCycle: "Yearly" }), // 1200/yr
     ];
     expect(totalYearly(active)).toBeCloseTo(2400);
   });
 
   it("equals totalMonthly * 12", () => {
     const active = [
-      sub({ amount: 50, billingCycle: "Monthly" }),
-      sub({ amount: 130, billingCycle: "Weekly" }),
+      sub({ amountMinor: 50, billingCycle: "Monthly" }),
+      sub({ amountMinor: 130, billingCycle: "Weekly" }),
     ];
     expect(totalYearly(active)).toBeCloseTo(totalMonthly(active) * 12);
   });
@@ -82,15 +85,34 @@ describe("totalYearly (Req 8.2, 11.3)", () => {
 describe("activeCount (Req 8.3)", () => {
   it("counts only active subscriptions within the full set", () => {
     const subs = [
-      sub({ isActive: true }),
-      sub({ isActive: false }),
-      sub({ isActive: true }),
+      sub({ state: "Active" }),
+      sub({ state: "Paused" }),
+      sub({ state: "Active" }),
     ];
     expect(activeCount(subs)).toBe(2);
   });
 
   it("is zero for an empty list", () => {
     expect(activeCount([])).toBe(0);
+  });
+
+  it("counts Active + Trial while spend sums Active-only; Paused excluded from both (AD-17)", () => {
+    // The I/O-matrix row: 2 Active + 1 Trial + 1 Paused.
+    const subs = [
+      sub({ id: "a1", state: "Active", amountMinor: 100, billingCycle: "Monthly" }),
+      sub({ id: "a2", state: "Active", amountMinor: 300, billingCycle: "Monthly" }),
+      sub({ id: "t", state: "Trial", amountMinor: 500, billingCycle: "Monthly" }),
+      sub({ id: "p", state: "Paused", amountMinor: 900, billingCycle: "Monthly" }),
+    ];
+
+    // Active count = Active + Trial (= 3); Paused excluded.
+    expect(activeCount(subs)).toBe(3);
+
+    // Current monthly spend sums the Active-only subset (Trial surfaced
+    // separately = $0 current spend; Paused excluded from both).
+    const spend = activeSpendSubscriptionsV2(subs);
+    expect(spend.map((s) => s.id)).toEqual(["a1", "a2"]);
+    expect(totalMonthly(spend)).toBeCloseTo(400); // 100 + 300, Trial/Paused excluded
   });
 });
 
@@ -165,9 +187,9 @@ describe("recentlyChanged (Req 8.5)", () => {
 describe("categoryDistribution (Req 11.2)", () => {
   it("groups monthly spend by category in first-appearance order", () => {
     const active = [
-      sub({ category: "AI", amount: 100, billingCycle: "Monthly" }),
-      sub({ category: "Music", amount: 1200, billingCycle: "Yearly" }), // 100
-      sub({ category: "AI", amount: 300, billingCycle: "Quarterly" }), // 100
+      sub({ category: "AI", amountMinor: 100, billingCycle: "Monthly" }),
+      sub({ category: "Music", amountMinor: 1200, billingCycle: "Yearly" }), // 100
+      sub({ category: "AI", amountMinor: 300, billingCycle: "Quarterly" }), // 100
     ];
     expect(categoryDistribution(active)).toEqual([
       { category: "AI", monthly: 200 },
@@ -177,9 +199,9 @@ describe("categoryDistribution (Req 11.2)", () => {
 
   it("conserves total spend across all groups", () => {
     const active = [
-      sub({ category: "AI", amount: 100, billingCycle: "Monthly" }),
-      sub({ category: "Music", amount: 50, billingCycle: "Monthly" }),
-      sub({ category: "Gaming", amount: 130, billingCycle: "Weekly" }),
+      sub({ category: "AI", amountMinor: 100, billingCycle: "Monthly" }),
+      sub({ category: "Music", amountMinor: 50, billingCycle: "Monthly" }),
+      sub({ category: "Gaming", amountMinor: 130, billingCycle: "Weekly" }),
     ];
     const sum = categoryDistribution(active).reduce((acc, e) => acc + e.monthly, 0);
     expect(sum).toBeCloseTo(totalMonthly(active));
@@ -195,17 +217,17 @@ describe("categoryDistribution (Req 11.2)", () => {
 describe("topByMonthly (Req 11.4)", () => {
   it("orders by normalized monthly amount descending", () => {
     const active = [
-      sub({ id: "cheap", amount: 1200, billingCycle: "Yearly" }), // 100
-      sub({ id: "mid", amount: 200, billingCycle: "Monthly" }), // 200
-      sub({ id: "dear", amount: 900, billingCycle: "Quarterly" }), // 300
+      sub({ id: "cheap", amountMinor: 1200, billingCycle: "Yearly" }), // 100
+      sub({ id: "mid", amountMinor: 200, billingCycle: "Monthly" }), // 200
+      sub({ id: "dear", amountMinor: 900, billingCycle: "Quarterly" }), // 300
     ];
     expect(topByMonthly(active, 2).map((s) => s.id)).toEqual(["dear", "mid"]);
   });
 
   it("preserves input order for ties (stable) and does not mutate input", () => {
     const active = [
-      sub({ id: "x", amount: 100, billingCycle: "Monthly" }),
-      sub({ id: "y", amount: 100, billingCycle: "Monthly" }),
+      sub({ id: "x", amountMinor: 100, billingCycle: "Monthly" }),
+      sub({ id: "y", amountMinor: 100, billingCycle: "Monthly" }),
     ];
     const snapshot = [...active];
     expect(topByMonthly(active, 5).map((s) => s.id)).toEqual(["x", "y"]);

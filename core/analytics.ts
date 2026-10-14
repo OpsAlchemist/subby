@@ -22,8 +22,8 @@
 
 import { monthlyAmount, sumMonthly, yearlyAmount } from "./billing";
 import type { ISODate } from "./renewal";
-import { activeSubscriptions } from "./subscriptions";
-import type { Subscription } from "./models/subscription";
+import { activeSubscriptionsV2 } from "./subscriptionsV2";
+import type { SubscriptionV2 } from "./models/subscription";
 
 /** Parses an `YYYY-MM-DD` string into its numeric year/month/day parts. */
 function parseISODate(date: ISODate): { year: number; month: number; day: number } {
@@ -56,7 +56,7 @@ function addDays(date: ISODate, days: number): ISODate {
  * Callers pass the already-active subscriptions; this reuses
  * {@link sumMonthly} from `core/billing`.
  */
-export function totalMonthly(active: Subscription[]): number {
+export function totalMonthly(active: SubscriptionV2[]): number {
   return sumMonthly(active);
 }
 
@@ -65,17 +65,18 @@ export function totalMonthly(active: Subscription[]): number {
  * subscriptions (each subscription's monthly amount multiplied by twelve)
  * (Req 8.2, 11.3). Callers pass the already-active subscriptions.
  */
-export function totalYearly(active: Subscription[]): number {
+export function totalYearly(active: SubscriptionV2[]): number {
   return active.reduce((acc, s) => acc + yearlyAmount(s), 0);
 }
 
 /**
- * Count the active subscriptions within `subs` (Req 8.3). Accepts the full set
- * and counts only those whose `isActive` is true, reusing the shared
- * {@link activeSubscriptions} predicate.
+ * Count the live subscriptions within `subs` (Req 8.3, AD-17). Accepts the full
+ * set and counts those whose state is Active **or** Trial — both are live, only
+ * the *spend* excludes Trial — reusing the shared {@link activeSubscriptionsV2}
+ * seam. Paused is excluded.
  */
-export function activeCount(subs: Subscription[]): number {
-  return activeSubscriptions(subs).length;
+export function activeCount(subs: SubscriptionV2[]): number {
+  return activeSubscriptionsV2(subs).length;
 }
 
 // --- Date-window and recency selections (Req 8.4, 8.5) -----------------------
@@ -91,10 +92,10 @@ export function activeCount(subs: Subscription[]): number {
  * because the upper bound is computed in UTC via {@link addDays}).
  */
 export function renewingWithin(
-  subs: Subscription[],
+  subs: SubscriptionV2[],
   days: number,
   today: ISODate,
-): Subscription[] {
+): SubscriptionV2[] {
   const upper = addDays(today, days);
   return subs.filter((s) => s.nextRenewal >= today && s.nextRenewal <= upper);
 }
@@ -109,7 +110,7 @@ export function renewingWithin(
  * `n` is clamped to be non-negative; when `n` is at least the input length the
  * result is a full sorted permutation of the input.
  */
-export function recentlyChanged(subs: Subscription[], n: number): Subscription[] {
+export function recentlyChanged(subs: SubscriptionV2[], n: number): SubscriptionV2[] {
   const sorted = [...subs].sort((a, b) =>
     a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0,
   );
@@ -130,7 +131,7 @@ export function recentlyChanged(subs: Subscription[], n: number): Subscription[]
  * already-active subscriptions.
  */
 export function categoryDistribution(
-  active: Subscription[],
+  active: SubscriptionV2[],
 ): { category: string; monthly: number }[] {
   const order: string[] = [];
   const totals = new Map<string, number>();
@@ -159,7 +160,7 @@ export function categoryDistribution(
  * amount. `n` is clamped to be non-negative; when `n` is at least the input
  * length the result is a full sorted permutation of the input.
  */
-export function topByMonthly(active: Subscription[], n: number): Subscription[] {
+export function topByMonthly(active: SubscriptionV2[], n: number): SubscriptionV2[] {
   const sorted = [...active].sort((a, b) => monthlyAmount(b) - monthlyAmount(a));
   return sorted.slice(0, Math.max(0, n));
 }
@@ -177,11 +178,11 @@ export function topByMonthly(active: Subscription[], n: number): Subscription[] 
  * mutated.
  */
 export function renewalTimeline(
-  subs: Subscription[],
+  subs: SubscriptionV2[],
   today: ISODate,
-): { date: ISODate; subs: Subscription[] }[] {
+): { date: ISODate; subs: SubscriptionV2[] }[] {
   const order: ISODate[] = [];
-  const groups = new Map<ISODate, Subscription[]>();
+  const groups = new Map<ISODate, SubscriptionV2[]>();
 
   for (const s of subs) {
     if (s.nextRenewal < today) continue; // upcoming only

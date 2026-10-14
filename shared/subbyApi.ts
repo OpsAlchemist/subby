@@ -14,9 +14,9 @@
  */
 
 import type { Category } from "core/models/category";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
-import type { SubscriptionPatch } from "core/subscriptions";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
+import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { ImportOutcome } from "core/import";
 import type {
   AppError,
@@ -58,14 +58,17 @@ export type Unsubscribe = () => void;
  */
 export interface SubbyApi {
   // --- Subscriptions (Req 3) ---
-  listSubscriptions(): Promise<IpcResult<Subscription[]>>;
-  createSubscription(input: SubscriptionInput): Promise<IpcResult<Subscription[]>>;
+  listSubscriptions(): Promise<IpcResult<SubscriptionV2[]>>;
+  createSubscription(input: SubscriptionInput): Promise<IpcResult<SubscriptionV2[]>>;
   updateSubscription(
     id: string,
-    patch: SubscriptionPatch,
-  ): Promise<IpcResult<Subscription[]>>;
-  deleteSubscription(id: string): Promise<IpcResult<Subscription[]>>;
-  toggleActive(id: string, value: boolean): Promise<IpcResult<Subscription[]>>;
+    patch: SubscriptionPatchV2,
+  ): Promise<IpcResult<SubscriptionV2[]>>;
+  deleteSubscription(id: string): Promise<IpcResult<SubscriptionV2[]>>;
+  setState(
+    id: string,
+    state: SubscriptionState,
+  ): Promise<IpcResult<SubscriptionV2[]>>;
 
   // --- Categories (Req 7) ---
   listCategories(): Promise<IpcResult<Category[]>>;
@@ -76,16 +79,16 @@ export interface SubbyApi {
   ): Promise<IpcResult<DeleteCategoryData>>;
 
   // --- Settings (Req 15) ---
-  getSettings(): Promise<IpcResult<Settings>>;
-  updateSettings(patch: Partial<Settings>): Promise<IpcResult<Settings>>;
+  getSettings(): Promise<IpcResult<SettingsV2>>;
+  updateSettings(patch: Partial<SettingsV2>): Promise<IpcResult<SettingsV2>>;
   /** Opens the native folder picker; `data` is `null` when the dialog is dismissed (Req 15.3). */
-  chooseDataFolder(): Promise<IpcResult<Settings | null>>;
+  chooseDataFolder(): Promise<IpcResult<SettingsV2 | null>>;
 
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;
   exportData(req: ExportRequest): Promise<IpcResult<ExportResult>>;
   listBackups(): Promise<IpcResult<string[]>>;
-  restoreBackup(name: string): Promise<IpcResult<Subscription[]>>;
+  restoreBackup(name: string): Promise<IpcResult<SubscriptionV2[]>>;
 
   // --- Events (main → renderer) ---
   /** Fires after any successful mutation so views can refresh (Req 8.6). Returns an unsubscribe. */

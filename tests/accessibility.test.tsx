@@ -24,9 +24,9 @@ import {
   errorStore,
 } from "@/stores";
 
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings as SettingsModel } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 as SettingsModel } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { AppError, IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -56,20 +56,20 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
 
 interface FakeApi extends SubbyApi {
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsModel;
   };
   dataChangedListeners: Array<() => void>;
 }
 
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -79,7 +79,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -95,13 +97,13 @@ function createFakeApi(): FakeApi {
   const fake: FakeApi = {
     state: {
       subscriptions: [
-        makeSubscription({ id: "sub-1", name: "Netflix", amount: 499 }),
+        makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900 }),
         makeSubscription({
           id: "sub-2",
           name: "Spotify",
           provider: "Spotify AB",
           category: "Music",
-          amount: 119,
+          amountMinor: 11900,
           billingCycle: "Yearly",
         }),
       ],
@@ -109,7 +111,7 @@ function createFakeApi(): FakeApi {
         makeCategory({ id: "cat-1", name: "Streaming" }),
         makeCategory({ id: "cat-2", name: "Music" }),
       ],
-      settings: { ...DEFAULT_SETTINGS },
+      settings: { ...DEFAULT_SETTINGS_V2 },
     },
     dataChangedListeners: [],
 
@@ -117,7 +119,7 @@ function createFakeApi(): FakeApi {
     createSubscription: () => ok(fake.state.subscriptions),
     updateSubscription: () => ok(fake.state.subscriptions),
     deleteSubscription: () => ok(fake.state.subscriptions),
-    toggleActive: () => ok(fake.state.subscriptions),
+    setState: () => ok(fake.state.subscriptions),
 
     listCategories: () => ok(fake.state.categories),
     createCategory: () =>

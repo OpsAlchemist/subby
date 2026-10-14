@@ -17,10 +17,11 @@ import {
   totalMonthly,
   totalYearly,
 } from "core/analytics";
-import { activeSubscriptions } from "core/subscriptions";
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
+import { exponentOf } from "core/money";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
 import type { AppError, IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
@@ -51,22 +52,22 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
 
 interface FakeApi extends SubbyApi {
   state: {
-    subscriptions: Subscription[];
+    subscriptions: SubscriptionV2[];
     categories: Category[];
-    settings: Settings;
+    settings: SettingsV2;
   };
   dataChangedListeners: Array<() => void>;
   errorListeners: Array<(error: AppError) => void>;
   emitDataChanged(): void;
 }
 
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     nextRenewal: "2025-02-01",
@@ -76,7 +77,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -88,12 +91,12 @@ function makeCategory(overrides: Partial<Category> = {}): Category {
   return { id: "cat-1", name: "Streaming", isDefault: true, ...overrides };
 }
 
-function createFakeApi(initial: Subscription[]): FakeApi {
+function createFakeApi(initial: SubscriptionV2[]): FakeApi {
   const fake: FakeApi = {
     state: {
       subscriptions: initial,
       categories: [makeCategory()],
-      settings: { ...DEFAULT_SETTINGS },
+      settings: { ...DEFAULT_SETTINGS_V2 },
     },
     dataChangedListeners: [],
     errorListeners: [],
@@ -107,7 +110,7 @@ function createFakeApi(initial: Subscription[]): FakeApi {
     createSubscription: () => ok(fake.state.subscriptions),
     updateSubscription: () => ok(fake.state.subscriptions),
     deleteSubscription: () => ok(fake.state.subscriptions),
-    toggleActive: () => ok(fake.state.subscriptions),
+    setState: () => ok(fake.state.subscriptions),
 
     // --- Categories ---
     listCategories: () => ok(fake.state.categories),
@@ -119,7 +122,7 @@ function createFakeApi(initial: Subscription[]): FakeApi {
     // --- Settings ---
     getSettings: () => ok(fake.state.settings),
     updateSettings: () => ok(fake.state.settings),
-    chooseDataFolder: () => ok<Settings | null>(fake.state.settings),
+    chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -146,13 +149,22 @@ function createFakeApi(initial: Subscription[]): FakeApi {
 
 // --- Expected-value helpers (real core/analytics math, no hardcoding) --------
 
-/** The currency formatter the Dashboard uses for the default currency (INR). */
+/** The currency formatter the Dashboard uses for the Home Currency (INR). */
 function formatCurrency(amount: number): string {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
-    currency: DEFAULT_SETTINGS.defaultCurrency,
+    currency: DEFAULT_SETTINGS_V2.homeCurrency,
     maximumFractionDigits: 2,
   }).format(amount);
+}
+
+/**
+ * Mirror the Dashboard's `minorToMajorNumber`: the analytics totals are now
+ * MINOR-unit sums, and the Dashboard renders them in Home-Currency major by
+ * dividing by 10^exponent (INR exponent 2 → divide by 100).
+ */
+function minorToMajor(minor: number): number {
+  return minor / 10 ** exponentOf(DEFAULT_SETTINGS_V2.homeCurrency);
 }
 
 /** Read the prominent value (`<p>`) of a metric card identified by its label. */
@@ -169,7 +181,7 @@ let teardown: () => void;
 
 beforeEach(() => {
   fake = createFakeApi([
-    makeSubscription({ id: "sub-1", name: "Netflix", amount: 499 }),
+    makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900 }),
   ]);
   setSubby(fake);
 });
@@ -193,7 +205,10 @@ describe("Dashboard reactivity (Req 8.6)", () => {
     teardown = initStores();
 
     // --- Initial metrics derived from the fake's initial subscriptions. ---
-    const initialActive = activeSubscriptions(fake.state.subscriptions);
+    // The analytics totals are MINOR-unit sums; the Dashboard renders them in
+    // Home-Currency major (divide by 10^exponent), so the expected display
+    // values are `formatCurrency(minorToMajor(minorTotal))`.
+    const initialActive = activeSpendSubscriptionsV2(fake.state.subscriptions);
     const expectedInitialCount = activeCount(fake.state.subscriptions);
     const expectedInitialMonthly = totalMonthly(initialActive);
     const expectedInitialYearly = totalYearly(initialActive);
@@ -205,21 +220,21 @@ describe("Dashboard reactivity (Req 8.6)", () => {
     });
     expect(expectedInitialCount).toBe(1);
     expect(metricCardValue("Total Monthly Spend")).toBe(
-      formatCurrency(expectedInitialMonthly),
+      formatCurrency(minorToMajor(expectedInitialMonthly)),
     );
     expect(metricCardValue("Total Yearly Spend")).toBe(
-      formatCurrency(expectedInitialYearly),
+      formatCurrency(minorToMajor(expectedInitialYearly)),
     );
 
     // --- Mutate the backing data: add a second active subscription, then ---
     // --- broadcast the change (simulating a main → renderer event).     ---
     fake.state.subscriptions = [
-      makeSubscription({ id: "sub-1", name: "Netflix", amount: 499 }),
-      makeSubscription({ id: "sub-2", name: "Spotify", amount: 200 }),
+      makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900 }),
+      makeSubscription({ id: "sub-2", name: "Spotify", amountMinor: 20000 }),
     ];
     fake.emitDataChanged();
 
-    const updatedActive = activeSubscriptions(fake.state.subscriptions);
+    const updatedActive = activeSpendSubscriptionsV2(fake.state.subscriptions);
     const expectedUpdatedCount = activeCount(fake.state.subscriptions);
     const expectedUpdatedMonthly = totalMonthly(updatedActive);
     const expectedUpdatedYearly = totalYearly(updatedActive);
@@ -235,10 +250,10 @@ describe("Dashboard reactivity (Req 8.6)", () => {
     // Monthly/yearly totals changed to reflect the new data (Req 8.1, 8.2, 8.6).
     expect(expectedUpdatedMonthly).toBeGreaterThan(expectedInitialMonthly);
     expect(metricCardValue("Total Monthly Spend")).toBe(
-      formatCurrency(expectedUpdatedMonthly),
+      formatCurrency(minorToMajor(expectedUpdatedMonthly)),
     );
     expect(metricCardValue("Total Yearly Spend")).toBe(
-      formatCurrency(expectedUpdatedYearly),
+      formatCurrency(minorToMajor(expectedUpdatedYearly)),
     );
   });
 });

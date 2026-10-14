@@ -28,22 +28,19 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronsUpDown,
+  Pause,
   Pencil,
   Power,
-  PowerOff,
   Search,
   Trash2,
 } from "lucide-react";
-import type { BillingCycle, Subscription } from "core/models/subscription";
+import type {
+  BillingCycle,
+  SubscriptionState,
+  SubscriptionV2,
+} from "core/models/subscription";
 import { fuzzySearch } from "core/search";
-import {
-  and,
-  byCategory,
-  byCycle,
-  byStatus,
-  filterByPredicate,
-  type SubscriptionPredicate,
-} from "core/subscriptions";
+import { minorUnits, toMajor } from "core/money";
 import { monthlyAmount } from "core/billing";
 import { subscriptionsApi, isSubbyError } from "@/api/subby";
 import { subscriptionsStore } from "@/stores/subscriptionsStore";
@@ -59,8 +56,8 @@ type SortColumn = "name" | "amount" | "nextRenewal" | "status";
 type SortDir = "asc" | "desc";
 /** The attribute the list is grouped by (Req 9.5). */
 type GroupBy = "none" | "category" | "status";
-/** Status filter selection (Req 9.4). */
-type StatusFilter = "all" | "active" | "inactive";
+/** State filter selection (Req 9.4) — the three-way v2 State plus "all". */
+type StatusFilter = "all" | SubscriptionState;
 /** The currently quick-edited cell (Req 9.7). */
 interface EditState {
   id: string;
@@ -92,17 +89,30 @@ const controlClass = cn(
 
 // --- Pure display + ordering helpers -----------------------------------------
 
-/** Format an amount in its subscription currency, falling back gracefully. */
-function formatCurrency(amount: number, currency: string): string {
+/**
+ * Format a subscription's native amount (integer minor units) in its own
+ * currency, falling back gracefully. The minor units are rendered to a major
+ * display string via the money seam, then formatted.
+ */
+function formatCurrency(amountMinor: number, currency: string): string {
+  const major = toMajor(amountMinor, currency);
+  const amount = Number(major);
   try {
     return new Intl.NumberFormat(undefined, {
       style: "currency",
       currency,
     }).format(amount);
   } catch {
-    return `${currency} ${amount.toFixed(2)}`;
+    return `${currency} ${major}`;
   }
 }
+
+/** Numeric order of the three states for a stable Status sort (Active→Trial→Paused). */
+const STATE_ORDER: Record<SubscriptionState, number> = {
+  Active: 0,
+  Trial: 1,
+  Paused: 2,
+};
 
 /** Format an ISO `YYYY-MM-DD` date into a short, human-readable form. */
 function formatDate(iso: string): string {
@@ -116,7 +126,7 @@ function formatDate(iso: string): string {
 }
 
 /** Comparator for a given sort column (ascending order). */
-function compareBy(a: Subscription, b: Subscription, column: SortColumn): number {
+function compareBy(a: SubscriptionV2, b: SubscriptionV2, column: SortColumn): number {
   switch (column) {
     case "name":
       return a.name.localeCompare(b.name);
@@ -129,8 +139,8 @@ function compareBy(a: Subscription, b: Subscription, column: SortColumn): number
           ? 1
           : 0;
     case "status":
-      // Active before inactive in ascending order.
-      return a.isActive === b.isActive ? 0 : a.isActive ? -1 : 1;
+      // Active → Trial → Paused in ascending order.
+      return STATE_ORDER[a.state] - STATE_ORDER[b.state];
   }
 }
 
@@ -140,10 +150,10 @@ function compareBy(a: Subscription, b: Subscription, column: SortColumn): number
  * The input array is never mutated.
  */
 function sortSubscriptions(
-  subs: Subscription[],
+  subs: SubscriptionV2[],
   column: SortColumn | null,
   dir: SortDir,
-): Subscription[] {
+): SubscriptionV2[] {
   if (!column) return subs;
   const sorted = [...subs].sort((a, b) => compareBy(a, b, column));
   return dir === "desc" ? sorted.reverse() : sorted;
@@ -153,7 +163,7 @@ function sortSubscriptions(
 interface RowGroup {
   key: string;
   label: string;
-  items: Subscription[];
+  items: SubscriptionV2[];
 }
 
 /**
@@ -161,18 +171,16 @@ interface RowGroup {
  * preserving the incoming row order within each group. With `groupBy === "none"`
  * a single unlabeled group containing every row is returned.
  */
-function groupSubscriptions(subs: Subscription[], groupBy: GroupBy): RowGroup[] {
+function groupSubscriptions(subs: SubscriptionV2[], groupBy: GroupBy): RowGroup[] {
   if (groupBy === "none") return [{ key: "all", label: "", items: subs }];
 
   const order: string[] = [];
-  const map = new Map<string, Subscription[]>();
+  const map = new Map<string, SubscriptionV2[]>();
   for (const s of subs) {
     const key =
       groupBy === "category"
         ? s.category || "Uncategorized"
-        : s.isActive
-          ? "Active"
-          : "Inactive";
+        : s.state; // group by the three-way State (Active / Paused / Trial)
     const bucket = map.get(key);
     if (bucket) {
       bucket.push(s);
@@ -216,11 +224,14 @@ export default function SubscriptionList(): JSX.Element {
   );
 
   const filtered = useMemo(() => {
-    const predicates: SubscriptionPredicate[] = [];
-    if (filterCategory !== "all") predicates.push(byCategory(filterCategory));
-    if (filterStatus !== "all") predicates.push(byStatus(filterStatus === "active"));
-    if (filterCycle !== "all") predicates.push(byCycle(filterCycle));
-    return filterByPredicate(searched, and(...predicates)); // Req 9.4
+    // Compose the active filters inline over the v2 shape (Req 9.4): Category by
+    // name, State by the three-way enum, Billing Cycle by value.
+    return searched.filter((s) => {
+      if (filterCategory !== "all" && s.category !== filterCategory) return false;
+      if (filterStatus !== "all" && s.state !== filterStatus) return false;
+      if (filterCycle !== "all" && s.billingCycle !== filterCycle) return false;
+      return true;
+    });
   }, [searched, filterCategory, filterStatus, filterCycle]);
 
   const sorted = useMemo(
@@ -281,13 +292,13 @@ export default function SubscriptionList(): JSX.Element {
     setSelectedIds(allVisibleSelected ? new Set() : new Set(visibleIds));
   }
 
-  /** Apply an active/inactive change to every selected subscription (Req 9.6). */
-  async function bulkSetActive(value: boolean): Promise<void> {
+  /** Apply a State change to every selected subscription via setState (Req 9.6, AD-17). */
+  async function bulkSetState(state: SubscriptionState): Promise<void> {
     const ids = [...selectedIds];
     setSelectedIds(new Set());
     for (const id of ids) {
       try {
-        await subscriptionsApi.toggleActive(id, value);
+        await subscriptionsApi.setState(id, state);
       } catch (err) {
         // Global error surface (Req 19.4) reports failures; log and continue.
         if (isSubbyError(err)) console.error(err.appError);
@@ -318,11 +329,16 @@ export default function SubscriptionList(): JSX.Element {
     }
   }
 
-  function startEdit(sub: Subscription, field: EditState["field"]): void {
+  function startEdit(sub: SubscriptionV2, field: EditState["field"]): void {
     setEdit({
       id: sub.id,
       field,
-      value: field === "amount" ? String(sub.amount) : sub.nextRenewal,
+      // Amount is edited as a MAJOR-unit string (rendered from the stored minor
+      // units); next renewal is the raw ISO date.
+      value:
+        field === "amount"
+          ? toMajor(sub.amountMinor, sub.currency)
+          : sub.nextRenewal,
     });
   }
 
@@ -330,12 +346,21 @@ export default function SubscriptionList(): JSX.Element {
   async function commitEdit(): Promise<void> {
     if (!edit) return;
     const current = edit;
+    const sub = subscriptions.find((s) => s.id === current.id);
     setEdit(null);
 
-    let patch: { amount: number } | { nextRenewal: string } | null = null;
+    let patch: { amountMinor: number } | { nextRenewal: string } | null = null;
     if (current.field === "amount") {
-      const amount = Number(current.value);
-      if (Number.isFinite(amount) && amount >= 0) patch = { amount };
+      // Parse the entered MAJOR amount into integer minor units in the sub's
+      // own currency through the money seam. Invalid/over-precise input throws,
+      // which we treat as a discarded edit (Story 3.5 adds the inline error).
+      if (sub) {
+        try {
+          patch = { amountMinor: minorUnits(current.value, sub.currency) };
+        } catch {
+          patch = null;
+        }
+      }
     } else if (/^\d{4}-\d{2}-\d{2}$/.test(current.value)) {
       patch = { nextRenewal: current.value };
     }
@@ -419,7 +444,7 @@ export default function SubscriptionList(): JSX.Element {
 
         <div className="flex flex-col gap-1">
           <label htmlFor="filter-status" className="text-xs text-muted-foreground">
-            Status
+            State
           </label>
           <select
             id="filter-status"
@@ -427,9 +452,10 @@ export default function SubscriptionList(): JSX.Element {
             onChange={(e) => setFilterStatus(e.target.value as StatusFilter)}
             className={controlClass}
           >
-            <option value="all">All</option>
-            <option value="active">Active</option>
-            <option value="inactive">Inactive</option>
+            <option value="all">All states</option>
+            <option value="Active">Active</option>
+            <option value="Trial">Trial</option>
+            <option value="Paused">Paused</option>
           </select>
         </div>
 
@@ -482,25 +508,25 @@ export default function SubscriptionList(): JSX.Element {
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <button
               type="button"
-              onClick={() => void bulkSetActive(true)}
+              onClick={() => void bulkSetState("Active")}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-md border border-input px-2.5 py-1.5 text-sm hover:bg-secondary/60",
                 focusRing,
               )}
             >
               <Power className="h-4 w-4" aria-hidden="true" />
-              Activate
+              Set Active
             </button>
             <button
               type="button"
-              onClick={() => void bulkSetActive(false)}
+              onClick={() => void bulkSetState("Paused")}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-md border border-input px-2.5 py-1.5 text-sm hover:bg-secondary/60",
                 focusRing,
               )}
             >
-              <PowerOff className="h-4 w-4" aria-hidden="true" />
-              Deactivate
+              <Pause className="h-4 w-4" aria-hidden="true" />
+              Set Paused
             </button>
             <button
               type="button"
@@ -644,7 +670,7 @@ export default function SubscriptionList(): JSX.Element {
                           label={`Edit amount for ${sub.name}`}
                           onClick={() => startEdit(sub, "amount")}
                         >
-                          {formatCurrency(sub.amount, sub.currency)}
+                          {formatCurrency(sub.amountMinor, sub.currency)}
                         </QuickEditButton>
                       )}
                     </td>
@@ -677,7 +703,7 @@ export default function SubscriptionList(): JSX.Element {
                       {sub.billingCycle}
                     </td>
                     <td className="px-3 py-2">
-                      <StatusBadge active={sub.isActive} />
+                      <StatusBadge state={sub.state} />
                     </td>
                   </tr>
                 ))}
@@ -726,7 +752,7 @@ export default function SubscriptionList(): JSX.Element {
                             </p>
                           )}
                         </div>
-                        <StatusBadge active={sub.isActive} />
+                        <StatusBadge state={sub.state} />
                       </div>
                       <dl className="mt-2 grid grid-cols-2 gap-2 text-sm">
                         <div>
@@ -764,7 +790,7 @@ export default function SubscriptionList(): JSX.Element {
                                 label={`Edit amount for ${sub.name}`}
                                 onClick={() => startEdit(sub, "amount")}
                               >
-                                {formatCurrency(sub.amount, sub.currency)}
+                                {formatCurrency(sub.amountMinor, sub.currency)}
                               </QuickEditButton>
                             )}
                           </dd>
@@ -891,18 +917,42 @@ function QuickEditButton({
   );
 }
 
-/** A small active/inactive status badge. */
-function StatusBadge({ active }: { active: boolean }): JSX.Element {
+/**
+ * The three-state State badge (Active / Paused / Trial). State is conveyed by a
+ * visible TEXT label (never color alone, per the DESIGN state-badge rule) plus a
+ * decorative leading dot that is `aria-hidden`:
+ *   - Trial  = accent-tint fill + accent text + accent dot ("live but not yet charged").
+ *   - Paused = muted fill + muted text (recedes).
+ *   - Active = muted fill + foreground text + a neutral dot.
+ */
+function StatusBadge({ state }: { state: SubscriptionState }): JSX.Element {
+  const styles: Record<SubscriptionState, { badge: string; dot: string }> = {
+    Active: {
+      badge: "bg-muted text-foreground",
+      dot: "bg-foreground/60",
+    },
+    Trial: {
+      badge: "bg-accent/15 text-accent",
+      dot: "bg-accent",
+    },
+    Paused: {
+      badge: "bg-muted text-muted-foreground",
+      dot: "bg-muted-foreground",
+    },
+  };
+  const { badge, dot } = styles[state];
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium",
-        active
-          ? "bg-accent/15 text-foreground"
-          : "bg-muted text-muted-foreground",
+        "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium",
+        badge,
       )}
     >
-      {active ? "Active" : "Inactive"}
+      <span
+        aria-hidden="true"
+        className={cn("inline-block h-1.5 w-1.5 rounded-full", dot)}
+      />
+      {state}
     </span>
   );
 }

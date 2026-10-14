@@ -29,8 +29,8 @@ const api: SubbyApi = {
   updateSubscription: (id, patch) =>
     ipcRenderer.invoke(CH.subs.update, { id, patch }),
   deleteSubscription: (id) => ipcRenderer.invoke(CH.subs.remove, id),
-  toggleActive: (id, value) =>
-    ipcRenderer.invoke(CH.subs.toggleActive, { id, value }),
+  setState: (id, state) =>
+    ipcRenderer.invoke(CH.subs.setState, { id, state }),
 
   // --- Categories (Req 7) ---
   listCategories: () => ipcRenderer.invoke(CH.categories.list),

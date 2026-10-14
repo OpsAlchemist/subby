@@ -3,8 +3,8 @@ import fc from "fast-check";
 
 import { exportJson, exportCsv } from "core/export";
 import { planImport } from "core/import";
-import { DEFAULT_SETTINGS } from "core/models/schema";
-import type { Subscription } from "core/models/subscription";
+import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import type { SubscriptionV2 } from "core/models/subscription";
 import type { ConflictMode } from "shared/types";
 
 /**
@@ -68,27 +68,26 @@ const customIntervalArb = fc.record({
 });
 
 /**
- * A non-negative, finite amount. `+ 0` normalizes a possible `-0` to `0` so the
- * CSV `String(-0)` → `Number("0")` round-trip compares cleanly.
+ * A non-negative INTEGER amount in minor units (AD-10). The v2 schema requires
+ * `amountMinor` to be a non-negative integer, so floats are invalid here.
  */
-const amountArb = fc
-  .double({ min: 0, max: 1_000_000_000, noNaN: true, noDefaultInfinity: true })
-  .map((x) => x + 0);
+const amountMinorArb = fc.integer({ min: 0, max: 1_000_000_000 });
 
 /**
- * A single schema-valid {@link Subscription}. Includes a `customInterval` only
+ * A single schema-valid {@link SubscriptionV2}. Includes a `customInterval` only
  * when the billing cycle is `Custom` (mirrors the schema's requirement). String
  * fields use the full unicode space to exercise CSV escaping (commas, quotes,
- * CR/LF).
+ * CR/LF). Only `Active`/`Paused` states are generated and `trial` is omitted so
+ * the "trial required iff state === 'Trial'" invariant holds trivially.
  */
-const subscriptionArb: fc.Arbitrary<Subscription> = fc
+const subscriptionArb: fc.Arbitrary<SubscriptionV2> = fc
   .record({
     id: fc.string({ minLength: 1 }),
     name: fc.string({ minLength: 1 }),
     provider: fc.string(),
     category: fc.string(),
-    amount: amountArb,
-    currency: fc.string(),
+    amountMinor: amountMinorArb,
+    currency: fc.string({ minLength: 1 }),
     billingCycle: cycleArb,
     customInterval: customIntervalArb,
     nextRenewal: isoDateArb,
@@ -98,14 +97,16 @@ const subscriptionArb: fc.Arbitrary<Subscription> = fc
     notes: fc.string(),
     color: fc.string(),
     icon: fc.string(),
-    isActive: fc.boolean(),
+    state: fc.constantFrom<"Active" | "Paused">("Active", "Paused"),
+    priceHistory: fc.constant([]),
+    tags: fc.array(fc.string(), { maxLength: 3 }),
     autoRenew: fc.boolean(),
     createdAt: isoDateTimeArb,
     updatedAt: isoDateTimeArb,
   })
   .map((raw) => {
     const { customInterval, ...rest } = raw;
-    const sub = { ...rest } as Subscription;
+    const sub = { ...rest } as SubscriptionV2;
     if (rest.billingCycle === "Custom") {
       sub.customInterval = customInterval;
     }
@@ -117,7 +118,7 @@ const subscriptionArb: fc.Arbitrary<Subscription> = fc
  * globally unique. Import dedupes by `id`, then by `name + provider` (Req 16.3),
  * so a faithful round-trip requires uniqueness on BOTH keys.
  */
-function stamp(sub: Subscription, tag: string): Subscription {
+function stamp(sub: SubscriptionV2, tag: string): SubscriptionV2 {
   return {
     ...sub,
     id: `${sub.id}-id-${tag}`,
@@ -127,13 +128,16 @@ function stamp(sub: Subscription, tag: string): Subscription {
 }
 
 /** An array of subscriptions made unique on both id and name+provider. */
-const uniqueSubsArb: fc.Arbitrary<Subscription[]> = fc
+const uniqueSubsArb: fc.Arbitrary<SubscriptionV2[]> = fc
   .array(subscriptionArb, { maxLength: 12 })
   .map((subs) => subs.map((s, i) => stamp(s, String(i))));
 
 /** Compare two subscription sets ignoring order (sort by unique id). */
-function expectSameSet(actual: Subscription[], expected: Subscription[]): void {
-  const byId = (a: Subscription, b: Subscription) =>
+function expectSameSet(
+  actual: SubscriptionV2[],
+  expected: SubscriptionV2[],
+): void {
+  const byId = (a: SubscriptionV2, b: SubscriptionV2) =>
     a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
   expect([...actual].sort(byId)).toEqual([...expected].sort(byId));
 }
@@ -144,7 +148,7 @@ describe("Feature: subby, Property 19: Export then import reproduces the subscri
   it("Feature: subby, Property 19: JSON export feeds back into import unchanged (Req 17.3)", () => {
     fc.assert(
       fc.property(uniqueSubsArb, modeArb, (subs, mode) => {
-        const raw = exportJson(subs, DEFAULT_SETTINGS);
+        const raw = exportJson(subs, DEFAULT_SETTINGS_V2);
         const outcome = planImport([], raw, "json", mode);
 
         expect(outcome.rejected).toEqual([]);
@@ -173,10 +177,10 @@ describe("Feature: subby, Property 19: Export then import reproduces the subscri
 // --- Property 20 -------------------------------------------------------------
 
 type IncomingItem =
-  | { kind: "valid"; base: Subscription }
+  | { kind: "valid"; base: SubscriptionV2 }
   | {
       kind: "invalid";
-      base: Subscription;
+      base: SubscriptionV2;
       flavor: "emptyName" | "negAmount" | "badCycle" | "notObject" | "missingId";
     };
 
@@ -192,12 +196,13 @@ const incomingItemArb: fc.Arbitrary<IncomingItem> = fc.oneof(
 );
 
 /** Corrupt a valid subscription so it fails schema validation (Req 16.2). */
-function corrupt(base: Subscription, flavor: string): unknown {
+function corrupt(base: SubscriptionV2, flavor: string): unknown {
   switch (flavor) {
     case "emptyName":
       return { ...base, name: "" };
     case "negAmount":
-      return { ...base, amount: -1 };
+      // A negative `amountMinor` violates the non-negative integer constraint.
+      return { ...base, amountMinor: -1 };
     case "badCycle":
       return { ...base, billingCycle: "NotACycle" };
     case "missingId": {
@@ -226,7 +231,7 @@ describe("Feature: subby, Property 20: Import validates per record and preserves
           // indices are malformed and which valid records we expect applied.
           const entries: unknown[] = [];
           const invalidRows: number[] = [];
-          const validIncoming: Subscription[] = [];
+          const validIncoming: SubscriptionV2[] = [];
 
           incoming.forEach((item, i) => {
             if (item.kind === "valid") {
@@ -239,7 +244,7 @@ describe("Feature: subby, Property 20: Import validates per record and preserves
             }
           });
 
-          const raw = JSON.stringify({ version: 1, subscriptions: entries });
+          const raw = JSON.stringify({ version: 2, subscriptions: entries });
           const outcome = planImport(existing, raw, "json", mode);
 
           // Exactly the malformed rows are rejected, by their incoming index.
@@ -268,10 +273,13 @@ describe("Feature: subby, Property 20: Import validates per record and preserves
 
 // --- Property 21 -------------------------------------------------------------
 
-/** Clearable string fields that the schema permits to be empty. */
+/**
+ * Clearable string fields that the schema permits to be empty. `currency` is
+ * NOT clearable under v2 (the schema requires a non-empty currency), so it is
+ * excluded from this set.
+ */
 const CLEARABLE = [
   "category",
-  "currency",
   "paymentMethod",
   "website",
   "notes",
@@ -284,8 +292,8 @@ function isEmpty(v: unknown): boolean {
 }
 
 interface DupCase {
-  existing: Subscription;
-  incoming: Subscription;
+  existing: SubscriptionV2;
+  incoming: SubscriptionV2;
 }
 
 /**
@@ -297,9 +305,9 @@ interface DupCase {
  */
 const dupCaseArb: fc.Arbitrary<DupCase> = fc
   .record({
-    clearMask: fc.array(fc.boolean(), { minLength: 7, maxLength: 7 }),
+    clearMask: fc.array(fc.boolean(), { minLength: 6, maxLength: 6 }),
     dupKind: fc.constantFrom("id", "nameProvider"),
-    eAmount: amountArb,
+    eAmount: fc.integer({ min: 0, max: 1_000_000_000 }),
     eActive: fc.boolean(),
     eAutoRenew: fc.boolean(),
   })
@@ -309,12 +317,12 @@ const dupCaseArb: fc.Arbitrary<DupCase> = fc
     const ID_E = "id-existing";
     const ID_I = "id-incoming";
 
-    const existing: Subscription = {
+    const existing: SubscriptionV2 = {
       id: ID_E,
       name: NAME,
       provider: PROVIDER,
       category: "cat#ex",
-      amount: eAmount,
+      amountMinor: eAmount,
       currency: "cur#ex",
       billingCycle: "Monthly",
       nextRenewal: "2030-01-01",
@@ -324,7 +332,9 @@ const dupCaseArb: fc.Arbitrary<DupCase> = fc
       notes: "notes#ex",
       color: "#111111",
       icon: "icon#ex",
-      isActive: eActive,
+      state: eActive ? "Active" : "Paused",
+      priceHistory: [],
+      tags: [],
       autoRenew: eAutoRenew,
       createdAt: "2025-01-01T00:00:00.000Z",
       updatedAt: "2025-01-02T00:00:00.000Z",
@@ -333,12 +343,12 @@ const dupCaseArb: fc.Arbitrary<DupCase> = fc
       if (clearMask[i]) existing[field] = "";
     });
 
-    const incoming: Subscription = {
+    const incoming: SubscriptionV2 = {
       id: dupKind === "id" ? ID_E : ID_I,
       name: NAME,
       provider: PROVIDER,
       category: "cat#in",
-      amount: eAmount + 1, // distinct from existing so preservation is visible
+      amountMinor: eAmount + 1, // distinct from existing so preservation is visible
       currency: "cur#in",
       billingCycle: "Monthly",
       nextRenewal: "2031-06-06",
@@ -348,7 +358,9 @@ const dupCaseArb: fc.Arbitrary<DupCase> = fc
       notes: "notes#in",
       color: "#222222",
       icon: "icon#in",
-      isActive: !eActive,
+      state: !eActive ? "Active" : "Paused",
+      priceHistory: [],
+      tags: [],
       autoRenew: !eAutoRenew,
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-02T00:00:00.000Z",
@@ -357,8 +369,8 @@ const dupCaseArb: fc.Arbitrary<DupCase> = fc
     return { existing, incoming };
   });
 
-function rawFor(sub: Subscription): string {
-  return JSON.stringify({ version: 1, subscriptions: [sub] });
+function rawFor(sub: SubscriptionV2): string {
+  return JSON.stringify({ version: 2, subscriptions: [sub] });
 }
 
 describe("Feature: subby, Property 21: Conflict modes resolve duplicates correctly", () => {

@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { app, BrowserWindow, ipcMain, session } from "electron";
 
-import type { Settings } from "core/models/settings";
+import type { SettingsV2 } from "core/models/settings";
 import type { AppError, IpcResult } from "shared/types";
 
 import {
@@ -165,7 +165,7 @@ function registerDialogChannels(context: AppContext): void {
   ipcMain.removeHandler(CH.settings.chooseDataFolder);
   ipcMain.handle(
     CH.settings.chooseDataFolder,
-    async (): Promise<IpcResult<Settings | null>> => {
+    async (): Promise<IpcResult<SettingsV2 | null>> => {
       const win = getWindow();
       if (win === null || win.isDestroyed()) {
         return { ok: true, data: null };

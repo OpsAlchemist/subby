@@ -3,11 +3,15 @@
  *
  * Platform-independent. MUST NOT import from `electron`, `react`, or Node's `fs`.
  *
- * All monetary amounts are treated as a single currency (INR) for this build;
- * totals are summed directly with no currency conversion (Req 6.1).
+ * Amounts are integer **minor units** in a subscription's own (Native) currency
+ * (AD-10). For a single-currency portfolio these are summed directly with no
+ * conversion — honest for Story 3.3, which has no FX-snapshot host in the UI
+ * yet; the full convert-before-sum Home total is Epic 6 (`core/money.homeTotal`).
+ * The normalized monthly/yearly figures are kept as `number` (minor units,
+ * possibly fractional after a sub-monthly division) and rounded only at display.
  */
 
-import type { CustomInterval, Subscription } from "./models/subscription";
+import type { CustomInterval, SubscriptionV2 } from "./models/subscription";
 
 /**
  * Average number of days in a month used to convert sub-month and
@@ -50,49 +54,49 @@ export function monthsInCustomInterval(interval: CustomInterval): number {
 }
 
 /**
- * Compute the normalized monthly amount of a subscription from its amount
- * and billing cycle (Req 5.1, 5.2).
+ * Compute the normalized monthly amount (in minor units) of a subscription from
+ * its `amountMinor` and billing cycle (Req 5.1, 5.2).
  *
- *   - Monthly     -> amount
- *   - Yearly      -> amount / 12
- *   - Half-Yearly -> amount / 6
- *   - Quarterly   -> amount / 3
- *   - Weekly      -> amount * 52 / 12
- *   - Custom      -> amount / monthsInCustomInterval(customInterval)
+ *   - Monthly     -> amountMinor
+ *   - Yearly      -> amountMinor / 12
+ *   - Half-Yearly -> amountMinor / 6
+ *   - Quarterly   -> amountMinor / 3
+ *   - Weekly      -> amountMinor * 52 / 12
+ *   - Custom      -> amountMinor / monthsInCustomInterval(customInterval)
  */
 export function monthlyAmount(
-  s: Pick<Subscription, "amount" | "billingCycle" | "customInterval">,
+  s: Pick<SubscriptionV2, "amountMinor" | "billingCycle" | "customInterval">,
 ): number {
   switch (s.billingCycle) {
     case "Monthly":
-      return s.amount;
+      return s.amountMinor;
     case "Yearly":
-      return s.amount / 12;
+      return s.amountMinor / 12;
     case "Half-Yearly":
-      return s.amount / 6;
+      return s.amountMinor / 6;
     case "Quarterly":
-      return s.amount / 3;
+      return s.amountMinor / 3;
     case "Weekly":
-      return (s.amount * 52) / 12;
+      return (s.amountMinor * 52) / 12;
     case "Custom":
-      return s.amount / monthsInCustomInterval(s.customInterval!);
+      return s.amountMinor / monthsInCustomInterval(s.customInterval!);
   }
 }
 
 /**
- * Compute the normalized yearly amount of a subscription as the monthly
- * amount multiplied by twelve (Req 5.5).
+ * Compute the normalized yearly amount (in minor units) of a subscription as the
+ * monthly amount multiplied by twelve (Req 5.5).
  */
 export function yearlyAmount(
-  s: Pick<Subscription, "amount" | "billingCycle" | "customInterval">,
+  s: Pick<SubscriptionV2, "amountMinor" | "billingCycle" | "customInterval">,
 ): number {
   return monthlyAmount(s) * 12;
 }
 
 /**
- * Sum the normalized monthly amounts of the given subscriptions directly,
- * with no currency conversion (Req 6.1).
+ * Sum the normalized monthly amounts (minor units) of the given subscriptions
+ * directly, with no currency conversion (Req 6.1).
  */
-export function sumMonthly(subs: Subscription[]): number {
+export function sumMonthly(subs: SubscriptionV2[]): number {
   return subs.reduce((acc, s) => acc + monthlyAmount(s), 0);
 }

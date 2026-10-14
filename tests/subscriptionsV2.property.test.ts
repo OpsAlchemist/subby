@@ -4,6 +4,9 @@ import fc from "fast-check";
 import {
   createSubscriptionV2,
   setNativeCurrency,
+  editSubscriptionV2,
+  setSubscriptionState,
+  deleteSubscriptionV2,
   type SubscriptionInputV2,
 } from "core/subscriptionsV2";
 import {
@@ -16,7 +19,7 @@ import {
 } from "core/money";
 import { roundHalfUpToExponent } from "core/migrations/v1_to_v2";
 import { subscriptionV2Schema } from "core/models/schema";
-import type { SubscriptionV2 } from "core/models/subscription";
+import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Native-Currency-per-subscription properties (FR-10, Story 2.1).
@@ -375,5 +378,178 @@ describe("subscriptionsV2 I/O matrix (example tests)", () => {
     expect(gbpSub.amountMinor).toBe(750);
     // Display is in the sub's OWN Native Currency — independent of homeCurrency.
     expect(toMajor(gbpSub.amountMinor, gbpSub.currency)).toBe("7.50");
+  });
+});
+
+// --- Property 40: the live v2 mutators (Story 3.3) ---------------------------
+
+/**
+ * Property 40 — the three live v2 mutators Story 3.3 wires into the IPC spine
+ * each honor the pure, surgical contract they mirror from `core/subscriptions.ts`:
+ *
+ *   - {@link setSubscriptionState} changes ONLY the target sub's `state` and
+ *     advances ONLY its `updatedAt` — every other sub (and every other field of
+ *     the target) is untouched; the input array is never mutated.
+ *   - {@link editSubscriptionV2} applies a patch to the target, PRESERVES its
+ *     `id`/`createdAt`, advances its `updatedAt`, and leaves non-target subs and
+ *     the input array untouched.
+ *   - {@link deleteSubscriptionV2} removes EXACTLY one sub (the target), keeps the
+ *     others in their original relative order, and never mutates the input.
+ *
+ * Each result stays schema-valid v2 (`subscriptionV2Schema`).
+ */
+
+const LATER = "2026-12-25T12:00:00.000Z"; // strictly after each sub's createdAt
+const stateArb = fc.constantFrom<SubscriptionState>("Active", "Paused");
+
+/**
+ * A small list of distinct, schema-valid v2 subs plus an index into it (the
+ * mutation target). Each sub has a unique id (`s0`, `s1`, …) and a known earlier
+ * `createdAt`/`updatedAt` so an advance is observable.
+ */
+const listAndTargetArb = fc
+  .array(
+    fc.record({
+      currency: knownCurrencyArb,
+      amountMinor: fc.integer({ min: 0, max: 1_000_000 }),
+      state: stateArb,
+    }),
+    { minLength: 1, maxLength: 6 },
+  )
+  .chain((specs) =>
+    fc.record({
+      specs: fc.constant(specs),
+      targetIndex: fc.integer({ min: 0, max: specs.length - 1 }),
+    }),
+  )
+  .map(({ specs, targetIndex }) => {
+    const subs: SubscriptionV2[] = specs.map((spec, i) => ({
+      ...EXAMPLE_FIELDS,
+      id: `s${i}`,
+      amountMinor: spec.amountMinor,
+      currency: spec.currency,
+      state: spec.state,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    }));
+    return { subs, targetIndex };
+  });
+
+describe("Feature: subby, Property 40: the live v2 mutators are pure and surgical", () => {
+  it("Feature: subby, Property 40: setSubscriptionState touches only the target's state + updatedAt; input never mutated; result schema-valid", () => {
+    fc.assert(
+      fc.property(listAndTargetArb, stateArb, ({ subs, targetIndex }, nextState) => {
+        const target = subs[targetIndex];
+        const snapshot = subs.map((s) => ({ ...s }));
+
+        const result = setSubscriptionState(subs, target.id, nextState, LATER);
+
+        // Input array + each element are untouched (pure).
+        expect(subs).toEqual(snapshot);
+
+        result.forEach((r, i) => {
+          const original = subs[i];
+          if (i === targetIndex) {
+            expect(r.state).toBe(nextState);
+            expect(r.updatedAt).toBe(LATER);
+            // Every OTHER field of the target is identical.
+            expect({ ...r, state: original.state, updatedAt: original.updatedAt }).toEqual(
+              original,
+            );
+          } else {
+            // Non-target subs are referentially unchanged (map returns `s`).
+            expect(r).toBe(original);
+          }
+        });
+
+        expect(subscriptionV2Schema.safeParse(result[targetIndex]).success).toBe(true);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("Feature: subby, Property 40: editSubscriptionV2 preserves id/createdAt, advances updatedAt, applies the patch, leaves others untouched", () => {
+    const patchArb = fc.record({
+      name: fc.string({ minLength: 1 }),
+      amountMinor: fc.integer({ min: 0, max: 1_000_000 }),
+      notes: fc.string(),
+    });
+
+    fc.assert(
+      fc.property(listAndTargetArb, patchArb, ({ subs, targetIndex }, patch) => {
+        const target = subs[targetIndex];
+        const snapshot = subs.map((s) => ({ ...s }));
+
+        const result = editSubscriptionV2(subs, target.id, patch, LATER);
+
+        // Input untouched.
+        expect(subs).toEqual(snapshot);
+
+        const edited = result[targetIndex];
+        // Immutable identity preserved.
+        expect(edited.id).toBe(target.id);
+        expect(edited.createdAt).toBe(target.createdAt);
+        // updatedAt advanced to `now`.
+        expect(edited.updatedAt).toBe(LATER);
+        // The patch landed.
+        expect(edited.name).toBe(patch.name);
+        expect(edited.amountMinor).toBe(patch.amountMinor);
+        expect(edited.notes).toBe(patch.notes);
+
+        // Non-target subs are referentially unchanged.
+        result.forEach((r, i) => {
+          if (i !== targetIndex) expect(r).toBe(subs[i]);
+        });
+
+        expect(subscriptionV2Schema.safeParse(edited).success).toBe(true);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("Feature: subby, Property 40: deleteSubscriptionV2 removes exactly the target, preserves order of the rest, never mutates input", () => {
+    fc.assert(
+      fc.property(listAndTargetArb, ({ subs, targetIndex }) => {
+        const target = subs[targetIndex];
+        const snapshot = subs.map((s) => ({ ...s }));
+
+        const result = deleteSubscriptionV2(subs, target.id);
+
+        // Input untouched.
+        expect(subs).toEqual(snapshot);
+
+        // Exactly one removed — the target.
+        expect(result).toHaveLength(subs.length - 1);
+        expect(result.some((s) => s.id === target.id)).toBe(false);
+
+        // The surviving subs keep their original relative order (and identity).
+        const expectedSurvivors = subs.filter((_s, i) => i !== targetIndex);
+        expect(result).toEqual(expectedSurvivors);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("Feature: subby, Property 40: unknown id is a no-op — setState/edit return same contents; delete removes nothing", () => {
+    const subs: SubscriptionV2[] = [
+      {
+        ...EXAMPLE_FIELDS,
+        id: "s0",
+        amountMinor: 100,
+        currency: "USD",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+
+    const afterState = setSubscriptionState(subs, "no-such-id", "Paused", LATER);
+    expect(afterState).toEqual(subs); // contents identical (fresh array)
+
+    const afterEdit = editSubscriptionV2(subs, "no-such-id", { name: "Nope" }, LATER);
+    expect(afterEdit).toEqual(subs);
+
+    const afterDelete = deleteSubscriptionV2(subs, "no-such-id");
+    expect(afterDelete).toEqual(subs);
+    expect(afterDelete).toHaveLength(1);
   });
 });

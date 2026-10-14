@@ -20,14 +20,19 @@
  *
  * Every currency decision routes through `core/money.ts` (the single money
  * seam): an unknown currency throws {@link UnknownCurrencyError} — never a
- * silent exponent-2 default. The v1-typed `core/subscriptions.ts` and the
- * running v1 app path are deliberately untouched; the renderer/IPC cutover is
- * Epic 3.
+ * silent exponent-2 default. As of Story 3.3 this module IS the live write path:
+ * `SubscriptionV2` flows through the StoragePort, `appWiring`, and the IPC spine
+ * to the renderer, and these mutators back the `subs:*` handlers. The v1-typed
+ * `core/subscriptions.ts` is retained only as the mirror reference for these
+ * mutators and no longer has any live caller.
  */
 
 import { exponentOf, minorUnits, toMajor } from "core/money";
 import { roundHalfUpToExponent } from "core/migrations/v1_to_v2";
-import type { SubscriptionV2 } from "core/models/subscription";
+import type {
+  SubscriptionState,
+  SubscriptionV2,
+} from "core/models/subscription";
 
 /**
  * Fields a caller supplies when creating a v2 subscription. The user enters a
@@ -156,4 +161,135 @@ export function setNativeCurrency(
 
     return { ...s, currency, amountMinor, updatedAt: now };
   });
+}
+
+// --- v2 mutations (live cutover; mirror core/subscriptions.ts) ---------------
+// These are the missing live mutators Story 3.3 wires into the IPC spine. Each
+// mirrors the pure, no-wall-clock contract of the v1 `core/subscriptions.ts`
+// helper it replaces: the input array is never mutated, and `now` is injected.
+
+/**
+ * Fields a caller may change on an existing v2 subscription. System-managed
+ * fields (`id`, `createdAt`, `updatedAt`) are excluded: `id`/`createdAt` are
+ * immutable after creation, and `updatedAt` is advanced by
+ * {@link editSubscriptionV2}. `amountMinor` is a derived field at rest, so it is
+ * patchable here only by a caller that has already parsed a major amount through
+ * the money seam (the modal does this); the eligibility/currency re-expression
+ * paths own their own setters.
+ */
+export type SubscriptionPatchV2 = Partial<
+  Omit<SubscriptionV2, "id" | "createdAt" | "updatedAt">
+>;
+
+/**
+ * Apply `patch` to the subscription with the matching `id` and set its
+ * `updatedAt` to `now`, returning a new array (Req 3.2, 9.7). Mirrors v1
+ * `editSubscription`.
+ *
+ * Non-matching subscriptions are returned unchanged, and `id`/`createdAt` are
+ * always preserved (the patch type excludes them). If no subscription matches
+ * `id`, the list is returned with the same contents (a fresh array).
+ */
+export function editSubscriptionV2(
+  existing: SubscriptionV2[],
+  id: string,
+  patch: SubscriptionPatchV2,
+  now: string,
+): SubscriptionV2[] {
+  return existing.map((s) =>
+    s.id === id ? { ...s, ...patch, updatedAt: now } : s,
+  );
+}
+
+/**
+ * Set the three-way `state` on the subscription with the matching `id` and
+ * advance its `updatedAt` to `now`, returning a new array (Req 3.7, AD-17).
+ * Replaces v1's boolean `toggleActive`.
+ *
+ * Only the target subscription changes; non-matching subs and the input array
+ * are left untouched. An unknown `id` yields a new array with identical
+ * contents (a no-op). This setter is intentionally narrow — it does NOT add or
+ * remove the embedded `trial` block; a transition to/from `Trial` with its trial
+ * fields flows through {@link editSubscriptionV2} from the modal, which carries
+ * the whole v2 patch so the schema invariant (`trial` present iff
+ * `state === "Trial"`) is honored at validation time.
+ */
+export function setSubscriptionState(
+  existing: SubscriptionV2[],
+  id: string,
+  state: SubscriptionState,
+  now: string,
+): SubscriptionV2[] {
+  return existing.map((s) =>
+    s.id === id ? { ...s, state, updatedAt: now } : s,
+  );
+}
+
+/**
+ * Remove exactly the subscription with the matching `id`, returning a new array
+ * (Req 3.3). Mirrors v1 `deleteSubscription`: other subscriptions are preserved
+ * in their original order and the input array is never mutated.
+ */
+export function deleteSubscriptionV2(
+  existing: SubscriptionV2[],
+  id: string,
+): SubscriptionV2[] {
+  return existing.filter((s) => s.id !== id);
+}
+
+// --- v2 eligibility predicates and selectors (the single state seam) ---------
+// The one place the Active/Trial/Paused rules live (AD-17). "Active count" is
+// Active + Trial (both are live); the current monthly total sums Active only;
+// Trials surface separately; Paused is excluded from both and never generates a
+// reminder. Every surface (analytics, scheduler, list, dashboard) consults these
+// rather than hard-coding its own state check.
+
+/** A predicate over a v2 subscription, used to filter lists. */
+export type SubscriptionV2Predicate = (s: SubscriptionV2) => boolean;
+
+/**
+ * Eligibility for the "Active count": a subscription is counted when it is live,
+ * i.e. its state is Active OR Trial (AD-17). Paused is excluded. This is the
+ * single predicate the count seam shares with the scheduler's "not Paused"
+ * eligibility — a Paused sub is neither counted nor reminded.
+ */
+export const isEligibleV2: SubscriptionV2Predicate = (s) =>
+  s.state === "Active" || s.state === "Trial";
+
+/** Predicate matching subscriptions in the plain Active state (spend-eligible). */
+export const isActiveStateV2: SubscriptionV2Predicate = (s) =>
+  s.state === "Active";
+
+/** Predicate matching subscriptions in the Trial state (surfaced separately). */
+export const isTrialStateV2: SubscriptionV2Predicate = (s) => s.state === "Trial";
+
+/**
+ * The live-but-counted subset (state Active + Trial), used for the "Active
+ * count" (Req 8.3). Preserves input order; never mutates the input.
+ */
+export function activeSubscriptionsV2(
+  subs: SubscriptionV2[],
+): SubscriptionV2[] {
+  return subs.filter(isEligibleV2);
+}
+
+/**
+ * The spend subset: plain Active subscriptions only (Trials excluded, Paused
+ * excluded). The current monthly/yearly total sums over THIS subset — a Trial
+ * costs $0 until it converts, so it never pollutes current spend (AD-17).
+ */
+export function activeSpendSubscriptionsV2(
+  subs: SubscriptionV2[],
+): SubscriptionV2[] {
+  return subs.filter(isActiveStateV2);
+}
+
+/**
+ * The Trial subset, surfaced separately as the "+ when N trials convert" figure
+ * (never summed into the current month).
+ */
+export function trialSubscriptionsV2(
+  subs: SubscriptionV2[],
+): SubscriptionV2[] {
+  return subs.filter(isTrialStateV2);
 }

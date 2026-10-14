@@ -9,8 +9,16 @@
  */
 
 import type { ReminderLeadTime } from "./models/settings";
-import type { Subscription } from "./models/subscription";
 import type { ISODate } from "./renewal";
+
+/**
+ * The only subscription field {@link dueLeadTimes} reads: the renewal date.
+ * Structural so it serves both v1 `Subscription` and v2 `SubscriptionV2` (the
+ * field is identical across versions).
+ */
+interface RenewableSubscription {
+  nextRenewal: string;
+}
 
 /** Days before `nextRenewal` that each lead time targets. */
 const LEAD_TIME_OFFSET_DAYS: Record<ReminderLeadTime, number> = {
@@ -65,7 +73,7 @@ function addDays(date: ISODate, days: number): ISODate {
  * timing apply to subsequent evaluations (Req 13.5).
  */
 export function dueLeadTimes(
-  sub: Subscription,
+  sub: RenewableSubscription,
   today: ISODate,
   enabled: ReminderLeadTime[],
 ): ReminderLeadTime[] {

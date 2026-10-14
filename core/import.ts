@@ -12,14 +12,15 @@
  *
  * Round-trip contract (Req 17.3): the JSON shape produced by `core/export.ts`
  * ({@link ExportFile}) is consumed faithfully here — the importer reads the
- * `subscriptions` array (and also tolerates a bare `Subscription[]`). The CSV
+ * `subscriptions` array (and also tolerates a bare `SubscriptionV2[]`). The CSV
  * shape produced by `exportCsv` (header = {@link CSV_COLUMNS}, RFC 4180
- * escaping, `customInterval` as a JSON cell, booleans as `true`/`false`) is
- * parsed back with the same conventions.
+ * escaping, `customInterval`/`trial`/`priceHistory`/`tags` as JSON cells,
+ * booleans as `true`/`false`, `amountMinor` as an integer, `state` as the enum
+ * string) is parsed back with the same conventions.
  */
 
-import type { Subscription } from "./models/subscription";
-import { subscriptionSchema } from "./models/schema";
+import type { SubscriptionV2 } from "./models/subscription";
+import { subscriptionV2Schema } from "./models/schema";
 import { CSV_COLUMNS } from "./export";
 import type { ConflictMode } from "shared/types";
 
@@ -35,7 +36,7 @@ import type { ConflictMode } from "shared/types";
  */
 export interface ImportOutcome {
   /** The new full set to persist (existing + resolved incoming records). */
-  applied: Subscription[];
+  applied: SubscriptionV2[];
   /** Count of incoming records added or applied (new, Replace, or Merge). */
   imported: number;
   /** Count of incoming duplicates left unchanged (Skip mode). */
@@ -63,7 +64,7 @@ export interface ImportOutcome {
  * filesystem.
  */
 export function planImport(
-  existing: Subscription[],
+  existing: SubscriptionV2[],
   incomingRaw: string,
   format: "json" | "csv",
   mode: ConflictMode,
@@ -88,7 +89,7 @@ export function planImport(
 
   // The applied set begins as a copy of the existing data so partial failures
   // never discard valid records already on disk (Req 16.5).
-  const applied: Subscription[] = existing.slice();
+  const applied: SubscriptionV2[] = existing.slice();
   let imported = 0;
   let skipped = 0;
 
@@ -99,12 +100,12 @@ export function planImport(
     }
 
     // 2. Per-record schema validation (Req 16.1, 16.2).
-    const result = subscriptionSchema.safeParse(candidate.value);
+    const result = subscriptionV2Schema.safeParse(candidate.value);
     if (!result.success) {
       rejected.push({ row, reason: formatZodError(result.error) });
       return;
     }
-    const record = result.data as Subscription;
+    const record = result.data as SubscriptionV2;
 
     // 3. Duplicate detection: by id first, then by name + provider (Req 16.3).
     const dupIndex = findDuplicateIndex(applied, record);
@@ -141,7 +142,7 @@ export function planImport(
  * Index of a duplicate of `record` within `set`: an `id` match wins; otherwise
  * a `name + provider` match is used (Req 16.3). Returns -1 when none match.
  */
-function findDuplicateIndex(set: Subscription[], record: Subscription): number {
+function findDuplicateIndex(set: SubscriptionV2[], record: SubscriptionV2): number {
   const byId = set.findIndex((s) => s.id === record.id);
   if (byId !== -1) return byId;
   return set.findIndex(
@@ -157,9 +158,9 @@ function findDuplicateIndex(set: Subscription[], record: Subscription): number {
  * empty.
  */
 function mergeSubscription(
-  existing: Subscription,
-  incoming: Subscription,
-): Subscription {
+  existing: SubscriptionV2,
+  incoming: SubscriptionV2,
+): SubscriptionV2 {
   const merged: Record<string, unknown> = { ...existing };
   for (const [key, value] of Object.entries(incoming)) {
     const current = merged[key];
@@ -168,7 +169,7 @@ function mergeSubscription(
     }
   }
   merged.id = existing.id; // preserve identity on a name+provider match
-  return merged as unknown as Subscription;
+  return merged as unknown as SubscriptionV2;
 }
 
 // --- JSON parsing ------------------------------------------------------------
@@ -185,7 +186,7 @@ type ParseResult =
 
 /**
  * Parse a JSON import. Reads the `subscriptions` array from the export shape
- * ({@link ExportFile}) and also tolerates a bare `Subscription[]`. Each element
+ * ({@link ExportFile}) and also tolerates a bare `SubscriptionV2[]`. Each element
  * is left as `unknown` for the schema to validate per record.
  */
 function parseJsonRecords(raw: string): ParseResult {
@@ -248,10 +249,18 @@ function parseCsvRecords(raw: string): ParseResult {
 }
 
 /**
- * Build a raw subscription-shaped object from one CSV data row, applying the
- * exporter's cell conventions. Values whose target type cannot be produced are
- * left as their raw string so the schema validation reports a clear error
- * (Req 16.2) rather than this function guessing.
+ * Build a raw {@link SubscriptionV2}-shaped object from one CSV data row,
+ * applying the exporter's cell conventions. Values whose target type cannot be
+ * produced are left as their raw string so the schema validation reports a clear
+ * error (Req 16.2) rather than this function guessing.
+ *
+ * v2 cell conventions:
+ *   - `amountMinor`  → integer (empty stays a string so validation rejects it).
+ *   - `state`        → the enum string, left as-is (no boolean coercion).
+ *   - `autoRenew`    → boolean.
+ *   - `customInterval` / `trial` → JSON cell, or absent/undefined when "".
+ *   - `priceHistory` / `tags`    → JSON cell; a "" cell defaults to `[]` so a
+ *     v2 record always carries these arrays (they are required by the schema).
  */
 function coerceCsvRow(
   cells: string[],
@@ -263,18 +272,24 @@ function coerceCsvRow(
     const cell = pos === undefined ? "" : cells[pos] ?? "";
 
     switch (column) {
-      case "amount":
-        // Empty stays a string so validation rejects it; otherwise numeric.
+      case "amountMinor":
+        // Empty stays a string so validation rejects it; otherwise an integer.
         record[column] = cell === "" ? cell : Number(cell);
         break;
-      case "isActive":
       case "autoRenew":
         record[column] =
           cell === "true" ? true : cell === "false" ? false : cell;
         break;
       case "customInterval":
-        // JSON cell, or absent when "" (omit so it stays optional/undefined).
+      case "trial":
+        // Optional object JSON cell, or absent when "" (stays optional/undefined).
         if (cell !== "") record[column] = JSON.parse(cell);
+        break;
+      case "priceHistory":
+      case "tags":
+        // Required array JSON cell; default an empty cell to [] so the v2 record
+        // always carries the array the schema requires.
+        record[column] = cell === "" ? [] : JSON.parse(cell);
         break;
       default:
         record[column] = cell;

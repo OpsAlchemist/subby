@@ -10,15 +10,22 @@
  * task 12.1), keeping `core/` free of platform dependencies.
  */
 
-import type { Subscription, SubscriptionsFile } from "./models/subscription";
+import type {
+  Subscription,
+  SubscriptionsFile,
+  SubscriptionV2,
+} from "./models/subscription";
 
 /**
- * Current on-disk schema version for the subscriptions backup payload.
+ * Current on-disk schema version for the subscriptions backup payload when
+ * assembling from a bare array (no source `version` to preserve).
  *
- * Matches the `version` field of {@link SubscriptionsFile}. Kept as a single
- * source of truth so backup payloads stay consistent with the live data file.
+ * Matches the live data file version (now 2, Story 3.3) so a backup taken from
+ * the current subscriptions set round-trips at the live schema. When a full
+ * file is supplied its own `version` is preserved instead (a RAW v1 pre-
+ * migration snapshot keeps `version: 1`).
  */
-export const BACKUP_SCHEMA_VERSION = 1;
+export const BACKUP_SCHEMA_VERSION = 2;
 
 /**
  * Zero-pad a non-negative integer to the given width.
@@ -126,16 +133,24 @@ export function backupFileName(
  * {@link SubscriptionsFile}), it builds the versioned root file shape that the
  * adapter serializes to a backup file. No I/O is performed here.
  *
- * Accepting either a `Subscription[]` or a `SubscriptionsFile` lets callers
- * pass whichever they have on hand; when a file is supplied its existing
+ * Accepting either a subscriptions array or a full subscriptions file lets
+ * callers pass whichever they have on hand; when a file is supplied its existing
  * `version` is preserved, otherwise {@link BACKUP_SCHEMA_VERSION} is used.
  *
+ * Version-agnostic over the subscription element shape: the live v2 adapter
+ * passes `SubscriptionV2[]` / a v2 file, while the pre-migration backup passes a
+ * RAW v1 file (whose `version: 1` is preserved). The payload is a plain
+ * `{ version, subscriptions }` record either way; the element type is carried
+ * through generically so no casting is needed at the call sites.
+ *
  * @param source - The subscriptions array, or a full subscriptions file.
- * @returns A {@link SubscriptionsFile} ready to be serialized as a backup.
+ * @returns A `{ version, subscriptions }` payload ready to be serialized.
  */
-export function assembleBackupPayload(
-  source: Subscription[] | SubscriptionsFile,
-): SubscriptionsFile {
+export function assembleBackupPayload<
+  TSub extends Subscription | SubscriptionV2,
+>(
+  source: TSub[] | { version: number; subscriptions: TSub[] },
+): { version: number; subscriptions: TSub[] } {
   if (Array.isArray(source)) {
     return {
       version: BACKUP_SCHEMA_VERSION,
@@ -147,3 +162,6 @@ export function assembleBackupPayload(
     subscriptions: [...source.subscriptions],
   };
 }
+
+/** Compatibility re-export: {@link SubscriptionsFile} shape kept for callers. */
+export type { SubscriptionsFile };

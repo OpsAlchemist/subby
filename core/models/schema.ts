@@ -321,6 +321,28 @@ export const DEFAULT_SETTINGS: Settings = {
   dataFolder: null,
 };
 
+/**
+ * Default **v2** settings applied on first run under schema v2 (AD-22, Story
+ * 3.3 cutover). The v1→v2 migrator maps `defaultCurrency`→`homeCurrency` and
+ * adds the all-false `online` block; this constant is the first-run equivalent
+ * the v2 storage adapter stamps for a brand-new file. Every carried-over field
+ * matches {@link DEFAULT_SETTINGS} so behavior is unchanged apart from the
+ * renamed currency and the new online toggles.
+ */
+export const DEFAULT_SETTINGS_V2: SettingsV2 = {
+  homeCurrency: DEFAULT_SETTINGS.defaultCurrency, // Req 6.3 (renamed from defaultCurrency)
+  notification: {
+    enabled: DEFAULT_SETTINGS.notification.enabled,
+    leadTimes: [...DEFAULT_SETTINGS.notification.leadTimes],
+  },
+  backupFrequency: DEFAULT_SETTINGS.backupFrequency,
+  theme: DEFAULT_SETTINGS.theme,
+  accentColor: DEFAULT_SETTINGS.accentColor,
+  trayMode: DEFAULT_SETTINGS.trayMode,
+  dataFolder: DEFAULT_SETTINGS.dataFolder,
+  online: { liveLogoFetch: false, fxRefresh: false }, // AD-22 (all-default-false)
+};
+
 // --- Compile-time alignment checks (no runtime cost) -------------------------
 // These ensure the zod schemas stay in lockstep with the TypeScript interfaces
 // in `core/models/*`. They are never executed; a divergence is a type error.

@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Scheduler } from "../electron/services/scheduler";
 import type { SchedulerServices, SubscriptionNotifier } from "../electron/services/scheduler";
-import type { ReminderLeadTime, Settings } from "core/models/settings";
-import type { Subscription } from "core/models/subscription";
+import type { ReminderLeadTime, SettingsV2 } from "core/models/settings";
+import type { SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Integration tests for the reminder Scheduler (Task 28.3) — Req 13.2, 13.3, 13.4.
@@ -37,14 +37,14 @@ import type { Subscription } from "core/models/subscription";
 const FIXED_NOW = () => new Date("2025-03-07T00:00:00Z");
 const TODAY = "2025-03-07";
 
-/** A complete, type-valid subscription; only `nextRenewal` drives due-ness. */
-function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
+/** A complete, type-valid v2 subscription; only `nextRenewal` drives due-ness. */
+function makeSubscription(overrides: Partial<SubscriptionV2> = {}): SubscriptionV2 {
   return {
     id: "sub-1",
     name: "Netflix",
     provider: "Netflix Inc.",
     category: "Streaming",
-    amount: 499,
+    amountMinor: 49900,
     currency: "INR",
     billingCycle: "Monthly",
     // Default to "today" so the same-day lead time is due for FIXED_NOW.
@@ -55,7 +55,9 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     notes: "",
     color: "#E50914",
     icon: "netflix",
-    isActive: true,
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     // Renewal dates are today/future, so roll-forward is a no-op regardless.
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
@@ -64,19 +66,20 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
   };
 }
 
-/** Settings with notifications enabled and an arbitrary set of lead times. */
+/** v2 settings with notifications enabled and an arbitrary set of lead times. */
 function makeSettings(
   leadTimes: ReminderLeadTime[],
   enabled = true,
-): Settings {
+): SettingsV2 {
   return {
-    defaultCurrency: "INR",
+    homeCurrency: "INR",
     notification: { enabled, leadTimes },
     backupFrequency: "weekly",
     theme: "dark",
-    accentColor: "#7C5CFF",
+    accentColor: "#92400e",
     trayMode: false,
     dataFolder: null,
+    online: { liveLogoFetch: false, fxRefresh: false },
   };
 }
 
@@ -85,7 +88,7 @@ function makeSettings(
  * every call so a test can mutate them between cycles (simulating data/settings
  * changes across ticks). Returns the spies too, so call counts can be asserted.
  */
-function makeServices(initialSettings: Settings, initialSubs: Subscription[]) {
+function makeServices(initialSettings: SettingsV2, initialSubs: SubscriptionV2[]) {
   const state = { settings: initialSettings, subs: initialSubs };
   const getSettings = vi.fn(async () => state.settings);
   const listSubscriptions = vi.fn(async () => state.subs);
@@ -254,6 +257,38 @@ describe("Tray_Mode OFF means evaluation only runs while the app is open (Req 13
     await scheduler.evaluateNow();
     expect(notifier.notify).toHaveBeenCalledTimes(1);
     expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day");
+  });
+});
+
+describe("state-based reminder eligibility (AD-17)", () => {
+  it("a due Paused subscription produces NO notification", async () => {
+    // Same-day due, but Paused subs never generate reminders (AD-17).
+    const paused = makeSubscription({ id: "paused", nextRenewal: TODAY, state: "Paused" });
+    const { services } = makeServices(makeSettings(["same-day"]), [paused]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+  });
+
+  it("a due Trial subscription DOES produce a notification (Trial is reminder-eligible)", async () => {
+    // Same-day due; Trial is live and reminder-eligible alongside Active (AD-17).
+    const trial = makeSubscription({
+      id: "trial",
+      nextRenewal: TODAY,
+      state: "Trial",
+      trial: { endDate: TODAY, postAmountMinor: 49900 },
+    });
+    const { services } = makeServices(makeSettings(["same-day"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "same-day");
   });
 });
 

@@ -35,6 +35,7 @@ import {
   categoriesFileSchema,
   DEFAULT_CATEGORIES,
   DEFAULT_SETTINGS,
+  DEFAULT_SETTINGS_V2,
   settingsFileSchema,
   settingsFileV2Schema,
   subscriptionsFileSchema,
@@ -43,10 +44,10 @@ import {
 import { assembleBackupPayload, backupFileName } from "core/backup";
 import { migrate } from "core/migrations";
 import type { Category } from "core/models/category";
-import type { Settings, SettingsFile } from "core/models/settings";
+import type { SettingsFileV2, SettingsV2 } from "core/models/settings";
 import type {
-  Subscription,
-  SubscriptionsFile,
+  SubscriptionsFileV2,
+  SubscriptionV2,
 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
 
@@ -67,14 +68,15 @@ import {
 /**
  * The current on-disk schema version the live app reads and writes.
  *
- * Epic-1 compatibility window (scope A): this stays **1**. The running app still
- * reads/writes v1 files; v1↔v2 coexist until Epic 3 makes the app v2-aware. The
- * version-gated read path below is built and fully tested now (including the
- * v1→v2 migrate branch, exercised in tests against a synthetic lower `current`),
- * so FR-29 is proven-ready. Epic 3 activates live migration by flipping this one
- * constant to 2 — no other change in the gating logic is required (AD-15).
+ * Story 3.3 cutover: this is now **2**. The running app reads/writes v2 files;
+ * an existing `version: 1` file on disk migrates-on-read through the already-
+ * tested version-gated path below (back up the raw v1 file, run the frozen
+ * `migrateSubscriptionV1toV2` migrator, validate against the v2 schema, write
+ * back). The gating logic was built and proven in Epic 1 against a synthetic
+ * `current = 2`; flipping this one constant is what makes that path live (AD-15,
+ * FR-29). No change to the gating logic itself was required.
  */
-export const CURRENT_VERSION = 1;
+export const CURRENT_VERSION = 2;
 
 /**
  * Typed error thrown when a data file exists but cannot be read as valid data
@@ -393,12 +395,24 @@ export class JsonFileStorage implements StoragePort {
   // the `== current` branch, never a spurious migrate). In Epic 1 production
   // `current` is 1, so defaults are stamped `version: 1` exactly as before.
 
-  private defaultSubscriptionsFile(): SubscriptionsFile {
-    return { version: this.current, subscriptions: [] };
+  private defaultSubscriptionsFile(): SubscriptionsFileV2 {
+    // Stamp the adapter's own `current` version (as the settings/categories
+    // default builders do) so a freshly recreated file is already at the
+    // version the subsequent read validates against — never a spurious
+    // migrate or a self-inflicted newer-than-current refusal.
+    return { version: this.current as 2, subscriptions: [] };
   }
 
-  private defaultSettingsFile(): Settings & { version: number } {
-    return { version: this.current, ...DEFAULT_SETTINGS };
+  private defaultSettingsFile(): SettingsV2 & { version: number } {
+    // Match the default CONTENT to the adapter's `current`: a `current = 1`
+    // adapter (today's live scope-A behavior / version-pinned test adapters)
+    // recreates the v1-shaped defaults so the subsequent `== current` read
+    // validates against the v1 schema; `current >= 2` recreates the v2 defaults.
+    return this.current >= 2
+      ? { version: this.current, ...DEFAULT_SETTINGS_V2 }
+      : ({ version: this.current, ...DEFAULT_SETTINGS } as unknown as SettingsV2 & {
+          version: number;
+        });
   }
 
   private defaultCategoriesFile(): { version: number; categories: Category[] } {
@@ -715,28 +729,28 @@ export class JsonFileStorage implements StoragePort {
 
   // --- Subscriptions ---------------------------------------------------------
 
-  async readSubscriptions(): Promise<Subscription[]> {
-    const file = await this.readVersioned<SubscriptionsFile>({
+  async readSubscriptions(): Promise<SubscriptionV2[]> {
+    const file = await this.readVersioned<SubscriptionsFileV2>({
       path: this.subscriptionsPath,
       fileName: fileNames.subscriptions,
-      // At the current version the live app validates with the v1 schema; a
-      // `current = 2` adapter (tests / Epic 3) validates with the v2 schema.
+      // The live app is v2 (`current = 2`): validate with the v2 schema. A test
+      // adapter pinned to `current = 1` still validates with the v1 schema.
       validateCurrent: (data) =>
         this.current >= 2
-          ? (subscriptionsFileV2Schema.parse(data) as unknown as SubscriptionsFile)
-          : subscriptionsFileSchema.parse(data),
+          ? subscriptionsFileV2Schema.parse(data)
+          : (subscriptionsFileSchema.parse(data) as unknown as SubscriptionsFileV2),
       buildDefaults: () => this.defaultSubscriptionsFile(),
       migrateFile: (data, fromVersion) =>
         migrate(
-          data as unknown as SubscriptionsFile,
+          data as unknown as Parameters<typeof migrate>[0],
           fromVersion,
-        ) as unknown as SubscriptionsFile,
+        ) as unknown as SubscriptionsFileV2,
       // Pre-migration backup of the RAW v1 file (AD-16). `assembleBackupPayload`
       // preserves the file's own `version`, so the backup is a faithful v1
       // snapshot — never a re-migrated one.
       preMigrationBackup: async (raw) => {
         await this.writeBackupPayload(
-          assembleBackupPayload(raw as unknown as SubscriptionsFile),
+          assembleBackupPayload(raw as unknown as SubscriptionsFileV2),
         );
       },
       canRestoreBackup: async () => (await this.listBackups()).length > 0,
@@ -747,14 +761,14 @@ export class JsonFileStorage implements StoragePort {
     return file.subscriptions;
   }
 
-  async writeSubscriptions(subs: Subscription[]): Promise<void> {
+  async writeSubscriptions(subs: SubscriptionV2[]): Promise<void> {
     await this.ensureTree();
     // Stamp the adapter's own `current` — the single version source the read
     // gate and the default-builders also use — so flipping CURRENT_VERSION (or
     // injecting a different `current`) is a genuine one-source change and a
     // write-then-read round-trips at that version with no spurious re-migrate.
-    const file: SubscriptionsFile = {
-      version: this.current,
+    const file: SubscriptionsFileV2 = {
+      version: this.current as 2,
       subscriptions: subs,
     };
     await writeJsonAtomic(this.subscriptionsPath, file);
@@ -762,22 +776,22 @@ export class JsonFileStorage implements StoragePort {
 
   // --- Settings --------------------------------------------------------------
 
-  async readSettings(): Promise<Settings> {
-    // SettingsFile structurally satisfies Settings (the extra `version` is
+  async readSettings(): Promise<SettingsV2> {
+    // SettingsFileV2 structurally satisfies SettingsV2 (the extra `version` is
     // benign and rewritten on the next write).
-    const file = await this.readVersioned<SettingsFile>({
+    const file = await this.readVersioned<SettingsFileV2>({
       path: this.settingsPath,
       fileName: fileNames.settings,
       validateCurrent: (data) =>
         this.current >= 2
-          ? (settingsFileV2Schema.parse(data) as unknown as SettingsFile)
-          : settingsFileSchema.parse(data),
-      buildDefaults: () => this.defaultSettingsFile(),
+          ? settingsFileV2Schema.parse(data)
+          : (settingsFileSchema.parse(data) as unknown as SettingsFileV2),
+      buildDefaults: () => this.defaultSettingsFile() as SettingsFileV2,
       migrateFile: (data, fromVersion) =>
         migrate(
-          data as unknown as SettingsFile,
+          data as unknown as Parameters<typeof migrate>[0],
           fromVersion,
-        ) as unknown as SettingsFile,
+        ) as unknown as SettingsFileV2,
       // Settings has no backup stream, so no pre-migration backup is taken and a
       // corrupt classification is never restorable (reset-to-defaults instead).
       canRestoreBackup: async () => false,
@@ -785,7 +799,7 @@ export class JsonFileStorage implements StoragePort {
     return file;
   }
 
-  async writeSettings(settings: Settings): Promise<void> {
+  async writeSettings(settings: SettingsV2): Promise<void> {
     await this.ensureTree();
     const file = { version: this.current, ...settings };
     await writeJsonAtomic(this.settingsPath, file);
@@ -868,7 +882,10 @@ export class JsonFileStorage implements StoragePort {
    * `'1' < '9'`). Scoping `seq` to a single same-instant burst keeps the segment
    * width-stable (≤ `MAX_ATTEMPTS` ≪ 10000) and sort-correct.
    */
-  private async writeBackupPayload(payload: SubscriptionsFile): Promise<string> {
+  private async writeBackupPayload(payload: {
+    version: number;
+    subscriptions: unknown[];
+  }): Promise<string> {
     await this.ensureTree();
 
     // Read the clock once per backup; sub-minute precision (seconds + millis)
@@ -936,14 +953,22 @@ export class JsonFileStorage implements StoragePort {
    * (Req 18.2). The name is reduced to its base name to prevent path traversal
    * outside the `backup/` directory.
    */
-  async readBackup(name: string): Promise<SubscriptionsFile> {
+  async readBackup(name: string): Promise<SubscriptionsFileV2> {
     await this.ensureTree();
     const safeName = basename(name);
     const file = join(this.backupDir, safeName);
-    const result = await safeReadJson(
-      file,
-      (data) => subscriptionsFileSchema.parse(data),
-    );
+    // A backup may be a v2 snapshot (the live format) OR a v1 snapshot — the
+    // pre-migration backup is a faithful RAW v1 file (AD-16), and legacy backups
+    // predate the cutover. Accept EITHER shape so a round-trip stays valid and a
+    // pre-migration v1 backup still reads back as its untouched v1 version; the
+    // caller's write-back re-stamps at the current version. The parsed value is
+    // typed as the port's `SubscriptionsFileV2` (its structural subset is enough
+    // for `restoreBackup`, which reads only `version` + `subscriptions`).
+    const result = await safeReadJson(file, (data) => {
+      const v2 = subscriptionsFileV2Schema.safeParse(data);
+      if (v2.success) return v2.data as unknown as SubscriptionsFileV2;
+      return subscriptionsFileSchema.parse(data) as unknown as SubscriptionsFileV2;
+    });
 
     if (result.ok) {
       return result.value;

@@ -14,7 +14,7 @@ import {
   type CloudPathPredicate,
 } from "../electron/storage/paths";
 import { SYNCED_FOLDER_CAVEAT, createAppContext } from "../electron/appWiring";
-import type { Subscription } from "core/models/subscription";
+import type { Subscription, SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Integration tests for the cloud-folder safe-read guardrail (Story 1.7 /
@@ -83,7 +83,7 @@ describe("defaultIsCloudPath (safe-default seam)", () => {
   it("is the adapter's default: unspecified predicate behaves as never-cloud", async () => {
     // No predicate injected → default. A missing file recreates (no guard),
     // even though the folder would otherwise look like a cloud path.
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     const subs = await storage.readSubscriptions();
     expect(subs).toEqual([]);
     expect(await readFile(join(userData, fileNames.subscriptions), "utf8")).toContain(
@@ -96,11 +96,11 @@ describe("defaultIsCloudPath (safe-default seam)", () => {
 
 describe("default predicate (() => false): recreate-on-missing unchanged", () => {
   it("missing subscriptions file is recreated with empty defaults, even with backups present", async () => {
-    const storage = new JsonFileStorage(userData); // default predicate
+    const storage = new JsonFileStorage(userData, null, 1); // default predicate
     // Create a backup first (so there IS evidence of real data), then delete the
     // live file. Under the default predicate the guardrail must stay INERT: the
     // file recreates exactly as today.
-    await storage.writeSubscriptions([v1Subscription()]);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
     await storage.createBackup("test");
     await rm(join(userData, fileNames.subscriptions), { force: true });
 
@@ -118,7 +118,7 @@ describe("cloud + transient missing: guardrail refuses empty-recreate", () => {
     const storage = new JsonFileStorage(userData, null, 1, alwaysCloud);
     // Real data existed and a backup was taken; then the live file vanishes
     // (mid-sync). The backup is the evidence of real data to protect.
-    await storage.writeSubscriptions([v1Subscription({ id: "live" })]);
+    await storage.writeSubscriptions([v1Subscription({ id: "live" })] as unknown as SubscriptionV2[]);
     await storage.createBackup("test");
     await rm(join(userData, fileNames.subscriptions), { force: true });
 
@@ -224,7 +224,7 @@ describe("cloud + transient missing: guardrail refuses empty-recreate", () => {
     // settings has NO backup stream, so guarding it would be an unrecoverable
     // retry-only dead-end — it must ALWAYS recreate-on-missing regardless of
     // isCloudPath. Delete settings; confirm it is recreated with defaults.
-    await storage.writeSubscriptions([v1Subscription()]);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
     await storage.createBackup("test");
     await rm(join(userData, fileNames.settings), { force: true });
 
@@ -274,7 +274,7 @@ describe("non-cloud missing: recreate unchanged (isCloudPath → false)", () => 
   it("missing file with backups present but predicate false → recreated empty (today's behavior)", async () => {
     const neverCloud: CloudPathPredicate = () => false;
     const storage = new JsonFileStorage(userData, null, 1, neverCloud);
-    await storage.writeSubscriptions([v1Subscription()]);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
     await storage.createBackup("test");
     await rm(join(userData, fileNames.subscriptions), { force: true });
 
@@ -292,13 +292,13 @@ describe("relocation honored; synced-folder caveat available", () => {
     try {
       const storage = new JsonFileStorage(userData, null, 1, alwaysCloud);
       // Pristine → init works in the default dir.
-      await storage.writeSubscriptions([v1Subscription({ id: "in-default" })]);
+      await storage.writeSubscriptions([v1Subscription({ id: "in-default" })] as unknown as SubscriptionV2[]);
       expect(storage.getDataFolder()).toBe(userData);
 
       // Relocate: subsequent I/O targets `other`.
       await storage.setDataFolder(other);
       expect(storage.getDataFolder()).toBe(other);
-      await storage.writeSubscriptions([v1Subscription({ id: "in-other" })]);
+      await storage.writeSubscriptions([v1Subscription({ id: "in-other" })] as unknown as SubscriptionV2[]);
       const inOther = await storage.readSubscriptions();
       expect(inOther[0]?.id).toBe("in-other");
       expect(await readdir(other)).toContain(fileNames.subscriptions);

@@ -11,7 +11,7 @@ import {
   writeJsonExclusive,
 } from "../electron/storage/safeJson";
 import { assembleBackupPayload } from "core/backup";
-import type { Subscription } from "core/models/subscription";
+import type { Subscription, SubscriptionV2 } from "core/models/subscription";
 
 /**
  * Collision-proof, never-overwrite backup tests (Story 1.5 / AD-16).
@@ -77,8 +77,8 @@ describe("collision-proof backups: same-minute uniqueness (AD-16)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-07T09:05:42.137Z"));
 
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription({ id: "a" })]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription({ id: "a" })] as unknown as SubscriptionV2[]);
 
     const name1 = await storage.createBackup("scheduled");
     const name2 = await storage.createBackup("pre-delete");
@@ -102,8 +102,8 @@ describe("collision-proof backups: same-minute uniqueness (AD-16)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-07T09:05:42.137Z"));
 
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription()]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
 
     const names: string[] = [];
     for (let i = 0; i < 10; i += 1) {
@@ -130,8 +130,8 @@ describe("collision-proof backups: same-minute uniqueness (AD-16)", () => {
     vi.useFakeTimers();
     const base = new Date("2026-03-07T09:05:42.137Z").getTime();
 
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription()]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
 
     const COUNT = 50;
     const names: string[] = [];
@@ -162,9 +162,9 @@ describe("collision-proof backups: pre-migration survives a same-minute backup (
     vi.setSystemTime(new Date("2026-03-07T09:05:42.137Z"));
 
     // Write a genuine v1 file via a current=1 adapter.
-    const writer = new JsonFileStorage(userData); // current = 1
+    const writer = new JsonFileStorage(userData, null, 1); // current = 1
     const v1Subs = [v1Subscription({ id: "a", amount: 499, currency: "INR" })];
-    await writer.writeSubscriptions(v1Subs);
+    await writer.writeSubscriptions(v1Subs as unknown as SubscriptionV2[]);
 
     // Read through a current=2 adapter: the migrate branch takes a pre-migration
     // backup of the RAW v1 file FIRST (AD-16).
@@ -198,7 +198,7 @@ describe("collision-proof backups: pre-migration survives a same-minute backup (
 
 describe("collision-proof backups: mixed old/new ordering + legacy restore (Req 18.2, AD-27)", () => {
   it("listBackups returns mixed old-format and new-format names newest-first", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     await storage.ensureTree();
 
     const backupDir = join(userData, fileNames.backupDir);
@@ -224,7 +224,7 @@ describe("collision-proof backups: mixed old/new ordering + legacy restore (Req 
   });
 
   it("a legacy YYYY-MM-DD-HH-MM.json backup still lists and readBackup-restores it", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     await storage.ensureTree();
 
     const legacyName = "2025-01-01-08-00.json";
@@ -248,7 +248,7 @@ describe("collision-proof backups: mixed old/new ordering + legacy restore (Req 
   });
 
   it("readBackup for a missing legacy name throws a not-found error (never silent)", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     await storage.ensureTree();
     await expect(storage.readBackup("2000-01-01-00-00.json")).rejects.toThrow(
       /Backup not found/,
@@ -261,8 +261,8 @@ describe("collision-proof backups: never-overwrite (AD-16)", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-07T09:05:42.137Z"));
 
-    const storage = new JsonFileStorage(userData);
-    await storage.writeSubscriptions([v1Subscription()]);
+    const storage = new JsonFileStorage(userData, null, 1);
+    await storage.writeSubscriptions([v1Subscription()] as unknown as SubscriptionV2[]);
     await storage.ensureTree();
 
     // Pre-seed the exact name the next backup would otherwise choose (seq 0).
@@ -296,7 +296,7 @@ describe("collision-proof backups: never-overwrite (AD-16)", () => {
   });
 
   it("writeJsonExclusive refuses to overwrite an existing file (loud FileExistsError)", async () => {
-    const storage = new JsonFileStorage(userData);
+    const storage = new JsonFileStorage(userData, null, 1);
     await storage.ensureTree();
     const target = join(userData, fileNames.backupDir, "exclusive-target.json");
 

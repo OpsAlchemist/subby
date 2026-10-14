@@ -18,7 +18,7 @@ export const CH = {
     create: "subs:create",
     update: "subs:update",
     remove: "subs:remove",
-    toggleActive: "subs:toggleActive",
+    setState: "subs:setState",
   },
   categories: { list: "cat:list", create: "cat:create", remove: "cat:remove" },
   settings: {

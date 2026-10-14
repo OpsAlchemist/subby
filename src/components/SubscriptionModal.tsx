@@ -1,31 +1,44 @@
 /**
- * Add / Edit subscription modal (task 19.1, Req 3.5, 3.6, 4.1, 4.2, 4.3, 4.4).
+ * Add / Edit subscription modal (Story 3.3; Req 3.5, 3.6, 4.1, 4.2, 4.3, 4.4,
+ * AD-17, AD-18).
  *
  * A single accessible modal dialog used for BOTH creating and editing a
- * {@link Subscription}:
+ * {@link SubscriptionV2}:
  *
- *   - CREATE mode (no `subscription` prop): all fields start empty/sensible,
- *     and the currency is pre-filled from {@link settingsStore}.defaultCurrency
- *     (Req 4.3). On save it calls `subscriptionsApi.create(input)` with a
- *     {@link SubscriptionInput} (no id/createdAt/updatedAt — those are assigned
- *     by core).
- *   - EDIT mode (`subscription` provided): every field is pre-populated with the
- *     subscription's current values (Req 4.2). On save it calls
- *     `subscriptionsApi.update(id, patch)`.
+ *   - CREATE mode (no `subscription` prop): all fields start empty/sensible, and
+ *     the currency is pre-filled from {@link settingsStore}.homeCurrency (Req
+ *     4.3). On save it calls `subscriptionsApi.create(input)` with a
+ *     {@link SubscriptionInputV2}: a user-entered MAJOR amount string plus the
+ *     Native currency (core parses it into integer `amountMinor` via the money
+ *     seam and assigns id/createdAt/updatedAt).
+ *   - EDIT mode (`subscription` provided): every field is pre-populated from the
+ *     subscription's current values, the stored `amountMinor` rendered back to a
+ *     major string via `toMajor` (Req 4.2). On save it calls
+ *     `subscriptionsApi.update(id, patch)` with a v2 patch (`amountMinor` parsed
+ *     from the entered major amount), preserving every untouched field including
+ *     `priceHistory`/`tags`/`trial`.
  *
- * The form exposes inputs for every editable Subscription field (Req 4.1) and a
- * custom-interval control shown only when the billing cycle is "Custom"
- * (design: Add/Edit Modal). Client-side validation mirrors
- * {@link subscriptionSchema}: a non-empty name (Req 3.5) and a non-negative
- * numeric amount (Req 3.6); inline messages name the offending field.
+ * State (AD-17): the old `isActive` boolean toggle is replaced by a **segmented
+ * State control** — an accessible `radiogroup` of Active / Paused / Trial, each
+ * a text-labelled option. Selecting Trial reveals a minimal trial block (end
+ * date + post-trial amount) so the v2 schema invariant holds (`trial` present
+ * iff state === 'Trial'); non-Trial states carry no `trial`. The full Epic-5
+ * trial setup/conversion is out of scope.
+ *
+ * The form exposes inputs for every editable field (Req 4.1) and a custom-
+ * interval control shown only when the billing cycle is "Custom". Client-side
+ * validation mirrors {@link subscriptionV2Schema}: a non-empty name (Req 3.5),
+ * a non-negative amount parsed through `core/money.minorUnits` (Req 3.6), a
+ * positive-integer custom interval, and a valid minimal trial when state ===
+ * 'Trial'. Inline messages name the offending field.
  *
  * Cancel (the Cancel button, the backdrop, or Escape) closes WITHOUT persisting
  * (Req 4.4). Any {@link SubbyError} from the bridge is caught and shown inline
  * so the modal never crashes (Req 19.4).
  *
- * Accessibility: `role="dialog"` + `aria-modal`, a labelled title, initial
- * focus on the first field, Escape to close, focus return to the previously
- * focused element, a simple focus trap, and visible focus rings (Req 22.1, 22.3).
+ * Accessibility: `role="dialog"` + `aria-modal`, a labelled title, initial focus
+ * on the first field, Escape to close, focus return to the previously focused
+ * element, a simple focus trap, and visible focus rings (Req 22.1, 22.3).
  */
 
 import { useEffect, useId, useRef, useState } from "react";
@@ -34,9 +47,12 @@ import { X } from "lucide-react";
 import type {
   BillingCycle,
   CustomInterval,
-  Subscription,
+  SubscriptionState,
+  SubscriptionV2,
+  TrialV2,
 } from "core/models/subscription";
-import type { SubscriptionInput } from "shared/types";
+import { minorUnits, toMajor } from "core/money";
+import type { SubscriptionInputV2 } from "shared/types";
 import { cn } from "@/lib/utils";
 import { isSubbyError, subscriptionsApi, toAppError } from "@/api/subby";
 import { categoriesStore } from "@/stores/categoriesStore";
@@ -63,6 +79,9 @@ const CUSTOM_UNITS: readonly CustomInterval["unit"][] = [
   "year",
 ];
 
+/** The three-way State options for the segmented control (AD-17). */
+const STATES: readonly SubscriptionState[] = ["Active", "Paused", "Trial"];
+
 /** Default custom interval used until the user edits it. */
 const DEFAULT_CUSTOM_INTERVAL: CustomInterval = { unit: "month", count: 1 };
 
@@ -84,14 +103,15 @@ function todayIso(): string {
 // --- Form state --------------------------------------------------------------
 
 /**
- * Editable form state. `amount` and the custom-interval `count` are kept as
- * strings so the user can type freely; they are parsed/validated on submit.
+ * Editable form state. Monetary fields (`amount`, `trialPostAmount`) and the
+ * custom-interval `count` are kept as strings so the user can type freely; they
+ * are parsed/validated on submit.
  */
 interface FormState {
   name: string;
   provider: string;
   category: string;
-  amount: string;
+  amount: string; // major-unit string
   currency: string;
   billingCycle: BillingCycle;
   customUnit: CustomInterval["unit"];
@@ -103,8 +123,11 @@ interface FormState {
   notes: string;
   color: string;
   icon: string;
-  isActive: boolean;
+  state: SubscriptionState;
   autoRenew: boolean;
+  // Minimal trial fields (used only when state === 'Trial').
+  trialEndDate: string;
+  trialPostAmount: string; // major-unit string
 }
 
 /** Per-field validation messages (only populated for fields that fail). */
@@ -112,21 +135,26 @@ interface FieldErrors {
   name?: string;
   amount?: string;
   customCount?: string;
+  trialEndDate?: string;
+  trialPostAmount?: string;
 }
 
 /** Build the initial form state for create or edit mode. */
 function initialState(
-  subscription: Subscription | undefined,
-  defaultCurrency: string,
+  subscription: SubscriptionV2 | undefined,
+  homeCurrency: string,
   defaultColor: string,
 ): FormState {
   if (subscription) {
-    // EDIT: pre-populate from the current subscription (Req 4.2).
+    // EDIT: pre-populate from the current subscription (Req 4.2). The stored
+    // minor units render back to a major string; the trial fields are seeded
+    // from the embedded trial when present.
+    const trial = subscription.trial;
     return {
       name: subscription.name,
       provider: subscription.provider,
       category: subscription.category,
-      amount: String(subscription.amount),
+      amount: minorToMajor(subscription.amountMinor, subscription.currency),
       currency: subscription.currency,
       billingCycle: subscription.billingCycle,
       customUnit: subscription.customInterval?.unit ?? DEFAULT_CUSTOM_INTERVAL.unit,
@@ -140,17 +168,22 @@ function initialState(
       notes: subscription.notes,
       color: subscription.color,
       icon: subscription.icon,
-      isActive: subscription.isActive,
+      state: subscription.state,
       autoRenew: subscription.autoRenew,
+      trialEndDate: trial?.endDate ?? todayIso(),
+      trialPostAmount:
+        trial !== undefined
+          ? minorToMajor(trial.postAmountMinor, subscription.currency)
+          : "",
     };
   }
-  // CREATE: empty/sensible defaults; currency from settings (Req 4.3).
+  // CREATE: empty/sensible defaults; currency from Home Currency (Req 4.3).
   return {
     name: "",
     provider: "",
     category: "",
     amount: "",
-    currency: defaultCurrency,
+    currency: homeCurrency,
     billingCycle: "Monthly",
     customUnit: DEFAULT_CUSTOM_INTERVAL.unit,
     customCount: String(DEFAULT_CUSTOM_INTERVAL.count),
@@ -161,20 +194,39 @@ function initialState(
     notes: "",
     color: defaultColor,
     icon: "",
-    isActive: true,
+    state: "Active",
     autoRenew: true,
+    trialEndDate: todayIso(),
+    trialPostAmount: "",
   };
 }
 
 /**
- * Validate the form, mirroring {@link subscriptionSchema}'s field rules. Returns
- * field-level messages that NAME the offending field (Req 3.5, 3.6) and the
- * parsed numeric values when valid.
+ * Render stored minor units back to a major display string for the amount
+ * field, falling back to the raw integer when the currency is unknown so an
+ * edit-mode open never crashes (validation catches a bad currency on save).
+ */
+function minorToMajor(minor: number, currency: string): string {
+  try {
+    return toMajor(minor, currency);
+  } catch {
+    return String(minor);
+  }
+}
+
+/**
+ * Validate the form, mirroring {@link subscriptionV2Schema}'s field rules.
+ * Returns field-level messages that NAME the offending field (Req 3.5, 3.6) and
+ * the parsed values when valid: `amountMinor` (integer minor units in the Native
+ * currency), the custom interval count, and — when state === 'Trial' — the
+ * minimal trial. The amount is parsed through `core/money.minorUnits`, so an
+ * invalid/over-precise amount surfaces as an inline error and nothing persists.
  */
 function validate(form: FormState): {
   errors: FieldErrors;
-  amount: number;
+  amountMinor: number;
   customCount: number;
+  trial: TrialV2 | undefined;
 } {
   const errors: FieldErrors = {};
 
@@ -183,10 +235,18 @@ function validate(form: FormState): {
     errors.name = "Name is required.";
   }
 
-  // Non-negative finite numeric amount (Req 3.6).
-  const amount = Number(form.amount);
-  if (form.amount.trim() === "" || !Number.isFinite(amount) || amount < 0) {
+  // Non-negative amount parsed into minor units (Req 3.6). An empty string or a
+  // value the money seam rejects (negative, over-precise, unknown currency) is
+  // an inline error.
+  let amountMinor = 0;
+  if (form.amount.trim() === "") {
     errors.amount = "Amount must be a non-negative number.";
+  } else {
+    try {
+      amountMinor = minorUnits(form.amount.trim(), form.currency);
+    } catch {
+      errors.amount = "Enter a valid amount for this currency.";
+    }
   }
 
   // A Custom cycle needs a positive-integer interval count (mirrors zod).
@@ -198,7 +258,33 @@ function validate(form: FormState): {
     errors.customCount = "Interval count must be a positive whole number.";
   }
 
-  return { errors, amount, customCount };
+  // A Trial state requires a minimal trial (end date + post-trial amount) so the
+  // v2 schema invariant holds (AD-17, AD-18 — months unrepresentable; an end
+  // date is used). Non-Trial states carry no trial.
+  let trial: TrialV2 | undefined;
+  if (form.state === "Trial") {
+    let postAmountMinor = 0;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(form.trialEndDate)) {
+      errors.trialEndDate = "Enter a valid trial end date.";
+    }
+    if (form.trialPostAmount.trim() === "") {
+      errors.trialPostAmount = "Enter the amount charged after the trial.";
+    } else {
+      try {
+        postAmountMinor = minorUnits(form.trialPostAmount.trim(), form.currency);
+      } catch {
+        errors.trialPostAmount = "Enter a valid post-trial amount.";
+      }
+    }
+    if (
+      errors.trialEndDate === undefined &&
+      errors.trialPostAmount === undefined
+    ) {
+      trial = { endDate: form.trialEndDate, postAmountMinor };
+    }
+  }
+
+  return { errors, amountMinor, customCount, trial };
 }
 
 // --- Props -------------------------------------------------------------------
@@ -209,7 +295,7 @@ export interface SubscriptionModalProps {
   /** Close handler — invoked on cancel, backdrop click, Escape, or save success. */
   onClose: () => void;
   /** When provided, the modal is in EDIT mode pre-populated from this value (Req 4.2). */
-  subscription?: Subscription;
+  subscription?: SubscriptionV2;
 }
 
 // --- Component ---------------------------------------------------------------
@@ -224,9 +310,10 @@ export default function SubscriptionModal({
 
   const isEdit = subscription !== undefined;
   const titleId = useId();
+  const stateGroupId = useId();
 
   const [form, setForm] = useState<FormState>(() =>
-    initialState(subscription, settings.defaultCurrency, settings.accentColor),
+    initialState(subscription, settings.homeCurrency, settings.accentColor),
   );
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -244,7 +331,7 @@ export default function SubscriptionModal({
   useEffect(() => {
     if (!open) return;
     setForm(
-      initialState(subscription, settings.defaultCurrency, settings.accentColor),
+      initialState(subscription, settings.homeCurrency, settings.accentColor),
     );
     setErrors({});
     setSubmitError(null);
@@ -274,13 +361,18 @@ export default function SubscriptionModal({
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  /** Build the editable payload shared by create (input) and update (patch). */
-  function buildPayload(amount: number, customCount: number): SubscriptionInput {
-    const base: SubscriptionInput = {
+  /**
+   * Build the editable payload shared by create (input) and update (patch). The
+   * entered major amount is carried as `amountMajor` for create (core parses it)
+   * and as a pre-parsed `amountMinor` for update. The trial block is included
+   * only when state === 'Trial'.
+   */
+  function buildInput(trial: TrialV2 | undefined, customCount: number): SubscriptionInputV2 {
+    return {
       name: form.name.trim(),
       provider: form.provider.trim(),
       category: form.category,
-      amount,
+      amountMajor: form.amount.trim(),
       currency: form.currency,
       billingCycle: form.billingCycle,
       // Only a Custom cycle carries a custom interval; otherwise clear it.
@@ -295,10 +387,14 @@ export default function SubscriptionModal({
       notes: form.notes,
       color: form.color,
       icon: form.icon.trim(),
-      isActive: form.isActive,
+      state: form.state,
+      trial,
+      // `priceHistory`/`tags` are not edited here; core defaults them to [] on
+      // create and the update path preserves the existing values.
+      priceHistory: subscription?.priceHistory ?? [],
+      tags: subscription?.tags ?? [],
       autoRenew: form.autoRenew,
     };
-    return base;
   }
 
   /** Validate, then create or update; close on success (Req 3.1, 3.2, 4.4). */
@@ -308,17 +404,39 @@ export default function SubscriptionModal({
     event.preventDefault();
     setSubmitError(null);
 
-    const { errors: nextErrors, amount, customCount } = validate(form);
+    const { errors: nextErrors, amountMinor, customCount, trial } = validate(form);
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
 
-    const payload = buildPayload(amount, customCount);
     setSaving(true);
     try {
       if (isEdit) {
-        await subscriptionsApi.update(subscription.id, payload);
+        // EDIT: a v2 patch carrying the pre-parsed minor units and the resolved
+        // trial, preserving every untouched field (priceHistory/tags/etc.).
+        await subscriptionsApi.update(subscription.id, {
+          name: form.name.trim(),
+          provider: form.provider.trim(),
+          category: form.category,
+          amountMinor,
+          currency: form.currency,
+          billingCycle: form.billingCycle,
+          customInterval:
+            form.billingCycle === "Custom"
+              ? { unit: form.customUnit, count: customCount }
+              : undefined,
+          nextRenewal: form.nextRenewal,
+          startDate: form.startDate,
+          paymentMethod: form.paymentMethod.trim(),
+          website: form.website.trim(),
+          notes: form.notes,
+          color: form.color,
+          icon: form.icon.trim(),
+          state: form.state,
+          trial,
+          autoRenew: form.autoRenew,
+        });
       } else {
-        await subscriptionsApi.create(payload);
+        await subscriptionsApi.create(buildInput(trial, customCount));
       }
       onClose();
     } catch (err) {
@@ -376,7 +494,7 @@ export default function SubscriptionModal({
         aria-modal="true"
         aria-labelledby={titleId}
         onKeyDown={handleKeyDown}
-        className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-border bg-card text-card-foreground shadow-xl"
+        className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-xl"
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border px-6 py-4">
@@ -615,6 +733,60 @@ export default function SubscriptionModal({
               />
             </Field>
 
+            {/* State — segmented Active / Paused / Trial radiogroup (AD-17). */}
+            <div className="sm:col-span-2">
+              <StateControl
+                groupId={stateGroupId}
+                value={form.state}
+                onChange={(next) => set("state", next)}
+              />
+            </div>
+
+            {/* Trial reveal — only when state === "Trial" (AD-18 minimal fields). */}
+            {form.state === "Trial" && (
+              <>
+                <Field
+                  label="Trial end date"
+                  htmlFor="sub-trial-end"
+                  required
+                  error={errors.trialEndDate}
+                >
+                  <input
+                    id="sub-trial-end"
+                    type="date"
+                    className={CONTROL_CLASS}
+                    value={form.trialEndDate}
+                    onChange={(e) => set("trialEndDate", e.target.value)}
+                    aria-invalid={errors.trialEndDate ? true : undefined}
+                    aria-describedby={
+                      errors.trialEndDate ? "sub-trial-end-error" : undefined
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Amount after trial"
+                  htmlFor="sub-trial-amount"
+                  required
+                  error={errors.trialPostAmount}
+                >
+                  <input
+                    id="sub-trial-amount"
+                    type="number"
+                    inputMode="decimal"
+                    min={0}
+                    step="0.01"
+                    className={CONTROL_CLASS}
+                    value={form.trialPostAmount}
+                    onChange={(e) => set("trialPostAmount", e.target.value)}
+                    aria-invalid={errors.trialPostAmount ? true : undefined}
+                    aria-describedby={
+                      errors.trialPostAmount ? "sub-trial-amount-error" : undefined
+                    }
+                  />
+                </Field>
+              </>
+            )}
+
             {/* Notes (full width) */}
             <div className="sm:col-span-2">
               <Field label="Notes" htmlFor="sub-notes">
@@ -628,13 +800,7 @@ export default function SubscriptionModal({
               </Field>
             </div>
 
-            {/* Toggles */}
-            <Toggle
-              id="sub-active"
-              label="Active"
-              checked={form.isActive}
-              onChange={(checked) => set("isActive", checked)}
-            />
+            {/* Auto-renew toggle */}
             <Toggle
               id="sub-auto-renew"
               label="Auto-renew"
@@ -659,7 +825,7 @@ export default function SubscriptionModal({
               type="button"
               onClick={onClose}
               className={cn(
-                "inline-flex items-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary/60",
+                "inline-flex items-center rounded-lg border border-input bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-secondary/60",
                 FOCUS_RING,
               )}
             >
@@ -669,7 +835,7 @@ export default function SubscriptionModal({
               type="submit"
               disabled={saving}
               className={cn(
-                "inline-flex items-center rounded-md bg-accent px-4 py-2 text-sm font-medium text-accent-foreground hover:opacity-90 disabled:opacity-50",
+                "inline-flex items-center rounded-lg bg-accent px-4 py-2 text-sm font-medium text-accent-foreground hover:opacity-90 disabled:opacity-50",
                 FOCUS_RING,
               )}
             >
@@ -717,6 +883,59 @@ function Field({
           {error}
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * The segmented three-way State control (AD-17): an accessible `radiogroup` of
+ * text-labelled Active / Paused / Trial options. Each option is a real
+ * `role="radio"` button reached by Tab (each is a focusable button; there is no
+ * roving tabindex, so Arrow keys do not move selection) and selected with
+ * Space/Enter (native button activation), with a visible focus ring. State is
+ * conveyed by its TEXT label, never color alone.
+ */
+function StateControl({
+  groupId,
+  value,
+  onChange,
+}: {
+  groupId: string;
+  value: SubscriptionState;
+  onChange: (next: SubscriptionState) => void;
+}): JSX.Element {
+  return (
+    <div className="space-y-1.5">
+      <span id={`${groupId}-label`} className="block text-sm font-medium text-foreground">
+        State
+      </span>
+      <div
+        role="radiogroup"
+        aria-labelledby={`${groupId}-label`}
+        className="inline-flex rounded-md border border-input p-0.5"
+      >
+        {STATES.map((option) => {
+          const selected = value === option;
+          return (
+            <button
+              key={option}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => onChange(option)}
+              className={cn(
+                "rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                FOCUS_RING,
+                selected
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {option}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

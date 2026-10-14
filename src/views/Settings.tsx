@@ -43,7 +43,7 @@ import { FolderOpen } from "lucide-react";
 
 import type {
   ReminderLeadTime,
-  Settings as SettingsModel,
+  SettingsV2 as SettingsModel,
 } from "core/models/settings";
 import { settingsApi, toAppError } from "@/api/subby";
 import { settingsStore } from "@/stores/settingsStore";
@@ -173,13 +173,13 @@ export default function Settings(): JSX.Element {
           <select
             id="setting-currency"
             className={SELECT_CLASS}
-            value={settings.defaultCurrency}
-            onChange={(e) => void persist({ defaultCurrency: e.target.value })}
+            value={settings.homeCurrency}
+            onChange={(e) => void persist({ homeCurrency: e.target.value })}
           >
             {/* Ensure the current value is selectable even if not in the list. */}
-            {!CURRENCIES.includes(settings.defaultCurrency) && (
-              <option value={settings.defaultCurrency}>
-                {settings.defaultCurrency}
+            {!CURRENCIES.includes(settings.homeCurrency) && (
+              <option value={settings.homeCurrency}>
+                {settings.homeCurrency}
               </option>
             )}
             {CURRENCIES.map((code) => (

@@ -65,7 +65,7 @@ import { dialog, type BrowserWindow, type FileFilter } from "electron";
 
 import { SYNCED_FOLDER_CAVEAT, type AppServices, type DataFormat } from "../appWiring";
 import type { ImportOutcome } from "core/import";
-import type { Settings } from "core/models/settings";
+import type { SettingsV2 } from "core/models/settings";
 import type { ConflictMode } from "shared/types";
 
 /** Default file name suggested in the export save dialog (Req 17.1, 17.2). */
@@ -177,7 +177,7 @@ export type ChooseDataFolderResult =
   | {
       cancelled: false;
       path: string;
-      settings: Settings;
+      settings: SettingsV2;
       /**
        * The single-machine synced-folder caveat (AD-31, Story 1.7). Always
        * carried on a successful folder choice so the IPC/UI layer can surface it

@@ -13,19 +13,28 @@
  *   so closer/contiguous matches rank higher (Req 12.1).
  */
 
-import type { Subscription } from "./models/subscription";
+/**
+ * The only subscription fields fuzzy search reads: `name` and `provider`.
+ * Structural so it serves both v1 `Subscription` and v2 `SubscriptionV2` (the
+ * fields are identical across versions).
+ */
+interface SearchableSubscription {
+  name: string;
+  provider: string;
+}
 
 /**
  * Return subscriptions whose `name` or `provider` approximately matches
  * `query`, ordered by match quality (best first).
  *
- * An empty or whitespace-only query returns all subscriptions unchanged
- * (Req 12.3).
+ * Generic over any subscription-like value `T` carrying `name`/`provider`, so
+ * it serves the v2 list/palette unchanged. An empty or whitespace-only query
+ * returns all subscriptions unchanged (Req 12.3).
  */
-export function fuzzySearch(
-  subs: Subscription[],
+export function fuzzySearch<T extends SearchableSubscription>(
+  subs: T[],
   query: string,
-): Subscription[] {
+): T[] {
   const q = query.trim().toLowerCase();
   if (q === "") return subs; // Req 12.3
 

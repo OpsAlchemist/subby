@@ -24,8 +24,9 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Search } from "lucide-react";
 
-import type { Subscription } from "core/models/subscription";
+import type { SubscriptionV2 } from "core/models/subscription";
 import { fuzzySearch } from "core/search";
+import { toMajor } from "core/money";
 import { cn } from "@/lib/utils";
 import { subscriptionsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
@@ -36,7 +37,7 @@ export interface GlobalSearchProps {
   /** Close handler — invoked on Escape, backdrop click, or after a selection. */
   onClose: () => void;
   /** Optional: invoked with the chosen subscription before the palette closes. */
-  onSelect?: (sub: Subscription) => void;
+  onSelect?: (sub: SubscriptionV2) => void;
 }
 
 /** Stable DOM id for a result option, used for `aria-activedescendant`. */
@@ -223,7 +224,8 @@ export default function GlobalSearch({
                     )}
                   </span>
                   <span className="shrink-0 text-xs text-muted-foreground">
-                    {sub.currency} {sub.amount} · {sub.billingCycle}
+                    {sub.currency} {toMajor(sub.amountMinor, sub.currency)} ·{" "}
+                    {sub.billingCycle}
                   </span>
                 </li>
               );

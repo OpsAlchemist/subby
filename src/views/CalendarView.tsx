@@ -29,7 +29,8 @@
 
 import { useMemo, useState } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
-import type { Subscription } from "core/models/subscription";
+import type { SubscriptionV2 } from "core/models/subscription";
+import { toMajor } from "core/money";
 import { subscriptionsStore } from "@/stores/subscriptionsStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
@@ -51,15 +52,21 @@ import {
 const focusRing =
   "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 
-/** Format an amount in its subscription currency, falling back gracefully. */
-function formatCurrency(amount: number, currency: string): string {
+/**
+ * Format a subscription's native amount (integer minor units) in its own
+ * currency, falling back gracefully. The minor units are rendered to a major
+ * display string via the money seam, then formatted.
+ */
+function formatCurrency(amountMinor: number, currency: string): string {
+  const major = toMajor(amountMinor, currency);
+  const amount = Number(major);
   try {
     return new Intl.NumberFormat(undefined, {
       style: "currency",
       currency,
     }).format(amount);
   } catch {
-    return `${currency} ${amount.toFixed(2)}`;
+    return `${currency} ${major}`;
   }
 }
 
@@ -92,7 +99,7 @@ function DayDetailPanel({
   subs,
 }: {
   selectedDate: string | null;
-  subs: Subscription[];
+  subs: SubscriptionV2[];
 }): JSX.Element {
   return (
     <aside
@@ -117,7 +124,7 @@ function DayDetailPanel({
                   <div className="flex items-center justify-between gap-3">
                     <span className="min-w-0 truncate font-medium">{s.name}</span>
                     <span className="shrink-0 text-sm font-medium">
-                      {formatCurrency(s.amount, s.currency)}
+                      {formatCurrency(s.amountMinor, s.currency)}
                     </span>
                   </div>
                   <p className="text-xs text-muted-foreground">{s.billingCycle}</p>

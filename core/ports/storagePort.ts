@@ -12,20 +12,20 @@
  */
 
 import type { Category } from "../models/category";
-import type { Settings } from "../models/settings";
+import type { SettingsV2 } from "../models/settings";
 import type {
-  Subscription,
-  SubscriptionsFile,
+  SubscriptionsFileV2,
+  SubscriptionV2,
 } from "../models/subscription";
 
 export interface StoragePort {
-  // Subscriptions
-  readSubscriptions(): Promise<Subscription[]>;
-  writeSubscriptions(subs: Subscription[]): Promise<void>;
+  // Subscriptions (v2 live model — Story 3.3 cutover)
+  readSubscriptions(): Promise<SubscriptionV2[]>;
+  writeSubscriptions(subs: SubscriptionV2[]): Promise<void>;
 
-  // Settings
-  readSettings(): Promise<Settings>;
-  writeSettings(settings: Settings): Promise<void>;
+  // Settings (v2: `homeCurrency` + the `online` block — AD-22)
+  readSettings(): Promise<SettingsV2>;
+  writeSettings(settings: SettingsV2): Promise<void>;
 
   // Categories
   readCategories(): Promise<Category[]>;
@@ -34,7 +34,7 @@ export interface StoragePort {
   // Backups
   createBackup(reason: string): Promise<string>; // returns backup filename
   listBackups(): Promise<string[]>;
-  readBackup(name: string): Promise<SubscriptionsFile>;
+  readBackup(name: string): Promise<SubscriptionsFileV2>;
 
   // Data folder (Req 15.3)
   getDataFolder(): string;
