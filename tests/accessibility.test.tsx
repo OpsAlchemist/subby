@@ -192,6 +192,24 @@ async function seedStores(): Promise<void> {
 }
 
 beforeEach(async () => {
+  // jsdom implements neither Element.scrollIntoView nor matchMedia; the Cmd-K
+  // palette and the Story 3.6 List highlight both use them. Stub so the
+  // palette-select → List glue test below runs (harmless for the other tests).
+  if (!HTMLElement.prototype.scrollIntoView) {
+    HTMLElement.prototype.scrollIntoView = () => {};
+  }
+  if (typeof window.matchMedia !== "function") {
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  }
   await seedStores();
 });
 
@@ -327,6 +345,45 @@ describe("Accessibility: keyboard navigation (Req 22.1, 22.2)", () => {
 
     const dialog = await screen.findByRole("dialog", { name: "Add subscription" });
     expect(dialog).toBeInTheDocument();
+  });
+});
+
+// --- Palette → List highlight glue (Story 3.6, FR-5) -------------------------
+
+describe("Global Search palette → List highlight glue (Story 3.6, FR-5)", () => {
+  it("switches to the List and highlights the chosen row when a palette result is selected", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+
+    // First paint is the Dashboard.
+    expect(screen.getByRole("main")).toHaveAttribute("aria-label", "Dashboard");
+
+    // Open the Cmd-K palette via the top-bar Global Search trigger.
+    await user.click(screen.getByRole("button", { name: /search subscriptions/i }));
+    const palette = await screen.findByRole("dialog", {
+      name: "Search subscriptions",
+    });
+
+    // Select the first result (Netflix, sub-1) with Enter.
+    const firstOption = within(palette).getAllByRole("option")[0];
+    expect(firstOption).toHaveTextContent("Netflix");
+    await user.keyboard("{Enter}");
+
+    // The view switched to the List…
+    await waitFor(() =>
+      expect(screen.getByRole("main")).toHaveAttribute("aria-label", "List"),
+    );
+
+    // …and the chosen subscription's row carries the transient accent-tint
+    // highlight (asserts App actually threaded sub.id → highlightId → the List,
+    // not a dropped or wrong value).
+    await waitFor(() => {
+      const table = screen.getByRole("table");
+      const netflixRow = within(table)
+        .getByLabelText("Select Netflix")
+        .closest("tr") as HTMLElement;
+      expect(netflixRow.className).toContain("bg-accent/15");
+    });
   });
 });
 

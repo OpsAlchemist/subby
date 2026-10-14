@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import type React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -158,6 +159,34 @@ async function renderList(
   await screen.findByRole("table");
 }
 
+/**
+ * Like {@link renderList} but passes the Story 3.6 palette-arrival highlight
+ * props so the view scrolls/highlights `highlightId` and clears it via
+ * `onHighlightConsumed`. Returns the rerender fn + the consume spy.
+ */
+async function renderListWithHighlight(
+  subs: SubscriptionV2[],
+  highlightId: string | null,
+  categories: Category[] = [],
+): Promise<{
+  rerender: (ui: React.ReactElement) => void;
+  onHighlightConsumed: ReturnType<typeof vi.fn>;
+}> {
+  fake.state.subscriptions = subs;
+  fake.state.categories = categories;
+  teardown = initStores();
+  await waitFor(() => expect(subscriptionsStore.getSnapshot().loaded).toBe(true));
+  const onHighlightConsumed = vi.fn();
+  const { rerender } = render(
+    <SubscriptionList
+      highlightId={highlightId}
+      onHighlightConsumed={onHighlightConsumed}
+    />,
+  );
+  await screen.findByRole("table");
+  return { rerender, onHighlightConsumed };
+}
+
 /** The subscription names of the data rows, in table (DOM) order. */
 function tableRowNames(): string[] {
   const table = screen.getByRole("table");
@@ -173,6 +202,24 @@ function tableRowNames(): string[] {
 beforeEach(() => {
   fake = createFakeApi();
   setSubby(fake);
+  // jsdom implements neither Element.scrollIntoView nor matchMedia; the Story
+  // 3.6 highlight uses both. Stub them so the highlight path runs under test.
+  if (!HTMLElement.prototype.scrollIntoView) {
+    HTMLElement.prototype.scrollIntoView = () => {};
+  }
+  vi.spyOn(HTMLElement.prototype, "scrollIntoView").mockImplementation(() => {});
+  if (typeof window.matchMedia !== "function") {
+    window.matchMedia = ((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+  }
 });
 
 afterEach(() => {
@@ -779,5 +826,145 @@ describe("new-surface accessibility (Story 3.5)", () => {
       (v) => v.impact === "serious" || v.impact === "critical",
     );
     expect(serious.map((v) => v.id)).toEqual([]);
+  });
+});
+
+// --- Palette-arrival highlight (Story 3.6, FR-5) -----------------------------
+
+describe("palette-arrival highlight (Story 3.6, FR-5)", () => {
+  /** The matching table row for a subscription id (its Select checkbox's row). */
+  function tableRowFor(name: string): HTMLElement {
+    const table = screen.getByRole("table");
+    const checkbox = within(table).getByLabelText(`Select ${name}`);
+    return checkbox.closest("tr") as HTMLElement;
+  }
+
+  it("scrolls the matching row into view, paints a transient accent tint, and clears via onHighlightConsumed", async () => {
+    const { onHighlightConsumed } = await renderListWithHighlight(
+      [
+        makeSub({ id: "a", name: "Netflix" }),
+        makeSub({ id: "b", name: "Spotify" }),
+      ],
+      "b", // highlight Spotify
+    );
+
+    // The matching row carries the DECORATIVE accent tint (not the solid fill).
+    await waitFor(() => {
+      const row = tableRowFor("Spotify");
+      expect(row.className).toContain("bg-accent/15");
+    });
+
+    // The scroll target was asked to come into view.
+    expect(HTMLElement.prototype.scrollIntoView).toHaveBeenCalled();
+
+    // The highlight is ephemeral: App is told to drop the id immediately.
+    expect(onHighlightConsumed).toHaveBeenCalledTimes(1);
+
+    // It never entangled with bulk selection: the row's checkbox stays unchecked.
+    const table = screen.getByRole("table");
+    expect(within(table).getByLabelText("Select Spotify")).not.toBeChecked();
+    // The non-highlighted row has no tint.
+    expect(tableRowFor("Netflix").className).not.toContain("bg-accent/15");
+  });
+
+  it("makes a filtered-OUT target reachable by clearing the local search before highlighting", async () => {
+    const user = userEvent.setup();
+    // Render WITHOUT a highlight first so we can set a local search that hides
+    // the target, then rerender with the highlight (as App would on palette select).
+    const { rerender, onHighlightConsumed } = await renderListWithHighlight(
+      [
+        makeSub({ id: "a", name: "Netflix" }),
+        makeSub({ id: "b", name: "Spotify" }),
+      ],
+      null,
+    );
+
+    // A local search that hides Spotify (only Netflix matches "net").
+    await user.type(screen.getByLabelText("Search subscriptions"), "net");
+    await waitFor(() => expect(tableRowNames()).toEqual(["Netflix"]));
+
+    // Now App threads in highlightId "b" (Spotify) — currently filtered out.
+    rerender(
+      <SubscriptionList highlightId="b" onHighlightConsumed={onHighlightConsumed} />,
+    );
+
+    // The local search is cleared so the row is reachable, and it is highlighted.
+    await waitFor(() => {
+      expect(tableRowNames()).toEqual(["Netflix", "Spotify"]);
+      expect(tableRowFor("Spotify").className).toContain("bg-accent/15");
+    });
+    // The search box was reset to empty.
+    expect(screen.getByLabelText("Search subscriptions")).toHaveValue("");
+    expect(onHighlightConsumed).toHaveBeenCalled();
+  });
+
+  it("consumes a highlightId that names no existing subscription without highlighting anything", async () => {
+    const { onHighlightConsumed } = await renderListWithHighlight(
+      [makeSub({ id: "a", name: "Netflix" })],
+      "does-not-exist",
+    );
+
+    // Nothing is tinted; App is still told to drop the dangling id.
+    await waitFor(() => expect(onHighlightConsumed).toHaveBeenCalled());
+    expect(tableRowFor("Netflix").className).not.toContain("bg-accent/15");
+  });
+
+  it("clears the transient tint after its interval, even though App nulls highlightId immediately", async () => {
+    // Regression guard: the clear-timer must survive `onHighlightConsumed`
+    // nulling `highlightId` on the next render. If the timer lived in the same
+    // effect keyed on `highlightId`, that effect's cleanup would cancel it and
+    // the tint would persist forever. Render under real timers (the store load
+    // needs them), then assert the tint is eventually removed.
+    await renderListWithHighlight(
+      [
+        makeSub({ id: "a", name: "Netflix" }),
+        makeSub({ id: "b", name: "Spotify" }),
+      ],
+      "b", // highlight Spotify
+    );
+
+    // The tint is painted on arrival.
+    expect(tableRowFor("Spotify").className).toContain("bg-accent/15");
+
+    // After the highlight interval (2s) elapses, the tint clears itself —
+    // proving the clear-timer was NOT cancelled when App dropped highlightId.
+    await waitFor(
+      () =>
+        expect(tableRowFor("Spotify").className).not.toContain("bg-accent/15"),
+      { timeout: 3000 },
+    );
+  });
+
+  it("snaps the scroll (behavior:'auto') when prefers-reduced-motion is set", async () => {
+    // Override the beforeEach matchMedia stub to report reduced-motion ON for
+    // the reduced-motion query, so the highlight scroll must snap (no animation).
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(prefers-reduced-motion: reduce)",
+      media: query,
+      onchange: null,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      addListener: () => {},
+      removeListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+
+    await renderListWithHighlight(
+      [
+        makeSub({ id: "a", name: "Netflix" }),
+        makeSub({ id: "b", name: "Spotify" }),
+      ],
+      "b", // highlight Spotify
+    );
+
+    const scrollSpy = HTMLElement.prototype.scrollIntoView as ReturnType<
+      typeof vi.fn
+    >;
+    await waitFor(() => expect(scrollSpy).toHaveBeenCalled());
+    // The matching call snaps rather than animating under reduced-motion.
+    const snapped = scrollSpy.mock.calls.some(
+      (c) => (c[0] as ScrollIntoViewOptions | undefined)?.behavior === "auto",
+    );
+    expect(snapped).toBe(true);
   });
 });

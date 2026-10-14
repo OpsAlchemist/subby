@@ -210,10 +210,36 @@ function groupSubscriptions(subs: SubscriptionV2[], groupBy: GroupBy): RowGroup[
 // --- Component ---------------------------------------------------------------
 
 /**
+ * Props for the Subscription List view. Both are optional so the view renders
+ * standalone (e.g. via the nav rail) and only receives a highlight when reached
+ * through the Global Search palette (Story 3.6, FR-5).
+ */
+export interface SubscriptionListProps {
+  /**
+   * A subscription id to transiently highlight once (set by App when a palette
+   * result is chosen). The view scrolls that row into view and paints a
+   * decorative accent-TINT highlight, then calls {@link onHighlightConsumed}.
+   * It is NEVER merged into `selectedIds` and NEVER persisted.
+   */
+  highlightId?: string | null;
+  /** Called after the highlight has been applied so App can clear `highlightId`. */
+  onHighlightConsumed?: () => void;
+}
+
+/**
+ * How long the transient palette-arrival highlight stays painted before it is
+ * cleared (Story 3.6). Short enough to read as a flash, long enough to notice.
+ */
+const HIGHLIGHT_DURATION_MS = 2000;
+
+/**
  * The Subscription List view. See the module docstring for the derivation
  * pipeline and accessibility/responsiveness notes.
  */
-export default function SubscriptionList(): JSX.Element {
+export default function SubscriptionList({
+  highlightId = null,
+  onHighlightConsumed,
+}: SubscriptionListProps = {}): JSX.Element {
   const subscriptions = useStoreData(subscriptionsStore);
   const categories = useStoreData(categoriesStore);
 
@@ -227,6 +253,10 @@ export default function SubscriptionList(): JSX.Element {
   const [groupBy, setGroupBy] = useState<GroupBy>("none");
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [edit, setEdit] = useState<EditState | null>(null);
+  // The id of the row currently painted with the transient palette-arrival
+  // highlight (Story 3.6). This is DECORATIVE accent-tint styling only — kept
+  // entirely separate from `selectedIds` so it never entangles with bulk state.
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
   // The pending bulk-delete request, if any — mounts the branded ConfirmDialog
   // naming the exact impact (count) instead of the native `window.confirm`.
   const [pendingDelete, setPendingDelete] = useState<string[] | null>(null);
@@ -237,6 +267,36 @@ export default function SubscriptionList(): JSX.Element {
   // The element that opened the current quick-edit (a QuickEditButton), so Esc
   // can return focus to the originating cell trigger (Req 9.7 / Story 3.5).
   const editTriggerRef = useRef<HTMLElement | null>(null);
+  // Map of subscription id → its rendered row element for the palette-arrival
+  // scroll target (Story 3.6). Both layouts (the wide `<tr>` and the narrow
+  // card) can be in the DOM at once (jsdom, or during a CSS breakpoint change),
+  // so the table row is PREFERRED when both are present; either is a correct
+  // scroll target for the same subscription.
+  const rowRefs = useRef<Map<string, HTMLElement>>(new Map());
+
+  /**
+   * Register a row element for `id`, preferring the table `<tr>` over the card.
+   * Called from inline ref callbacks on both layouts; a `null` element (unmount)
+   * only clears the map entry when it is the element being removed.
+   */
+  function registerRow(
+    id: string,
+    el: HTMLElement | null,
+    isTableRow: boolean,
+  ): void {
+    if (el) {
+      const existing = rowRefs.current.get(id);
+      // The table row wins; a card never overwrites an already-registered row.
+      if (isTableRow || !existing) rowRefs.current.set(id, el);
+    } else {
+      // Unmount: drop the entry only if it still points at THIS element's kind
+      // (avoids a card unmount wiping a live table-row registration).
+      const existing = rowRefs.current.get(id);
+      if (existing && (existing.tagName === "TR") === isTableRow) {
+        rowRefs.current.delete(id);
+      }
+    }
+  }
 
   // --- Derivation pipeline: search → filter → sort → group -------------------
 
@@ -296,6 +356,67 @@ export default function SubscriptionList(): JSX.Element {
       selectAllRef.current.indeterminate = someVisibleSelected && !allVisibleSelected;
     }
   }, [someVisibleSelected, allVisibleSelected]);
+
+  // --- Palette-arrival highlight (Story 3.6, FR-5) ---------------------------
+  //
+  // When App threads in a non-null `highlightId` (a subscription chosen in the
+  // Cmd-K palette), scroll that row into view and paint a transient accent-TINT
+  // highlight on it, then clear it after a short, reduced-motion-respecting
+  // interval and tell App to drop the id. This never touches `selectedIds` or
+  // the filter/sort/group pipeline. If the target is currently filtered OUT of
+  // the view, the local search/filter state is reset FIRST so the row is always
+  // reachable — a highlighted row the user cannot see would be useless.
+  useEffect(() => {
+    if (!highlightId) return;
+    // The target must exist in the store to be highlightable at all.
+    if (!subscriptions.some((s) => s.id === highlightId)) {
+      onHighlightConsumed?.();
+      return;
+    }
+
+    // If the row is hidden by the current local search/filters, clear them so
+    // it becomes visible, then wait for the re-render (this effect re-runs when
+    // `visibleIds` updates) before scrolling/painting.
+    if (!visibleIds.includes(highlightId)) {
+      setQuery("");
+      setFilterCategory("all");
+      setFilterTag("all");
+      setFilterStatus("all");
+      setFilterCycle("all");
+      return;
+    }
+
+    // The row is now in the DOM: scroll it into view and paint the highlight.
+    const node = rowRefs.current.get(highlightId);
+    const reduceMotion =
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    node?.scrollIntoView({
+      block: "nearest",
+      behavior: reduceMotion ? "auto" : "smooth",
+    });
+    setHighlightedId(highlightId);
+    // Clear App's id now that the highlight is applied (ephemeral — never
+    // persisted). The painted tint lingers locally for the interval below.
+    onHighlightConsumed?.();
+    // `visibleIds` is a dep so the effect re-runs after filters are cleared.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlightId, visibleIds]);
+
+  // Clear the transient tint after its interval. Keyed on the LOCAL
+  // `highlightedId`, NOT `highlightId` — App nulls `highlightId` synchronously
+  // via `onHighlightConsumed`, which would otherwise re-run the effect above and
+  // cancel this timer the instant the id is consumed, leaving the tint painted
+  // forever. A separate effect keyed on the local state owns the lifecycle.
+  useEffect(() => {
+    if (!highlightedId) return;
+    const timer = window.setTimeout(
+      () => setHighlightedId(null),
+      HIGHLIGHT_DURATION_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [highlightedId]);
 
   // --- Handlers --------------------------------------------------------------
 
@@ -743,9 +864,14 @@ export default function SubscriptionList(): JSX.Element {
                 {group.items.map((sub) => (
                   <tr
                     key={sub.id}
+                    ref={(el) => registerRow(sub.id, el, true)}
                     className={cn(
-                      "border-b border-border last:border-0",
+                      "border-b border-border last:border-0 transition-colors",
                       selectedIds.has(sub.id) && "bg-secondary/30",
+                      // Transient palette-arrival highlight: a DECORATIVE accent
+                      // tint (not the solid accent fill — a row is content, not
+                      // an action), separate from selection (Story 3.6, FR-5).
+                      highlightedId === sub.id && "bg-accent/15",
                     )}
                   >
                     <td className="px-3 py-2">
@@ -846,9 +972,12 @@ export default function SubscriptionList(): JSX.Element {
               {group.items.map((sub) => (
                 <div
                   key={sub.id}
+                  ref={(el) => registerRow(sub.id, el, false)}
                   className={cn(
-                    "rounded-md border border-border bg-card p-3",
+                    "rounded-md border border-border bg-card p-3 transition-colors",
                     selectedIds.has(sub.id) && "ring-1 ring-ring",
+                    // Same transient accent-tint highlight as the table row.
+                    highlightedId === sub.id && "bg-accent/15",
                   )}
                 >
                   <div className="flex items-start gap-3">

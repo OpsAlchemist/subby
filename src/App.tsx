@@ -109,12 +109,25 @@ const focusRingOnAccent =
  * Render the active view. Calendar/Analytics are lazy and wrapped in Suspense
  * by the caller. The other views are eager and cheap.
  */
-function ActiveView({ view }: { view: ViewKey }): JSX.Element {
+function ActiveView({
+  view,
+  highlightId,
+  onHighlightConsumed,
+}: {
+  view: ViewKey;
+  highlightId: string | null;
+  onHighlightConsumed: () => void;
+}): JSX.Element {
   switch (view) {
     case "dashboard":
       return <Dashboard />;
     case "list":
-      return <SubscriptionList />;
+      return (
+        <SubscriptionList
+          highlightId={highlightId}
+          onHighlightConsumed={onHighlightConsumed}
+        />
+      );
     case "calendar":
       return <CalendarView />;
     case "analytics":
@@ -153,6 +166,13 @@ export default function App(): JSX.Element {
   // Global Search command palette open state (task 22). Opened by the top-bar
   // search trigger or the Cmd/Ctrl-K shortcut (Req 22.2).
   const [searchOpen, setSearchOpen] = useState(false);
+
+  // The subscription id to transiently highlight in the List after a palette
+  // selection (Story 3.6, FR-5). Threaded into SubscriptionList; the List clears
+  // it via `onHighlightConsumed` once the highlight has been shown, so it is
+  // ephemeral (never persisted, never part of `selectedIds`). The app has no
+  // router/URL params/UI store — this prop thread matches the in-memory routing.
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
   // Theme wiring (task 25, Req 14): subscribe to the settings store and apply
   // the theme + accent whenever they change, and follow OS appearance while the
@@ -389,7 +409,11 @@ export default function App(): JSX.Element {
               </div>
             }
           >
-            <ActiveView view={view} />
+            <ActiveView
+              view={view}
+              highlightId={highlightId}
+              onHighlightConsumed={() => setHighlightId(null)}
+            />
           </Suspense>
         </main>
       </div>
@@ -398,11 +422,16 @@ export default function App(): JSX.Element {
       <SubscriptionModal open={addOpen} onClose={() => setAddOpen(false)} />
 
       {/* Global Search command palette (task 22). On select, jump to the List
-          view and close; the list owns per-row navigation/editing. */}
+          view and transiently highlight the chosen subscription's row (Story
+          3.6, FR-5); the palette returns focus to its trigger on close. The
+          List consumes `highlightId` and clears it via onHighlightConsumed. */}
       <GlobalSearch
         open={searchOpen}
         onClose={() => setSearchOpen(false)}
-        onSelect={() => setView("list")}
+        onSelect={(sub) => {
+          setHighlightId(sub.id);
+          setView("list");
+        }}
       />
     </div>
   );

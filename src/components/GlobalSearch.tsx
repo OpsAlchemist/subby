@@ -57,6 +57,10 @@ export default function GlobalSearch({
 
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  // The element focused before the palette opened — focus returns here on close
+  // (Escape, backdrop, or selection), mirroring ConfirmDialog/SubscriptionModal.
+  const previouslyFocused = useRef<HTMLElement | null>(null);
 
   const titleId = useId();
   const listId = useId();
@@ -68,13 +72,25 @@ export default function GlobalSearch({
   );
 
   // Reset the query and selection each time the palette opens, and focus the
-  // input after paint so it is immediately keyboard-driven (Req 22.2).
+  // input after paint so it is immediately keyboard-driven (Req 22.2). Capture
+  // the previously-focused element on open and restore it on close so focus
+  // returns to the top-bar trigger that opened the palette (DESIGN focus-return;
+  // mirrors ConfirmDialog/SubscriptionModal).
   useEffect(() => {
     if (!open) return;
     setQuery("");
     setActiveIndex(0);
+    previouslyFocused.current =
+      (document.activeElement as HTMLElement | null) ?? null;
     const id = window.setTimeout(() => inputRef.current?.focus(), 0);
-    return () => window.clearTimeout(id);
+    return () => {
+      window.clearTimeout(id);
+      // Only restore focus if the trigger is still in the document — a detached
+      // or absent node would silently drop focus to document.body.
+      if (previouslyFocused.current?.isConnected) {
+        previouslyFocused.current.focus();
+      }
+    };
   }, [open]);
 
   // Keep the highlighted index within bounds as the result set changes.
@@ -104,8 +120,41 @@ export default function GlobalSearch({
     onClose();
   }
 
-  /** Keyboard-first navigation: arrows move, Enter selects, Escape closes. */
+  /** Keyboard-first navigation: arrows move, Enter selects, Escape closes; Tab trapped. */
   function handleKeyDown(event: React.KeyboardEvent<HTMLDivElement>): void {
+    // Focus trap: keep Tab/Shift-Tab within the dialog (mirrors ConfirmDialog).
+    // The results are driven by `aria-activedescendant` (not real focus), so the
+    // input is the only natural tab stop — cycle focusables and keep focus from
+    // escaping to the page behind the overlay.
+    if (event.key === "Tab") {
+      const focusables = dialogRef.current?.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      );
+      if (!focusables || focusables.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      // With a single focusable (the input, today), Tab must be a no-op that
+      // keeps focus on it rather than escaping — preventDefault unconditionally
+      // whenever focus is within the dialog. This stays correct if a second
+      // control is ever added (the first/last wrap below then takes over).
+      if (focusables.length <= 1) {
+        if (dialogRef.current?.contains(active)) event.preventDefault();
+        return;
+      }
+      if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+      return;
+    }
+
     switch (event.key) {
       case "Escape":
         event.preventDefault();
@@ -146,6 +195,7 @@ export default function GlobalSearch({
       }}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -210,8 +260,17 @@ export default function GlobalSearch({
                   }}
                   className={cn(
                     "flex cursor-pointer items-center justify-between gap-3 rounded-md px-3 py-2 text-sm",
+                    // The keyboard-active row uses the ACCENT as its selected
+                    // background (focus/selected = accent discipline), matching
+                    // active-nav and the primary button (DESIGN "Global search").
+                    // Accent-fill rule: the focus ring renders in the element
+                    // FOREGROUND (never accent-on-accent), offset against the
+                    // card surface — mirroring App.tsx `focusRingOnAccent`. The
+                    // row is not natively focusable, so the ring is for
+                    // parity/hover-focus; `aria-selected` is the SR signal.
                     selected
-                      ? "bg-secondary text-secondary-foreground"
+                      ? "bg-accent text-accent-foreground " +
+                        "outline-none focus-visible:ring-2 focus-visible:ring-accent-foreground focus-visible:ring-offset-2 focus-visible:ring-offset-card"
                       : "text-foreground hover:bg-secondary/60",
                   )}
                 >
