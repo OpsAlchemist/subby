@@ -21,6 +21,7 @@ export const fileNames = {
   subscriptions: "subscriptions.json",
   settings: "settings.json",
   categories: "categories.json",
+  reminderLedger: "reminder-ledger.json",
   backupDir: "backup",
 } as const;
 

@@ -33,10 +33,13 @@ import { basename, join } from "node:path";
 
 import {
   categoriesFileSchema,
+  defaultReminderLedger,
   DEFAULT_CATEGORIES,
   DEFAULT_CATEGORY_COLORS,
   DEFAULT_SETTINGS,
   DEFAULT_SETTINGS_V2,
+  reminderLedgerFileSchema,
+  REMINDER_LEDGER_VERSION,
   settingsFileSchema,
   settingsFileV2Schema,
   subscriptionsFileSchema,
@@ -46,6 +49,7 @@ import { assignDefaultColors } from "core/categories";
 import { assembleBackupPayload, backupFileName } from "core/backup";
 import { migrate } from "core/migrations";
 import type { Category } from "core/models/category";
+import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsFileV2, SettingsV2 } from "core/models/settings";
 import type {
   SubscriptionsFileV2,
@@ -379,6 +383,10 @@ export class JsonFileStorage implements StoragePort {
 
   private get categoriesPath(): string {
     return join(this.dataDir, fileNames.categories);
+  }
+
+  private get reminderLedgerPath(): string {
+    return join(this.dataDir, fileNames.reminderLedger);
   }
 
   /**
@@ -874,6 +882,107 @@ export class JsonFileStorage implements StoragePort {
     // default therefore stays cleared.
     const file = { version: this.current, colorsSeeded: true, categories };
     await writeJsonAtomic(this.categoriesPath, file);
+  }
+
+  // --- Reminder ledger (Epic 4, Story 4.1 — AD-18 / AD-19) -------------------
+
+  /**
+   * Read the persisted fired-reminder ledger (`reminder-ledger.json`).
+   *
+   * The ledger is the app's EXACTLY-ONCE dedupe memory, so a read must
+   * distinguish a genuinely-absent file from a merely-unreadable one. This
+   * branches on `safeReadVersionedJson`'s `detected.reason` EXPLICITLY — it does
+   * NOT collapse every `!ok` into one reset — per the amended recovery policy:
+   *
+   *   (a) MISSING (ENOENT, first run) → establish, WRITE ONCE, and return a fresh
+   *       empty ledger. This is the ONE allowed read-path write.
+   *   (b) CONTENT-CORRUPT (bad JSON / not a versioned object / fails the schema at
+   *       `== current`) → return a fresh empty ledger IN MEMORY with NO write;
+   *       4.2's next real write self-heals the file. A corrupt dedupe memory
+   *       degrades to "may re-fire", which is acceptable — silently CLOBBERING a
+   *       possibly-recoverable file must not be the read's doing.
+   *   (c) TRANSIENT READ FAILURE (a non-ENOENT `readFile` error — EACCES / EBUSY
+   *       / partial read) → ALSO return a fresh empty ledger in memory with NO
+   *       write. CRITICAL: `safeReadVersionedJson` maps any non-ENOENT read error
+   *       to `reason:"malformed"`, so this is the SAME branch as (b) — the
+   *       no-write-on-malformed behavior is what prevents a passing I/O hiccup
+   *       from erasing persisted fired-state and re-arming every reminder. It is
+   *       load-bearing, not cosmetic.
+   *   (d) `version > current` → throw {@link StorageNewerVersionError}; the file
+   *       is left untouched (never downgrade-overwrite).
+   *
+   * Unlike the categories file (which THROWS `StorageCorruptError` on corrupt),
+   * the ledger deliberately DEGRADES-to-empty: it is recomputable scheduler state
+   * with no backup stream, so refusing the read would strand the scheduler. This
+   * is NOT parity with the categories throw posture — it is the opposite, by
+   * design.
+   */
+  async readReminderLedger(): Promise<ReminderLedger> {
+    await this.ensureTree();
+
+    const detected = await safeReadVersionedJson(this.reminderLedgerPath);
+
+    if (!detected.ok) {
+      if (detected.reason === "missing") {
+        // (a) MISSING (ENOENT): establish and WRITE a fresh empty ledger — the
+        // ONE allowed read-path write. Guard the write so a disk fault surfaces
+        // as the in-memory empty ledger rather than crashing a read that must
+        // never throw: a failed first-run write still returns a usable (if
+        // non-persisted) empty ledger; 4.2's next write retries persistence.
+        const fresh = defaultReminderLedger();
+        try {
+          await writeJsonAtomic(this.reminderLedgerPath, fresh);
+        } catch {
+          // Could not persist the fresh ledger (disk fault). Return it in memory
+          // for this pass — never crash the read.
+        }
+        return fresh;
+      }
+      // (b)/(c) CONTENT-CORRUPT or TRANSIENT READ FAILURE — both surface as
+      // `reason:"malformed"`. Return a fresh empty ledger IN MEMORY and do NOT
+      // overwrite the on-disk file. This no-write path is exactly what prevents a
+      // transient I/O hiccup (or a corrupt file that could still be recovered)
+      // from clobbering persisted fired-state. 4.2's next real write self-heals.
+      return defaultReminderLedger();
+    }
+
+    const { value, version } = detected;
+
+    // (d) `> current`: refuse, never downgrade-overwrite (file left untouched).
+    if (version > REMINDER_LEDGER_VERSION) {
+      throw new StorageNewerVersionError(
+        fileNames.reminderLedger,
+        version,
+        REMINDER_LEDGER_VERSION,
+      );
+    }
+
+    // `== current`: validate against the ledger schema. A schema-parse failure at
+    // the current version is CONTENT-CORRUPT — degrade to an in-memory empty
+    // ledger with NO overwrite (same no-clobber posture as (b)).
+    try {
+      return reminderLedgerFileSchema.parse(value);
+    } catch {
+      return defaultReminderLedger();
+    }
+  }
+
+  /**
+   * Persist the reminder ledger via the shared atomic writer (temp-then-rename).
+   * No backup stream — the ledger is recomputable scheduler state, deliberately
+   * NOT routed through the backup/restore path (per the story's Boundaries).
+   *
+   * This story only ever writes on the MISSING→recreate read path, and that
+   * first-run write needs no per-file lock: it is atomic (temp-then-rename) and
+   * idempotent (it writes a fresh EMPTY ledger, so a repeat only re-establishes
+   * the same empty default). `readReminderLedger` is NOT yet driven by the
+   * launch migration barrier (only subscriptions/settings/categories are) — the
+   * barrier/`appWiring` per-file-lock wiring arrives with the scheduler's
+   * read-modify-write mutator in a later story (4.2).
+   */
+  async writeReminderLedger(ledger: ReminderLedger): Promise<void> {
+    await this.ensureTree();
+    await writeJsonAtomic(this.reminderLedgerPath, ledger);
   }
 
   // --- Backups (Req 18.1, 18.2) ----------------------------------------------

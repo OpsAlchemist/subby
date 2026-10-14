@@ -6,10 +6,11 @@ import { join } from "node:path";
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import type { Category } from "core/models/category";
+import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionsFileV2, SubscriptionV2 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
-import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
+import { DEFAULT_SETTINGS_V2, defaultReminderLedger } from "core/models/schema";
 import type { SubscriptionInput } from "shared/types";
 
 /**
@@ -56,6 +57,7 @@ class InstrumentedStorage implements StoragePort {
   subscriptions: SubscriptionV2[] = [];
   settings: SettingsV2 = { ...DEFAULT_SETTINGS_V2 };
   categories: Category[] = [];
+  reminderLedger: ReminderLedger = defaultReminderLedger();
   backups: SubscriptionsFileV2[] = [];
   readonly log: string[] = [];
   private backupSeq = 0;
@@ -108,6 +110,28 @@ class InstrumentedStorage implements StoragePort {
     await microtaskGap();
     this.categories = categories.map((c) => ({ ...c }));
     this.log.push("write:cats:end");
+  }
+
+  async readReminderLedger(): Promise<ReminderLedger> {
+    this.log.push("read:ledger:start");
+    await microtaskGap();
+    this.log.push("read:ledger:end");
+    return {
+      version: this.reminderLedger.version,
+      lastRunAt: this.reminderLedger.lastRunAt,
+      fired: this.reminderLedger.fired.map((e) => ({ ...e })),
+    };
+  }
+
+  async writeReminderLedger(ledger: ReminderLedger): Promise<void> {
+    this.log.push("write:ledger:start");
+    await microtaskGap();
+    this.reminderLedger = {
+      version: ledger.version,
+      lastRunAt: ledger.lastRunAt,
+      fired: ledger.fired.map((e) => ({ ...e })),
+    };
+    this.log.push("write:ledger:end");
   }
 
   async createBackup(_reason: string): Promise<string> {

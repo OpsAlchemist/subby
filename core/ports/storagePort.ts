@@ -12,6 +12,7 @@
  */
 
 import type { Category } from "../models/category";
+import type { ReminderLedger } from "../models/reminder";
 import type { SettingsV2 } from "../models/settings";
 import type {
   SubscriptionsFileV2,
@@ -30,6 +31,16 @@ export interface StoragePort {
   // Categories
   readCategories(): Promise<Category[]>;
   writeCategories(categories: Category[]): Promise<void>;
+
+  // Reminder ledger (Epic 4): the persisted, versioned exactly-once dedupe
+  // memory for fired reminders. `readReminderLedger` degrades a missing/corrupt/
+  // transiently-unreadable file to a fresh empty ledger (see the adapter for the
+  // amended recovery policy — only a MISSING file is ever recreated on read). The
+  // one case it does NOT degrade is a file whose `version` is NEWER than the
+  // current ledger version: that THROWS `StorageNewerVersionError` and leaves the
+  // file untouched (never downgrade-overwrite).
+  readReminderLedger(): Promise<ReminderLedger>;
+  writeReminderLedger(ledger: ReminderLedger): Promise<void>;
 
   // Backups
   createBackup(reason: string): Promise<string>; // returns backup filename

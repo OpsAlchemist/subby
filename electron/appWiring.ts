@@ -62,7 +62,11 @@ export const SYNCED_FOLDER_CAVEAT =
  * subscriptions mutation and a settings mutation may run concurrently; only
  * same-file mutations are forced one-at-a-time.
  */
-type MutableFileKey = "subscriptions" | "settings" | "categories";
+type MutableFileKey =
+  | "subscriptions"
+  | "settings"
+  | "categories"
+  | "reminderLedger";
 
 /**
  * Build a set of per-file async mutexes (AD-29).

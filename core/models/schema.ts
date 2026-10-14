@@ -21,6 +21,7 @@ import type {
 import type { ReminderLeadTime, Settings, SettingsFile } from "core/models/settings";
 import type { OnlineSettingsV2, SettingsV2, SettingsFileV2 } from "core/models/settings";
 import type { Category, CategoriesFile } from "core/models/category";
+import type { ReminderEvent, ReminderLedger } from "core/models/reminder";
 
 // --- Primitive / enum schemas ------------------------------------------------
 
@@ -162,6 +163,52 @@ export const categoriesFileSchema = z.object({
   categories: z.array(categorySchema),
   colorsSeeded: z.boolean().optional(),
 });
+
+// --- Reminder ledger (Epic 4, Story 4.1 — AD-18 / AD-19) ---------------------
+
+/**
+ * The current on-disk version of `reminder-ledger.json`. A literal `1` for this
+ * story; the versioned safe-read path gates on it exactly as the other data
+ * files gate on their own version.
+ */
+export const REMINDER_LEDGER_VERSION = 1 as const;
+
+/**
+ * One fired-reminder event (AD-18). Discriminated by `kind` so the SAME schema
+ * carries both this epic's recurring `renewal` reminders AND Epic 5's one-shot
+ * `trial-end` reminders — the two shapes are identical, so the union is a single
+ * object with a `kind` enum rather than a `z.discriminatedUnion`. `leadTime`
+ * reuses the existing lead-time enum; `localDay` reuses the existing `isoDate`
+ * validator (the canonical local day from `reminderDay`); `subscriptionId` is a
+ * non-empty string. The validators are reused verbatim — never loosened.
+ */
+export const reminderEventSchema = z.object({
+  kind: z.enum(["renewal", "trial-end"]),
+  subscriptionId: z.string().min(1),
+  leadTime: reminderLeadTimeSchema,
+  localDay: isoDate,
+});
+
+/**
+ * Root file shape for `reminder-ledger.json` (AD-19). `version` is a literal `1`;
+ * `lastRunAt` is a UTC ISO instant (validated by the same `isoDateTime` the other
+ * files use) OR `null`; `fired` is an array of {@link reminderEventSchema}.
+ */
+export const reminderLedgerFileSchema = z.object({
+  version: z.literal(REMINDER_LEDGER_VERSION),
+  lastRunAt: isoDateTime.nullable(),
+  fired: z.array(reminderEventSchema),
+});
+
+/**
+ * A FRESH, empty reminder ledger (the first-run / recovery default). Returns a
+ * NEW object with a NEW `fired` array on every call — never a shared mutable
+ * reference — so a caller that appends to the result can never retroactively
+ * mutate the default or another caller's ledger.
+ */
+export function defaultReminderLedger(): ReminderLedger {
+  return { version: REMINDER_LEDGER_VERSION, lastRunAt: null, fired: [] };
+}
 
 // --- v2 schemas (additive; lockstep with the v2 interfaces) ------------------
 // These validate the schema-v2 shapes defined in `core/models/*`. They are the
@@ -424,6 +471,15 @@ function _assertSchemaAlignment(): void {
   const _catBack: z.infer<typeof categorySchema> = {} as Category;
   const _catsFile: CategoriesFile = {} as z.infer<typeof categoriesFileSchema>;
 
+  // Reminder ledger lockstep (Epic 4): the zod schemas and the TS types agree
+  // both ways, so a drift between `models/reminder.ts` and these schemas is a
+  // compile error.
+  const _reminderEventIn = {} as z.infer<typeof reminderEventSchema>;
+  const _reminderEvent: ReminderEvent = _reminderEventIn;
+  const _reminderEventBack: z.infer<typeof reminderEventSchema> = {} as ReminderEvent;
+  const _reminderLedger: ReminderLedger = {} as z.infer<typeof reminderLedgerFileSchema>;
+  const _reminderLedgerBack: z.infer<typeof reminderLedgerFileSchema> = {} as ReminderLedger;
+
   // v2 lockstep: the v2 zod schemas and the v2 interfaces must agree both ways.
   const _state: SubscriptionState = "Active" as z.infer<typeof subscriptionStateSchema>;
   const _stateBack: z.infer<typeof subscriptionStateSchema> = "Active" as SubscriptionState;
@@ -465,6 +521,10 @@ function _assertSchemaAlignment(): void {
     _cat,
     _catBack,
     _catsFile,
+    _reminderEvent,
+    _reminderEventBack,
+    _reminderLedger,
+    _reminderLedgerBack,
     _state,
     _stateBack,
     _trial,
