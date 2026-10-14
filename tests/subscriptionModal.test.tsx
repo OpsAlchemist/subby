@@ -86,6 +86,7 @@ function makeCategory(overrides: Partial<Category> = {}): Category {
 interface FakeApi extends SubbyApi {
   createSpy: ReturnType<typeof vi.fn>;
   updateSpy: ReturnType<typeof vi.fn>;
+  createCategorySpy: ReturnType<typeof vi.fn>;
   state: {
     subscriptions: SubscriptionV2[];
     categories: Category[];
@@ -107,10 +108,18 @@ function createFakeApi(): FakeApi {
     ok<SubscriptionV2[]>([makeSubscription({ id: "new-id" })]),
   );
   const updateSpy = vi.fn(() => ok<SubscriptionV2[]>([makeSubscription()]));
+  // Inline add-category: creates a category by the given name and returns it so
+  // the modal can select it immediately (Story 3.4).
+  const createCategorySpy = vi.fn((name: string) => {
+    const created = makeCategory({ id: `cat-${name}`, name, isDefault: false });
+    fake.state.categories = [...fake.state.categories, created];
+    return ok({ categories: fake.state.categories, created });
+  });
 
   const fake: FakeApi = {
     createSpy,
     updateSpy,
+    createCategorySpy,
     state: {
       subscriptions: [],
       categories: [makeCategory()],
@@ -126,8 +135,8 @@ function createFakeApi(): FakeApi {
 
     // --- Categories ---
     listCategories: () => ok(fake.state.categories),
-    createCategory: () =>
-      ok({ categories: fake.state.categories, created: fake.state.categories[0] }),
+    createCategory: createCategorySpy as SubbyApi["createCategory"],
+    updateCategory: () => ok(fake.state.categories),
     deleteCategory: () =>
       ok({ needsConfirmation: false as const, categories: fake.state.categories }),
 
@@ -373,5 +382,142 @@ describe("Trial state reveals the trial fields and carries them in the payload (
     // The entered post-trial MAJOR amount (9.99 GBP, exp 2) is parsed to minor units.
     expect(payload.trial).toEqual({ endDate: "2026-12-31", postAmountMinor: 999 });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- Tag editor (Story 3.4, FR-3) --------------------------------------------
+
+describe("TagEditor in the modal (Story 3.4)", () => {
+  it("adds, de-duplicates case-insensitively, removes, and carries tags on create", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Tagged");
+    await user.type(screen.getByLabelText(/^Amount/), "100");
+
+    const tagInput = screen.getByLabelText("Tags");
+    // Add "Work" via Enter.
+    await user.type(tagInput, "Work{Enter}");
+    expect(screen.getByText("Work")).toBeInTheDocument();
+
+    // A case/whitespace duplicate is dropped (still just one "Work").
+    await user.type(tagInput, "  work {Enter}");
+    expect(screen.getAllByText(/^work$/i)).toHaveLength(1);
+
+    // Add a second distinct tag, then remove the first via its remove button.
+    await user.type(tagInput, "Personal{Enter}");
+    expect(screen.getByText("Personal")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Remove tag Work" }));
+    expect(screen.queryByText("Work")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.tags).toEqual(["Personal"]);
+  });
+
+  it("a comma-separated paste adds EVERY segment (finding E)", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Pasted");
+    await user.type(screen.getByLabelText(/^Amount/), "100");
+
+    const tagInput = screen.getByLabelText("Tags") as HTMLInputElement;
+    // Simulate a paste of "a,b,c" by setting the value with commas in one change.
+    fireEvent.change(tagInput, { target: { value: "a,b,c" } });
+
+    // Every segment BEFORE the last comma is committed as a chip (finding E: not
+    // just the first). The trailing non-comma remainder "c" stays in the input,
+    // per the TagEditor contract.
+    expect(screen.getByText("a")).toBeInTheDocument();
+    expect(screen.getByText("b")).toBeInTheDocument();
+    expect(tagInput.value).toBe("c");
+
+    // Pressing Enter commits the trailing remainder, so all three land.
+    await user.type(tagInput, "{Enter}");
+    expect(screen.getByText("c")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.tags).toEqual(["a", "b", "c"]);
+  });
+
+  it("a trailing-comma paste 'a,b,c,' commits all three segments", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Pasted2");
+    await user.type(screen.getByLabelText(/^Amount/), "100");
+
+    const tagInput = screen.getByLabelText("Tags") as HTMLInputElement;
+    // A trailing comma means EVERY segment is before a comma → all commit.
+    fireEvent.change(tagInput, { target: { value: "a,b,c," } });
+
+    expect(screen.getByText("a")).toBeInTheDocument();
+    expect(screen.getByText("b")).toBeInTheDocument();
+    expect(screen.getByText("c")).toBeInTheDocument();
+    expect(tagInput.value).toBe("");
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.tags).toEqual(["a", "b", "c"]);
+  });
+
+  it("Escape while focused in the tag field does NOT close the modal", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<SubscriptionModal open onClose={onClose} />);
+
+    const tagInput = screen.getByLabelText("Tags");
+    await user.click(tagInput);
+    await user.keyboard("{Escape}");
+
+    // The tag field swallows Escape; the modal stays open (no onClose, no discard).
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("pre-populates and preserves existing tags in EDIT mode", async () => {
+    const user = userEvent.setup();
+    const subscription = makeSubscription({ id: "edit-tags", tags: ["Keep"] });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    expect(screen.getByText("Keep")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Tags"), "Added{Enter}");
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    const patch = fake.updateSpy.mock.calls[0][1] as { tags: string[] };
+    expect(patch.tags).toEqual(["Keep", "Added"]);
+  });
+});
+
+// --- Inline add-category (Story 3.4) -----------------------------------------
+
+describe("inline add-category in the modal (Story 3.4)", () => {
+  it("creates a category and selects it without leaving the modal", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.click(screen.getByRole("button", { name: /add new/i }));
+    const nameField = await screen.findByLabelText("New category name");
+    await user.type(nameField, "Newsletters{Enter}");
+
+    await waitFor(() =>
+      expect(fake.createCategorySpy).toHaveBeenCalledWith("Newsletters"),
+    );
+    // The Category select now has the created category selected.
+    await waitFor(() =>
+      expect(screen.getByLabelText("Category")).toHaveValue("Newsletters"),
+    );
   });
 });

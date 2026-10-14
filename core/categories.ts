@@ -12,6 +12,7 @@
  */
 
 import type { Category } from "./models/category";
+import { DEFAULT_CATEGORY_COLORS } from "./models/schema";
 
 /**
  * The only subscription field these category helpers read: the assigned
@@ -140,6 +141,92 @@ export function isCategoryInUse(
  */
 export function deleteCategory(existing: Category[], id: string): Category[] {
   return existing.filter((c) => c.id !== id);
+}
+
+// --- Category color: one-time seed + user-owned mutation (Story 3.4, FR-3) ---
+
+/**
+ * The ONE-TIME default-color seeding transform (Story 3.4). Returns a NEW array
+ * in which every default-named category that is **missing** a `color` is stamped
+ * with its {@link DEFAULT_CATEGORY_COLORS} hue. A category that already has a
+ * color is left untouched, and a CUSTOM (non-default-named) category is never
+ * assigned a color. The input is never mutated and order is preserved.
+ *
+ * **NOT idempotent-safe to run on every read.** This transform cannot distinguish
+ * a default whose color the user deliberately CLEARED (color removed) from one
+ * that was never set — both present as "missing color on a default name" — so
+ * re-running it would silently resurrect a cleared color (review finding A). The
+ * caller MUST run it exactly once, gated by the sticky `colorsSeeded` marker on
+ * the categories file; after that one seed, `color` is purely user-owned.
+ *
+ * Keying on the category NAME (not `isDefault`) is deliberate and additive: it
+ * backfills the stable default palette by the same name the defaults ship with,
+ * and a user-renamed-or-custom category simply has no palette entry.
+ */
+export function assignDefaultColors(categories: Category[]): Category[] {
+  return categories.map((c) => {
+    if (c.color !== undefined) return { ...c };
+    const seeded = DEFAULT_CATEGORY_COLORS[c.name];
+    if (seeded === undefined) return { ...c };
+    return { ...c, color: seeded };
+  });
+}
+
+/**
+ * Set (or CLEAR) the `color` of exactly the category with the matching `id`,
+ * returning a NEW array (Story 3.4). This is the only mutable field — rename is
+ * explicitly out of scope. Passing a hex string sets it; passing `undefined`
+ * CLEARS the color by DROPPING the `color` key entirely (not storing an empty
+ * string), so a cleared default renders colorless and — because the one-time seed
+ * is marker-gated — stays cleared across reloads. Other categories and the input
+ * array are left untouched; an unknown `id` yields a new array with identical
+ * contents.
+ *
+ * Color-format validation lives at the schema + `cat:update` service boundary
+ * ({@link hexColor}); this pure helper assumes a validated value so `core/` stays
+ * free of a chosen color grammar it doesn't own.
+ */
+export function setCategoryColor(
+  existing: Category[],
+  id: string,
+  color: string | undefined,
+): Category[] {
+  return existing.map((c) => {
+    if (c.id !== id) return c;
+    if (color === undefined) {
+      // Clear: drop the key so the category is genuinely colorless.
+      const { color: _dropped, ...rest } = c;
+      return rest;
+    }
+    return { ...c, color };
+  });
+}
+
+// --- Tags: trimmed, case-insensitive de-dup, order-preserving (Story 3.4) ----
+
+/**
+ * Add `raw` to a subscription's `tags`, returning a NEW array (Story 3.4, FR-3).
+ * The tag is trimmed; a blank/whitespace-only tag is IGNORED (returns a copy
+ * unchanged). De-duplication is case-insensitive and the FIRST-seen casing wins —
+ * an incoming tag that matches an existing one case-insensitively is dropped (the
+ * existing entry and its order are kept). Appends in order otherwise. The input
+ * array is never mutated.
+ */
+export function addTag(tags: string[], raw: string): string[] {
+  const trimmed = raw.trim();
+  if (trimmed === "") return [...tags];
+  const exists = tags.some((t) => t.toLowerCase() === trimmed.toLowerCase());
+  return exists ? [...tags] : [...tags, trimmed];
+}
+
+/**
+ * Remove `raw` from a subscription's `tags`, returning a NEW array (Story 3.4).
+ * Matching is trimmed + case-insensitive, so removing `" work "` drops a stored
+ * `"Work"`. Non-matching tags are preserved in order; the input is never mutated.
+ */
+export function removeTag(tags: string[], raw: string): string[] {
+  const target = raw.trim().toLowerCase();
+  return tags.filter((t) => t.toLowerCase() !== target);
 }
 
 // --- Settings merge (Req 15.2) -----------------------------------------------

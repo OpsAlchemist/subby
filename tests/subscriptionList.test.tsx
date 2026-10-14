@@ -107,6 +107,7 @@ function createFakeApi(): FakeApi {
     listCategories: vi.fn(() => ok(fake.state.categories)),
     createCategory: () =>
       ok({ categories: fake.state.categories, created: fake.state.categories[0] }),
+    updateCategory: () => ok(fake.state.categories),
     deleteCategory: () =>
       ok({ needsConfirmation: false as const, categories: fake.state.categories }),
 
@@ -361,5 +362,49 @@ describe("quick-edit (Req 9.7)", () => {
     // The List parses the entered MAJOR amount into integer minor units in the
     // sub's own currency: minorUnits("999", "INR") === 99900 (exponent 2).
     expect(fake.updateSubscription).toHaveBeenCalledWith("a", { amountMinor: 99900 });
+  });
+});
+
+// --- Category color chip + tag chips (Story 3.4) -----------------------------
+
+describe("category color dot + tag chips (Story 3.4)", () => {
+  it("renders an aria-hidden color dot before a category WITH a color; none when colorless", async () => {
+    await renderList(
+      [
+        makeSub({ id: "a", name: "Netflix", category: "Streaming" }),
+        makeSub({ id: "b", name: "Blog", category: "Writing" }),
+      ],
+      [
+        { id: "c1", name: "Streaming", isDefault: true, color: "#db2777" },
+        { id: "c2", name: "Writing", isDefault: false }, // colorless
+      ],
+    );
+
+    const table = screen.getByRole("table");
+    // The colored category renders a decorative dot with its background color;
+    // the colorless one renders none (the NAME still carries the meaning).
+    const dot = table.querySelector(
+      'span[aria-hidden="true"][style*="background-color"]',
+    ) as HTMLElement | null;
+    expect(dot).not.toBeNull();
+    // Both category NAMES are still present as text.
+    expect(within(table).getByText("Streaming")).toBeInTheDocument();
+    expect(within(table).getByText("Writing")).toBeInTheDocument();
+
+    // Exactly ONE colored dot (Streaming), since Writing has no color.
+    const dots = table.querySelectorAll(
+      'span[aria-hidden="true"][style*="background-color"]',
+    );
+    expect(dots).toHaveLength(1);
+  });
+
+  it("renders a subscription's tag chips read-only in the row", async () => {
+    await renderList(
+      [makeSub({ id: "a", name: "Netflix", category: "Streaming", tags: ["Shared", "Family"] })],
+      [{ id: "c1", name: "Streaming", isDefault: true }],
+    );
+    const table = screen.getByRole("table");
+    expect(within(table).getByText("Shared")).toBeInTheDocument();
+    expect(within(table).getByText("Family")).toBeInTheDocument();
   });
 });

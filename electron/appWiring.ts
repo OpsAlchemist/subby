@@ -22,6 +22,7 @@ import * as catCore from "core/categories";
 import * as subsCore from "core/subscriptionsV2";
 import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
+import { hexColor } from "core/models/schema";
 import type { Category } from "core/models/category";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -119,6 +120,16 @@ export type DeleteCategoryOutcome =
   | { ok: false; reason: "needs_confirmation"; name: string; inUseCount: number };
 
 /**
+ * Result of {@link AppServices.updateCategoryColor} (Story 3.4). The service
+ * never throws: an unknown id yields `not_found`, a non-hex color yields
+ * `validation`, and both map to inline IPC errors (no global toast).
+ */
+export type UpdateCategoryColorOutcome =
+  | { ok: true; categories: Category[] }
+  | { ok: false; reason: "not_found" }
+  | { ok: false; reason: "validation" };
+
+/**
  * The operations the IPC handlers (task 13.2) call. Each mutating method
  * persists the change through the {@link StoragePort} and returns the new
  * persisted state so the handler can wrap it in an `IpcResult` and broadcast
@@ -151,6 +162,16 @@ export interface AppServices {
   listCategories(): Promise<Category[]>;
   /** Create a custom category, rejecting duplicate names (Req 7.2, 7.3). */
   createCategory(name: string): Promise<catCore.CreateCategoryResult>;
+  /**
+   * Set (or clear) a category's color (Story 3.4, FR-3). `color` is a validated
+   * `#rrggbb` hex to set, or `undefined` to clear. Returns the new `Category[]`
+   * on success; an unknown id → `not_found`, a non-hex color → `validation`
+   * (never throws).
+   */
+  updateCategoryColor(
+    id: string,
+    color: string | undefined,
+  ): Promise<UpdateCategoryColorOutcome>;
   /**
    * Delete a category. When the category is assigned to ≥1 subscription and the
    * caller has not confirmed, returns `needs_confirmation` so the renderer can
@@ -339,6 +360,28 @@ export function buildAppServices(storage: StoragePort): AppServices {
           await storage.writeCategories(result.categories);
         }
         return result;
+      });
+    },
+
+    updateCategoryColor(id, color) {
+      // Serializes on the file it writes (`categories`), mirroring the other
+      // category mutators: read → setCategoryColor → write under the lock.
+      return lock("categories", async () => {
+        // VALIDATE the color at this service boundary (the single runtime source
+        // is `hexColor`). `undefined` means CLEAR and is always allowed; a string
+        // must be a `#rrggbb` hex, otherwise a `validation` outcome is returned
+        // (never throws, never persists arbitrary text into an inline style).
+        if (color !== undefined && !hexColor.safeParse(color).success) {
+          return { ok: false, reason: "validation" };
+        }
+        const existing = await storage.readCategories();
+        if (!existing.some((c) => c.id === id)) {
+          // Unknown id: nothing is written.
+          return { ok: false, reason: "not_found" };
+        }
+        const next = catCore.setCategoryColor(existing, id, color);
+        await storage.writeCategories(next);
+        return { ok: true, categories: next };
       });
     },
 

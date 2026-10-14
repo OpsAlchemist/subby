@@ -409,6 +409,37 @@ describe("real JsonFileStorage end-to-end: concurrency loses nothing", () => {
     expect(listed.map((s) => s.name).sort()).toEqual(["A", "B", "C"]);
   });
 
+  it("updateCategoryColor: not_found / validation / happy-path (Story 3.4, finding D)", async () => {
+    // Bootstrap the default categories (seeded) and pick a real id.
+    const cats = await services.listCategories();
+    const target = cats[0];
+
+    // Unknown id → not_found, and nothing is written (the color store is
+    // unchanged).
+    const unknown = await services.updateCategoryColor("unknown", "#123456");
+    expect(unknown).toEqual({ ok: false, reason: "not_found" });
+    const afterUnknown = await services.listCategories();
+    expect(afterUnknown).toEqual(cats);
+
+    // A bad (non-hex) color → validation, and nothing is written.
+    const bad = await services.updateCategoryColor(target.id, "nope");
+    expect(bad).toEqual({ ok: false, reason: "validation" });
+    const afterBad = await services.listCategories();
+    expect(afterBad.find((c) => c.id === target.id)!.color).toBe(target.color);
+
+    // A valid hex persists through listCategories().
+    const okResult = await services.updateCategoryColor(target.id, "#abcdef");
+    expect(okResult.ok).toBe(true);
+    const afterOk = await services.listCategories();
+    expect(afterOk.find((c) => c.id === target.id)!.color).toBe("#abcdef");
+
+    // Clearing (undefined) drops the color.
+    const cleared = await services.updateCategoryColor(target.id, undefined);
+    expect(cleared.ok).toBe(true);
+    const afterClear = await services.listCategories();
+    expect(afterClear.find((c) => c.id === target.id)!.color).toBeUndefined();
+  });
+
   it("a lock-free read issued between two serialized writes never observes a torn state", async () => {
     // Seed one subscription, then fire a write and a read concurrently. The read
     // must observe either the before or the after set — never a partial/torn

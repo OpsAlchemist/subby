@@ -20,7 +20,12 @@ export const CH = {
     remove: "subs:remove",
     setState: "subs:setState",
   },
-  categories: { list: "cat:list", create: "cat:create", remove: "cat:remove" },
+  categories: {
+    list: "cat:list",
+    create: "cat:create",
+    update: "cat:update", // {id, color} — color-only; rename is out of scope (Story 3.4)
+    remove: "cat:remove",
+  },
   settings: {
     get: "settings:get",
     update: "settings:update",

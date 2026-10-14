@@ -47,6 +47,7 @@ import { subscriptionsStore } from "@/stores/subscriptionsStore";
 import { categoriesStore } from "@/stores/categoriesStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
+import CategoryColorDot from "@/components/CategoryColorDot";
 
 // --- Local types -------------------------------------------------------------
 
@@ -647,7 +648,11 @@ export default function SubscriptionList(): JSX.Element {
                       )}
                     </td>
                     <td className="px-3 py-2 text-muted-foreground">
-                      {sub.category}
+                      <span className="inline-flex items-center">
+                        <CategoryColorDot categoryName={sub.category} />
+                        {sub.category}
+                      </span>
+                      <TagChips tags={sub.tags} />
                     </td>
                     <td className="px-3 py-2">
                       {edit && edit.id === sub.id && edit.field === "amount" ? (
@@ -759,7 +764,13 @@ export default function SubscriptionList(): JSX.Element {
                           <dt className="text-xs text-muted-foreground">
                             Category
                           </dt>
-                          <dd>{sub.category}</dd>
+                          <dd>
+                            <span className="inline-flex items-center">
+                              <CategoryColorDot categoryName={sub.category} />
+                              {sub.category}
+                            </span>
+                            <TagChips tags={sub.tags} />
+                          </dd>
                         </div>
                         <div>
                           <dt className="text-xs text-muted-foreground">Cycle</dt>
@@ -914,6 +925,27 @@ function QuickEditButton({
         aria-hidden="true"
       />
     </button>
+  );
+}
+
+/**
+ * Read-only tag chips for a List row (Story 3.4 parity). Tags are edited in the
+ * Add/Edit modal; here they are just surfaced beside the category. Renders
+ * nothing when a subscription has no tags.
+ */
+function TagChips({ tags }: { tags: string[] }): JSX.Element | null {
+  if (tags.length === 0) return null;
+  return (
+    <span className="mt-1 flex flex-wrap gap-1">
+      {tags.map((tag) => (
+        <span
+          key={tag}
+          className="inline-flex items-center rounded-md bg-muted px-1.5 py-0.5 text-xs text-muted-foreground"
+        >
+          {tag}
+        </span>
+      ))}
+    </span>
   );
 }
 

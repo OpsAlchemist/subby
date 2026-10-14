@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,11 @@ import {
   isStorageCorruptError,
 } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
-import { DEFAULT_CATEGORIES, DEFAULT_SETTINGS } from "core/models/schema";
+import {
+  DEFAULT_CATEGORIES,
+  DEFAULT_CATEGORY_COLORS,
+  DEFAULT_SETTINGS,
+} from "core/models/schema";
 import type { Subscription, SubscriptionV2 } from "core/models/subscription";
 
 /**
@@ -141,6 +145,115 @@ describe("JsonFileStorage bootstrap (Req 1.4, 1.5, 19.3)", () => {
     const subs = await storage.readSubscriptions();
     expect(subs).toEqual([]);
     expect(await isFile(subsPath)).toBe(true);
+  });
+});
+
+describe("JsonFileStorage category color one-time seed/backfill (Story 3.4)", () => {
+  const catPath = () => join(userData, fileNames.categories);
+
+  /** Read the raw categories file off disk. */
+  async function readRawCategoriesFile(): Promise<{
+    version: number;
+    colorsSeeded?: boolean;
+    categories: { name: string; color?: string }[];
+  }> {
+    return JSON.parse(await readFile(catPath(), "utf8"));
+  }
+
+  it("fresh install stamps the seeded palette colors AND colorsSeeded:true", async () => {
+    const categories = await storage.readCategories();
+
+    // Every default category now carries its seeded palette color.
+    for (const name of DEFAULT_CATEGORIES) {
+      const cat = categories.find((c) => c.name === name)!;
+      expect(cat.color).toBe(DEFAULT_CATEGORY_COLORS[name]);
+    }
+
+    // The on-disk file is marked seeded so later reads never re-backfill.
+    const raw = await readRawCategoriesFile();
+    expect(raw.colorsSeeded).toBe(true);
+  });
+
+  it("backfills an unseeded colorless file ONCE, marks it seeded, and a second read writes nothing", async () => {
+    // Simulate an upgrade: a pre-3.4 categories file with default names, NO
+    // colors, and NO colorsSeeded marker.
+    await writeFile(
+      catPath(),
+      JSON.stringify({
+        version: 1,
+        categories: [
+          { id: "c1", name: "Streaming", isDefault: true },
+          { id: "c2", name: "AI", isDefault: true },
+          { id: "c3", name: "My Custom", isDefault: false },
+        ],
+      }),
+      "utf8",
+    );
+
+    // First read backfills the default names and marks the file seeded.
+    const first = await storage.readCategories();
+    expect(first.find((c) => c.name === "Streaming")!.color).toBe(
+      DEFAULT_CATEGORY_COLORS["Streaming"],
+    );
+    expect(first.find((c) => c.name === "AI")!.color).toBe(
+      DEFAULT_CATEGORY_COLORS["AI"],
+    );
+    // The custom category is never touched.
+    expect(first.find((c) => c.name === "My Custom")!.color).toBeUndefined();
+
+    const afterFirst = await readRawCategoriesFile();
+    expect(afterFirst.colorsSeeded).toBe(true);
+
+    // The second read must NOT write (steady state): capture the file's mtime
+    // and confirm it is unchanged across the read.
+    const mtimeBefore = (await stat(catPath())).mtimeMs;
+    await new Promise((r) => setTimeout(r, 10));
+    const second = await storage.readCategories();
+    const mtimeAfter = (await stat(catPath())).mtimeMs;
+
+    expect(mtimeAfter).toBe(mtimeBefore);
+    expect(second).toEqual(first);
+  });
+
+  it("a user-CLEARED default color on a colorsSeeded:true file STAYS cleared (seed never resurrects — finding A)", async () => {
+    // A seeded file where a default-named category ("Streaming") has NO color —
+    // i.e. the user deliberately cleared it after the one-time seed.
+    await writeFile(
+      catPath(),
+      JSON.stringify({
+        version: 1,
+        colorsSeeded: true,
+        categories: [
+          { id: "c1", name: "Streaming", isDefault: true }, // cleared, no color
+          { id: "c2", name: "AI", isDefault: true, color: "#059669" },
+        ],
+      }),
+      "utf8",
+    );
+
+    const mtimeBefore = (await stat(catPath())).mtimeMs;
+    await new Promise((r) => setTimeout(r, 10));
+    const categories = await storage.readCategories();
+    const mtimeAfter = (await stat(catPath())).mtimeMs;
+
+    // The cleared default is returned STILL colorless (the seed did not refill
+    // it), and no write-back occurred.
+    expect(categories.find((c) => c.name === "Streaming")!.color).toBeUndefined();
+    expect(categories.find((c) => c.name === "AI")!.color).toBe("#059669");
+    expect(mtimeAfter).toBe(mtimeBefore);
+
+    // On disk, Streaming is still colorless.
+    const raw = await readRawCategoriesFile();
+    expect(raw.categories.find((c) => c.name === "Streaming")!.color).toBeUndefined();
+  });
+
+  it("writeCategories keeps colorsSeeded:true sticky", async () => {
+    await storage.readCategories(); // seeds
+    await storage.writeCategories([
+      { id: "c1", name: "Streaming", isDefault: true },
+    ]);
+    const raw = await readRawCategoriesFile();
+    expect(raw.colorsSeeded).toBe(true);
   });
 });
 

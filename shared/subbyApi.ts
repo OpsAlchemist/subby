@@ -73,6 +73,16 @@ export interface SubbyApi {
   // --- Categories (Req 7) ---
   listCategories(): Promise<IpcResult<Category[]>>;
   createCategory(name: string): Promise<IpcResult<CreateCategoryData>>;
+  /**
+   * Set (or clear) a category's color (Story 3.4, FR-3). `color` is a `#rrggbb`
+   * hex to set, or `undefined` to clear. Resolves with the new `Category[]`;
+   * an unknown id fails with an inline `not_found` error and a non-hex color
+   * with an inline `validation` error (never a global toast).
+   */
+  updateCategory(
+    id: string,
+    patch: { color: string | undefined },
+  ): Promise<IpcResult<Category[]>>;
   deleteCategory(
     id: string,
     opts?: { confirmed: boolean },

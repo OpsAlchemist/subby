@@ -259,6 +259,46 @@ export function registerIpcHandlers(
     },
   );
 
+  handle<IpcResult<Category[]>>(
+    CH.categories.update,
+    async (
+      _event,
+      payload: { id: string; color: string | undefined },
+    ): Promise<IpcResult<Category[]>> => {
+      try {
+        const outcome = await services.updateCategoryColor(
+          payload.id,
+          payload.color,
+        );
+        if (outcome.ok) {
+          broadcastDataChanged();
+          return { ok: true, data: outcome.categories };
+        }
+        // Both outcomes are inline-resolvable (no evt:error global toast): an
+        // unknown id → not_found; a non-hex color → validation naming the field
+        // (matrix "invalid color → validation inline").
+        if (outcome.reason === "not_found") {
+          return {
+            ok: false,
+            error: { code: "not_found", message: "Category not found." },
+          };
+        }
+        return {
+          ok: false,
+          error: {
+            code: "validation",
+            field: "color",
+            message: "Color must be a valid #rrggbb hex value.",
+          },
+        };
+      } catch (err) {
+        const error = toAppError(err);
+        broadcastError(error);
+        return { ok: false, error };
+      }
+    },
+  );
+
   handle<IpcResult<DeleteCategoryData>>(
     CH.categories.remove,
     async (
@@ -368,6 +408,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.subs.setState,
   CH.categories.list,
   CH.categories.create,
+  CH.categories.update,
   CH.categories.remove,
   CH.settings.get,
   CH.settings.update,

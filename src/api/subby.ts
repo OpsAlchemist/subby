@@ -121,6 +121,8 @@ export const subscriptionsApi = {
 export const categoriesApi = {
   list: () => unwrap(getSubby().listCategories()),
   create: (name: string) => unwrap(getSubby().createCategory(name)),
+  update: (id: string, patch: { color: string | undefined }) =>
+    unwrap(getSubby().updateCategory(id, patch)),
   remove: (id: string, opts?: { confirmed: boolean }) =>
     unwrap(getSubby().deleteCategory(id, opts)),
 } as const;

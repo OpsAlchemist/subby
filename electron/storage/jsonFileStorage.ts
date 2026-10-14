@@ -34,6 +34,7 @@ import { basename, join } from "node:path";
 import {
   categoriesFileSchema,
   DEFAULT_CATEGORIES,
+  DEFAULT_CATEGORY_COLORS,
   DEFAULT_SETTINGS,
   DEFAULT_SETTINGS_V2,
   settingsFileSchema,
@@ -41,6 +42,7 @@ import {
   subscriptionsFileSchema,
   subscriptionsFileV2Schema,
 } from "core/models/schema";
+import { assignDefaultColors } from "core/categories";
 import { assembleBackupPayload, backupFileName } from "core/backup";
 import { migrate } from "core/migrations";
 import type { Category } from "core/models/category";
@@ -415,13 +417,22 @@ export class JsonFileStorage implements StoragePort {
         });
   }
 
-  private defaultCategoriesFile(): { version: number; categories: Category[] } {
+  private defaultCategoriesFile(): {
+    version: number;
+    categories: Category[];
+    colorsSeeded: boolean;
+  } {
+    // A fresh install stamps each default with its seeded palette color (Story
+    // 3.4) and marks the file `colorsSeeded: true`, so the subsequent read takes
+    // the already-seeded branch (no backfill, no write-back) and the colors are
+    // present out of the box.
     const categories: Category[] = DEFAULT_CATEGORIES.map((name) => ({
       id: randomUUID(),
       name,
       isDefault: true,
+      color: DEFAULT_CATEGORY_COLORS[name],
     }));
-    return { version: this.current, categories };
+    return { version: this.current, categories, colorsSeeded: true };
   }
 
   // --- Cloud-path guardrail (AD-31) ------------------------------------------
@@ -815,7 +826,33 @@ export class JsonFileStorage implements StoragePort {
     );
 
     if (result.ok) {
-      return result.value.categories;
+      // ONE-TIME seeded backfill (Story 3.4, review findings A + B). The default-
+      // category color backfill runs — and writes back — exactly ONCE, gated by
+      // the sticky `colorsSeeded` marker:
+      //   - `colorsSeeded === true`  → return the stored categories VERBATIM with
+      //     NO write. This is the steady state and the upgrade-already-seeded case,
+      //     so a user-CLEARED default color stays cleared (the seed never
+      //     resurrects it) and routine reads never write.
+      //   - otherwise (missing/false) → this is the barrier-serialized first read
+      //     after upgrade from a pre-3.4 file. Run `assignDefaultColors` (fills a
+      //     MISSING color on a default-named category only; never overwrites a
+      //     user-set color, never touches a custom category), persist
+      //     `{version, colorsSeeded: true, categories}` ONCE, and return it.
+      // Because this one write happens inside `runMigrationBarrier` BEFORE any IPC
+      // handler registers (and never again), it cannot race a locked mutation
+      // (finding B). The categories file has no backup stream — reset-to-defaults
+      // is its recovery — so this in-place one-time seed is consistent with how
+      // the file is managed.
+      if (result.value.colorsSeeded === true) {
+        return result.value.categories;
+      }
+      const seeded = assignDefaultColors(result.value.categories);
+      await writeJsonAtomic(this.categoriesPath, {
+        version: this.current,
+        colorsSeeded: true,
+        categories: seeded,
+      });
+      return seeded;
     }
     if (result.reason === "missing") {
       // AD-31 cloud guardrail (Story 1.7) via the single shared rule. Categories
@@ -831,7 +868,11 @@ export class JsonFileStorage implements StoragePort {
 
   async writeCategories(categories: Category[]): Promise<void> {
     await this.ensureTree();
-    const file = { version: this.current, categories };
+    // Keep `colorsSeeded: true` sticky on every write (Story 3.4): once the file
+    // is seeded, any mutation (set/clear color, create, delete) persists the
+    // marker so a later read never re-runs the one-time backfill — a user-cleared
+    // default therefore stays cleared.
+    const file = { version: this.current, colorsSeeded: true, categories };
     await writeJsonAtomic(this.categoriesPath, file);
   }
 

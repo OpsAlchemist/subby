@@ -41,6 +41,7 @@ import {
 import { exponentOf } from "core/money";
 import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
+import CategoryColorDot from "@/components/CategoryColorDot";
 
 /** Number of upcoming days considered "renewing soon" on the dashboard (Req 8.4). */
 const RENEWAL_WINDOW_DAYS = 7;
@@ -150,7 +151,15 @@ function SubscriptionPanel({
               key={s.id}
               className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0"
             >
-              <span className="min-w-0 truncate font-medium">{s.name}</span>
+              <span className="min-w-0 truncate">
+                <span className="font-medium">{s.name}</span>
+                {s.category && (
+                  <span className="ml-2 inline-flex items-center text-sm text-muted-foreground">
+                    <CategoryColorDot categoryName={s.category} />
+                    {s.category}
+                  </span>
+                )}
+              </span>
               <span className="shrink-0 text-sm text-muted-foreground">
                 {renderMeta(s)}
               </span>

@@ -124,6 +124,7 @@ function createFakeApi(): FakeApi {
     listCategories: () => ok(fake.state.categories),
     createCategory: () =>
       ok({ categories: fake.state.categories, created: fake.state.categories[0] }),
+    updateCategory: () => ok(fake.state.categories),
     deleteCategory: () =>
       ok({ needsConfirmation: false as const, categories: fake.state.categories }),
 

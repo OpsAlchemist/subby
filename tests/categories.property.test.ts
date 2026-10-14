@@ -1,9 +1,17 @@
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
 
-import { createCategory, mergeSettings } from "core/categories";
+import {
+  createCategory,
+  mergeSettings,
+  assignDefaultColors,
+  setCategoryColor,
+  addTag,
+  removeTag,
+} from "core/categories";
 import type { Category } from "core/models/category";
 import type { ReminderLeadTime, Settings } from "core/models/settings";
+import { DEFAULT_CATEGORIES, DEFAULT_CATEGORY_COLORS } from "core/models/schema";
 
 /**
  * Property-based tests for category and settings logic (task 6.4).
@@ -225,6 +233,179 @@ describe("Feature: subby, Property 18: Settings update round-trips", () => {
         expect(merged.notification.leadTimes).not.toBe(
           current.notification.leadTimes,
         );
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+// =============================================================================
+// Story 3.4: category color seed/mutation + tag helpers
+// =============================================================================
+
+const defaultNameArb = fc.constantFrom(...DEFAULT_CATEGORIES);
+const hexArb = fc
+  .integer({ min: 0, max: 0xffffff })
+  .map((n) => `#${n.toString(16).padStart(6, "0")}`);
+
+/** A category that is EITHER a default name or a custom name, with/without color. */
+const categoryArb: fc.Arbitrary<Category> = fc
+  .record({
+    id: fc.uuid(),
+    name: fc.oneof(defaultNameArb, rawNameArb),
+    isDefault: fc.boolean(),
+    color: fc.option(hexArb, { nil: undefined }),
+  })
+  .map(({ id, name, isDefault, color }) => {
+    const c: Category = { id, name, isDefault };
+    if (color !== undefined) c.color = color;
+    return c;
+  });
+
+describe("Story 3.4 Property: assignDefaultColors is additive, never overwrites or affects custom", () => {
+  it("only fills a MISSING color on a default-named category; existing colors + custom untouched; input not mutated", () => {
+    fc.assert(
+      fc.property(fc.array(categoryArb, { maxLength: 20 }), (categories) => {
+        const before = structuredClone(categories);
+        const next = assignDefaultColors(categories);
+
+        expect(next).toHaveLength(categories.length);
+        next.forEach((c, i) => {
+          const original = categories[i];
+          const seed = DEFAULT_CATEGORY_COLORS[c.name];
+          if (original.color !== undefined) {
+            // An already-set color is NEVER overwritten.
+            expect(c.color).toBe(original.color);
+          } else if (seed !== undefined) {
+            // A missing color on a default NAME is filled from the seed.
+            expect(c.color).toBe(seed);
+          } else {
+            // A custom name with no color stays colorless.
+            expect(c.color).toBeUndefined();
+          }
+          // id/name/isDefault are preserved; order preserved.
+          expect({ id: c.id, name: c.name, isDefault: c.isDefault }).toEqual({
+            id: original.id,
+            name: original.name,
+            isDefault: original.isDefault,
+          });
+        });
+
+        // Purity: the input is structurally unchanged.
+        expect(categories).toEqual(before);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("running assignDefaultColors a second time changes nothing beyond the first pass (seeds settle)", () => {
+    fc.assert(
+      fc.property(fc.array(categoryArb, { maxLength: 20 }), (categories) => {
+        const once = assignDefaultColors(categories);
+        const twice = assignDefaultColors(once);
+        // After one seed every default name already has a color, so a second
+        // pass is a pure copy — the seeding has settled.
+        expect(twice).toEqual(once);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+describe("Story 3.4 Property: setCategoryColor is color-only, id-scoped, clears by dropping the key", () => {
+  it("sets/clears exactly one category and never mutates the input or other fields", () => {
+    fc.assert(
+      fc.property(
+        fc.array(categoryArb, { minLength: 1, maxLength: 15 }),
+        fc.option(hexArb, { nil: undefined }),
+        (categories, color) => {
+          const targetIndex = categories.length - 1;
+          const targetId = categories[targetIndex].id;
+          const before = structuredClone(categories);
+          const next = setCategoryColor(categories, targetId, color);
+
+          // Every category OTHER than ones sharing the target id is identical.
+          next.forEach((c, i) => {
+            if (categories[i].id !== targetId) {
+              expect(c).toEqual(categories[i]);
+              return;
+            }
+            // Target: name/isDefault unchanged; color set or key dropped.
+            expect(c.name).toBe(categories[i].name);
+            expect(c.isDefault).toBe(categories[i].isDefault);
+            if (color === undefined) {
+              expect("color" in c).toBe(false);
+            } else {
+              expect(c.color).toBe(color);
+            }
+          });
+
+          // Purity.
+          expect(categories).toEqual(before);
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+const tagArb = fc.string({ maxLength: 10 });
+// `addTag` preserves the invariant it is handed: callers keep `tags` free of
+// case-insensitive duplicates (that is exactly what addTag enforces on each add),
+// so the precondition for these properties is an already-deduplicated input.
+const tagsArb = fc
+  .array(tagArb, { maxLength: 12 })
+  .map((tags) => tags.reduce<string[]>((acc, t) => addTag(acc, t), []));
+
+describe("Story 3.4 Property: addTag trims, de-dups case-insensitively, order-preserving, ignores blank", () => {
+  it("holds the add invariants and never mutates input", () => {
+    fc.assert(
+      fc.property(tagsArb, tagArb, (tags, raw) => {
+        const before = [...tags];
+        const next = addTag(tags, raw);
+        const trimmed = raw.trim();
+
+        // Result has all-unique (case-insensitive) tags.
+        const lowered = next.map((t) => t.toLowerCase());
+        expect(new Set(lowered).size).toBe(lowered.length);
+
+        if (trimmed === "") {
+          // Blank is ignored → copy unchanged.
+          expect(next).toEqual(tags);
+        } else {
+          const already = tags.some(
+            (t) => t.toLowerCase() === trimmed.toLowerCase(),
+          );
+          if (already) {
+            // Duplicate (case-insensitive) → unchanged.
+            expect(next).toEqual(tags);
+          } else {
+            // Fresh tag → appended at the end, trimmed, order preserved.
+            expect(next).toEqual([...tags, trimmed]);
+          }
+        }
+
+        // Purity.
+        expect(tags).toEqual(before);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+describe("Story 3.4 Property: removeTag drops the trimmed+case-insensitive match, order-preserving", () => {
+  it("removes every case-insensitive match and preserves the rest in order; input not mutated", () => {
+    fc.assert(
+      fc.property(tagsArb, tagArb, (tags, raw) => {
+        const before = [...tags];
+        const next = removeTag(tags, raw);
+        const target = raw.trim().toLowerCase();
+
+        const expected = tags.filter((t) => t.toLowerCase() !== target);
+        expect(next).toEqual(expected);
+
+        // Purity.
+        expect(tags).toEqual(before);
       }),
       { numRuns: NUM_RUNS },
     );

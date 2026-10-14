@@ -50,6 +50,7 @@ import { settingsStore } from "@/stores/settingsStore";
 import { errorStore } from "@/stores/errorStore";
 import { useStore } from "@/stores/hooks";
 import { SettingsScaffold, SettingsSection } from "@/components/SettingsSection";
+import SettingsCategories from "@/components/SettingsCategories";
 import {
   resolveTheme,
   type ResolvedTheme,
@@ -263,6 +264,9 @@ export default function Settings(): JSX.Element {
           </select>
         </Field>
       </SettingsSection>
+
+      {/* Categories (Story 3.4) — inserted via the section-insert slot pattern. */}
+      <SettingsCategories />
 
       {/* Appearance */}
       <SettingsSection

@@ -394,6 +394,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "setState",
     "listCategories",
     "createCategory",
+    "updateCategory",
     "deleteCategory",
     "getSettings",
     "updateSettings",

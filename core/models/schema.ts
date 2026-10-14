@@ -127,18 +127,40 @@ export const settingsFileSchema = settingsSchema.extend({
 
 // --- Category ----------------------------------------------------------------
 
-/** Category validator (Req 7.1). */
+/**
+ * A `#rrggbb` hex color (Story 3.4). This is the SINGLE runtime-validation source
+ * for a category color: the `cat:update` service parses an incoming color through
+ * it, so a non-hex string is rejected with an inline `validation` outcome (I/O
+ * matrix "invalid color → validation inline") rather than persisting arbitrary
+ * text into an inline CSS `style`. The native `<input type="color">` only ever
+ * emits `#rrggbb`, so the UI happy-path never trips this — it guards the IPC
+ * boundary. Both upper- and lower-case hex are accepted.
+ */
+export const hexColor = z
+  .string()
+  .regex(/^#[0-9a-fA-F]{6}$/, "color must be a #rrggbb hex string");
+
+/** Category validator (Req 7.1). Color, when present, is validated as `#rrggbb`. */
 export const categorySchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   isDefault: z.boolean(),
-  color: z.string().optional(),
+  color: hexColor.optional(),
 });
 
-/** Root file shape for `categories.json` (Req 1.2). */
+/**
+ * Root file shape for `categories.json` (Req 1.2).
+ *
+ * `colorsSeeded` is the sticky one-time seed marker (Story 3.4): the storage
+ * adapter runs the default-color backfill (and writes it back) exactly once, then
+ * stamps this `true`; every subsequent read returns the stored categories
+ * verbatim with no write. Optional/additive so an older file without the key
+ * reads as not-yet-seeded.
+ */
 export const categoriesFileSchema = z.object({
   version: z.number().int().nonnegative(),
   categories: z.array(categorySchema),
+  colorsSeeded: z.boolean().optional(),
 });
 
 // --- v2 schemas (additive; lockstep with the v2 interfaces) ------------------
@@ -300,6 +322,37 @@ export const DEFAULT_CATEGORIES: readonly string[] = [
   "Education",
   "Development",
 ];
+
+/**
+ * Seeded colors for the 11 default categories (Story 3.4, FR-3).
+ *
+ * Each hue is stable, distinct, and chosen to read clearly as a small decorative
+ * dot. The palette **deliberately avoids** the brand accent (ochre `#92400e` /
+ * amber `#f59e0b` / `#b45309`) and the destructive red (`#b91c1c` / `#f87171`) so
+ * a category dot is never confused with a primary action or a destructive
+ * affordance (DESIGN "one-accent-and-stop": category color is a legitimate FR-3
+ * data attribute, distinct from the chrome accent rule). Every value is a
+ * `#rrggbb` hex that satisfies {@link hexColor}.
+ *
+ * This map is consumed by the storage adapter's ONE-TIME seed/backfill
+ * (`defaultCategoriesFile` + the `colorsSeeded`-gated `readCategories` path) and
+ * by the pure `assignDefaultColors` transform in `core/categories.ts`. After the
+ * one-time seed, a category's color is purely user-owned — this map is never
+ * reconciled against on a steady-state read.
+ */
+export const DEFAULT_CATEGORY_COLORS: Readonly<Record<string, string>> = {
+  Entertainment: "#7c3aed", // violet
+  Productivity: "#2563eb", // blue
+  "Cloud Hosting": "#0891b2", // cyan
+  Streaming: "#db2777", // pink
+  AI: "#059669", // emerald
+  Music: "#9333ea", // purple
+  Gaming: "#4f46e5", // indigo
+  Fitness: "#16a34a", // green
+  Utilities: "#64748b", // slate
+  Education: "#0d9488", // teal
+  Development: "#7c6f64", // warm stone (distinct from the slate neutral, off the cool-heavy rest)
+};
 
 /**
  * Default settings applied on first run (Req 6.3, 14.4): dark theme,

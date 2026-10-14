@@ -35,6 +35,8 @@ const api: SubbyApi = {
   // --- Categories (Req 7) ---
   listCategories: () => ipcRenderer.invoke(CH.categories.list),
   createCategory: (name) => ipcRenderer.invoke(CH.categories.create, name),
+  updateCategory: (id, patch) =>
+    ipcRenderer.invoke(CH.categories.update, { id, color: patch.color }),
   deleteCategory: (id, opts) =>
     ipcRenderer.invoke(CH.categories.remove, { id, opts }),
 

@@ -54,9 +54,16 @@ import type {
 import { minorUnits, toMajor } from "core/money";
 import type { SubscriptionInputV2 } from "shared/types";
 import { cn } from "@/lib/utils";
-import { isSubbyError, subscriptionsApi, toAppError } from "@/api/subby";
+import {
+  categoriesApi,
+  isSubbyError,
+  subscriptionsApi,
+  toAppError,
+} from "@/api/subby";
+import TagEditor from "@/components/TagEditor";
 import { categoriesStore } from "@/stores/categoriesStore";
 import { settingsStore } from "@/stores/settingsStore";
+import { errorStore } from "@/stores/errorStore";
 import { useStoreData } from "@/stores/hooks";
 
 // --- Constants ---------------------------------------------------------------
@@ -125,6 +132,8 @@ interface FormState {
   icon: string;
   state: SubscriptionState;
   autoRenew: boolean;
+  // Free-form tags, edited via the TagEditor (de-duplicated by core helpers).
+  tags: string[];
   // Minimal trial fields (used only when state === 'Trial').
   trialEndDate: string;
   trialPostAmount: string; // major-unit string
@@ -170,6 +179,7 @@ function initialState(
       icon: subscription.icon,
       state: subscription.state,
       autoRenew: subscription.autoRenew,
+      tags: [...subscription.tags],
       trialEndDate: trial?.endDate ?? todayIso(),
       trialPostAmount:
         trial !== undefined
@@ -196,6 +206,7 @@ function initialState(
     icon: "",
     state: "Active",
     autoRenew: true,
+    tags: [],
     trialEndDate: todayIso(),
     trialPostAmount: "",
   };
@@ -319,6 +330,15 @@ export default function SubscriptionModal({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // Inline "+ add new" category affordance next to the Category select: when
+  // open, a small labelled input creates a category via `categoriesApi.create`
+  // and selects the result WITHOUT leaving the modal. Its own inline error echoes
+  // a duplicate name.
+  const [addingCategory, setAddingCategory] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [categoryError, setCategoryError] = useState<string | null>(null);
+  const newCategoryRef = useRef<HTMLInputElement>(null);
+
   const firstFieldRef = useRef<HTMLInputElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const previouslyFocused = useRef<HTMLElement | null>(null);
@@ -335,6 +355,9 @@ export default function SubscriptionModal({
     );
     setErrors({});
     setSubmitError(null);
+    setAddingCategory(false);
+    setNewCategoryName("");
+    setCategoryError(null);
     // We intentionally re-seed only on (re)open or identity change of the
     // target subscription, not on every keystroke.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -359,6 +382,37 @@ export default function SubscriptionModal({
   /** Patch a single form field. */
   function set<K extends keyof FormState>(key: K, value: FormState[K]): void {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  /**
+   * Create a category inline and select it on the Category field, without
+   * leaving the modal (Story 3.4). A duplicate name (case-insensitive, trimmed)
+   * surfaces as an inline error echoing the existing name; the store reloads via
+   * the `onDataChanged` broadcast so the new option appears in the select.
+   */
+  async function createAndSelectCategory(): Promise<void> {
+    const name = newCategoryName.trim();
+    if (name === "") return;
+    setCategoryError(null);
+    try {
+      const { created } = await categoriesApi.create(name);
+      set("category", created.name);
+      setAddingCategory(false);
+      setNewCategoryName("");
+    } catch (err) {
+      // Inline-resolvable failures (duplicate name → `conflict`, bad name →
+      // `validation`) show inline next to the field; system failures
+      // (io/corrupt/unknown) go to the global error surface instead.
+      const appError = toAppError(err);
+      if (
+        isSubbyError(err) &&
+        (appError.code === "conflict" || appError.code === "validation")
+      ) {
+        setCategoryError(appError.message);
+      } else {
+        errorStore.set(appError);
+      }
+    }
   }
 
   /**
@@ -389,10 +443,10 @@ export default function SubscriptionModal({
       icon: form.icon.trim(),
       state: form.state,
       trial,
-      // `priceHistory`/`tags` are not edited here; core defaults them to [] on
-      // create and the update path preserves the existing values.
+      // `priceHistory` is not edited here; `tags` ARE edited via the TagEditor
+      // (already trimmed + de-duplicated by core helpers) and carried through.
       priceHistory: subscription?.priceHistory ?? [],
-      tags: subscription?.tags ?? [],
+      tags: form.tags,
       autoRenew: form.autoRenew,
     };
   }
@@ -433,6 +487,7 @@ export default function SubscriptionModal({
           icon: form.icon.trim(),
           state: form.state,
           trial,
+          tags: form.tags,
           autoRenew: form.autoRenew,
         });
       } else {
@@ -545,26 +600,99 @@ export default function SubscriptionModal({
               />
             </Field>
 
-            {/* Category */}
+            {/* Category — with an inline "+ add new" affordance (Story 3.4). */}
             <Field label="Category" htmlFor="sub-category">
-              <select
-                id="sub-category"
-                className={CONTROL_CLASS}
-                value={form.category}
-                onChange={(e) => set("category", e.target.value)}
-              >
-                <option value="">Uncategorized</option>
-                {/* Keep the current value selectable even if it is no longer a known category. */}
-                {form.category !== "" &&
-                  !categories.some((c) => c.name === form.category) && (
-                    <option value={form.category}>{form.category}</option>
-                  )}
-                {categories.map((c) => (
-                  <option key={c.id} value={c.name}>
-                    {c.name}
-                  </option>
-                ))}
-              </select>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <select
+                    id="sub-category"
+                    className={CONTROL_CLASS}
+                    value={form.category}
+                    onChange={(e) => set("category", e.target.value)}
+                  >
+                    <option value="">Uncategorized</option>
+                    {/* Keep the current value selectable even if it is no longer a known category. */}
+                    {form.category !== "" &&
+                      !categories.some((c) => c.name === form.category) && (
+                        <option value={form.category}>{form.category}</option>
+                      )}
+                    {categories.map((c) => (
+                      <option key={c.id} value={c.name}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAddingCategory(true);
+                      setCategoryError(null);
+                      window.setTimeout(() => newCategoryRef.current?.focus(), 0);
+                    }}
+                    className={cn(
+                      "inline-flex shrink-0 items-center rounded-md border border-input bg-background px-2.5 py-2 text-sm font-medium text-foreground hover:bg-secondary/60",
+                      FOCUS_RING,
+                    )}
+                  >
+                    + Add new
+                  </button>
+                </div>
+                {addingCategory && (
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="sub-new-category"
+                      className="block text-sm font-medium text-foreground"
+                    >
+                      New category name
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        id="sub-new-category"
+                        ref={newCategoryRef}
+                        type="text"
+                        className={CONTROL_CLASS}
+                        value={newCategoryName}
+                        onChange={(e) => setNewCategoryName(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            void createAndSelectCategory();
+                          } else if (e.key === "Escape") {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            setAddingCategory(false);
+                            setNewCategoryName("");
+                            setCategoryError(null);
+                          }
+                        }}
+                        aria-invalid={categoryError ? true : undefined}
+                        aria-describedby={
+                          categoryError ? "sub-new-category-error" : undefined
+                        }
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void createAndSelectCategory()}
+                        className={cn(
+                          "inline-flex shrink-0 items-center rounded-md bg-accent px-3 py-2 text-sm font-medium text-accent-foreground hover:opacity-90",
+                          FOCUS_RING,
+                        )}
+                      >
+                        Add
+                      </button>
+                    </div>
+                    {categoryError && (
+                      <p
+                        id="sub-new-category-error"
+                        role="alert"
+                        className="text-sm text-destructive"
+                      >
+                        {categoryError}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
             </Field>
 
             {/* Amount */}
@@ -786,6 +914,14 @@ export default function SubscriptionModal({
                 </Field>
               </>
             )}
+
+            {/* Tags (full width) — add/remove chips, de-duplicated by core. */}
+            <div className="sm:col-span-2">
+              <TagEditor
+                tags={form.tags}
+                onChange={(tags) => set("tags", tags)}
+              />
+            </div>
 
             {/* Notes (full width) */}
             <div className="sm:col-span-2">

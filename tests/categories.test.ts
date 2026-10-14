@@ -6,10 +6,14 @@ import {
   categoryAssignmentCount,
   isCategoryInUse,
   mergeSettings,
+  assignDefaultColors,
+  setCategoryColor,
+  addTag,
+  removeTag,
 } from "core/categories";
 import type { Category } from "core/models/category";
 import type { Subscription } from "core/models/subscription";
-import { DEFAULT_SETTINGS } from "core/models/schema";
+import { DEFAULT_SETTINGS, DEFAULT_CATEGORY_COLORS } from "core/models/schema";
 
 /**
  * Unit tests for category management and settings-merge helpers
@@ -120,6 +124,111 @@ describe("deleteCategory", () => {
   it("returns an equivalent list when no id matches", () => {
     const existing = [category("A")];
     expect(deleteCategory(existing, "missing")).toEqual(existing);
+  });
+});
+
+// --- assignDefaultColors (Story 3.4 one-time seed) ---------------------------
+
+describe("assignDefaultColors", () => {
+  it("fills a missing color on a default-named category from the seed palette", () => {
+    const existing = [category("Streaming", true)];
+    const next = assignDefaultColors(existing);
+    expect(next[0].color).toBe(DEFAULT_CATEGORY_COLORS["Streaming"]);
+    // Purity: input not mutated.
+    expect(existing[0].color).toBeUndefined();
+  });
+
+  it("NEVER overwrites a user-set color on a default-named category", () => {
+    const existing = [{ ...category("Streaming", true), color: "#abcdef" }];
+    const next = assignDefaultColors(existing);
+    expect(next[0].color).toBe("#abcdef");
+  });
+
+  it("NEVER touches a custom (non-default-named) category", () => {
+    const existing = [category("Side Projects", false)];
+    const next = assignDefaultColors(existing);
+    expect(next[0].color).toBeUndefined();
+  });
+
+  it("seeds every default name and leaves custom + already-colored intact", () => {
+    const existing: Category[] = [
+      category("AI", true), // → gets seeded
+      { ...category("Music", true), color: "#111111" }, // kept
+      category("My Stuff", false), // custom → untouched
+    ];
+    const next = assignDefaultColors(existing);
+    expect(next[0].color).toBe(DEFAULT_CATEGORY_COLORS["AI"]);
+    expect(next[1].color).toBe("#111111");
+    expect(next[2].color).toBeUndefined();
+    // Order preserved.
+    expect(next.map((c) => c.name)).toEqual(["AI", "Music", "My Stuff"]);
+  });
+});
+
+// --- setCategoryColor (Story 3.4) --------------------------------------------
+
+describe("setCategoryColor", () => {
+  it("sets the color on exactly the matching id, returning a new array", () => {
+    const existing = [category("A"), category("B")];
+    const next = setCategoryColor(existing, "id-A", "#123456");
+    expect(next.find((c) => c.name === "A")!.color).toBe("#123456");
+    expect(next.find((c) => c.name === "B")!.color).toBeUndefined();
+    // Purity.
+    expect(existing[0].color).toBeUndefined();
+    expect(next).not.toBe(existing);
+  });
+
+  it("clears the color by DROPPING the key when passed undefined", () => {
+    const existing = [{ ...category("A"), color: "#123456" }];
+    const next = setCategoryColor(existing, "id-A", undefined);
+    expect(next[0].color).toBeUndefined();
+    // The key is actually absent (not an empty string).
+    expect("color" in next[0]).toBe(false);
+  });
+
+  it("is a no-op (new array, identical contents) for an unknown id", () => {
+    const existing = [category("A")];
+    const next = setCategoryColor(existing, "missing", "#000000");
+    expect(next).toEqual(existing);
+  });
+});
+
+// --- addTag / removeTag (Story 3.4) ------------------------------------------
+
+describe("addTag", () => {
+  it("appends a trimmed tag, order-preserving", () => {
+    expect(addTag(["Work"], "  Personal  ")).toEqual(["Work", "Personal"]);
+  });
+
+  it("ignores a blank / whitespace-only tag", () => {
+    expect(addTag(["Work"], "   ")).toEqual(["Work"]);
+    expect(addTag(["Work"], "")).toEqual(["Work"]);
+  });
+
+  it("de-duplicates case-insensitively, keeping the first-seen casing", () => {
+    expect(addTag(["Work"], "work")).toEqual(["Work"]);
+    expect(addTag(["Work"], " WORK ")).toEqual(["Work"]);
+  });
+
+  it("never mutates the input array", () => {
+    const tags = ["Work"];
+    const next = addTag(tags, "Play");
+    expect(tags).toEqual(["Work"]);
+    expect(next).not.toBe(tags);
+  });
+});
+
+describe("removeTag", () => {
+  it("removes a tag matched trimmed + case-insensitively", () => {
+    expect(removeTag(["Work", "Play"], " work ")).toEqual(["Play"]);
+    expect(removeTag(["Work", "Play"], "PLAY")).toEqual(["Work"]);
+  });
+
+  it("preserves order and leaves non-matches intact; never mutates input", () => {
+    const tags = ["A", "B", "C"];
+    const next = removeTag(tags, "B");
+    expect(next).toEqual(["A", "C"]);
+    expect(tags).toEqual(["A", "B", "C"]);
   });
 });
 
