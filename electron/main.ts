@@ -204,10 +204,14 @@ function unregisterDialogChannels(): void {
  *
  * Starts the real {@link Scheduler} slightly after first paint so reminder
  * evaluation does not compete with cold-start work (Req 21.1). {@link Scheduler.start}
- * runs an immediate launch evaluation and then keeps a periodic timer ticking
- * for the process lifetime, so reminders fire regardless of window visibility
- * when Tray_Mode is on (Req 13.3). Safe to invoke more than once: `start()` is
- * idempotent and will not duplicate the interval.
+ * runs the launch CATCH-UP pass (Story 4.3) FIRST — firing reminders missed
+ * while the app was closed, within the 24h look-back anchored on `lastRunAt` —
+ * then an immediate launch evaluation, then keeps a periodic timer ticking for
+ * the process lifetime, so reminders fire regardless of window visibility when
+ * Tray_Mode is on (Req 13.3). The catch-up therefore runs here, AFTER the
+ * migration barrier (the scheduler is constructed and started post-barrier in
+ * the `whenReady` sequence — AD-28), exactly once per launch. Safe to invoke
+ * more than once: `start()` is idempotent and will not duplicate the interval.
  */
 function scheduleDeferredSchedulerFirstTick(): void {
   setTimeout(() => {

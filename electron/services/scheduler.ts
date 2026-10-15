@@ -43,23 +43,31 @@
  *    failure is caught, the cycle degrades (emits nothing / does not advance
  *    `lastRunAt`), and does not crash.
  *
- * NOTE on the two date roles (see the spec's Design Notes): the RENEWAL-DUE
- * comparison inside `dueLeadTimes` uses a UTC `today` (`toISODate(now)`) — that
- * calendar-UTC arithmetic is unchanged. The DEDUPE BUCKET is the canonical LOCAL
- * day from `reminderDay`. They can differ by one near a midnight boundary, and
- * that is correct.
+ * SEAM FIX (Story 4.3): the live tick now decides dueness AND stores the dedupe
+ * bucket on the SAME single value — `localToday = reminderDay(now, offset)`. This
+ * CORRECTS the shipped 4.2 split (which decided dueness on a UTC `today` yet
+ * stored the local day): because `catchUp` keys each event on
+ * `targetDate = nextRenewal - leadDays`, and on the firing local day
+ * `localToday === targetDate` (dueness means `localToday + leadDays ===
+ * nextRenewal`), the live tick and the launch catch-up now produce an IDENTICAL
+ * dedupe identity for the same `(sub, leadTime, renewal)` — so a reminder shown by
+ * one is never re-shown by the other (SM-2 across the live/catch-up seam). Dueness
+ * is now genuinely LOCAL (AD-18), not UTC.
  *
- * The launch catch-up pass (reading `lastRunAt` to fire reminders missed while
- * the app was closed) is Story 4.3 — NOT this story. 4.2 only ADVANCES
- * `lastRunAt` so 4.3 has an anchor to read.
+ * The launch catch-up pass ({@link Scheduler.catchUpOnLaunch}) fires reminders
+ * whose moment passed while the app was closed, within the 24h look-back cap
+ * anchored on `lastRunAt`. It is run ONCE by {@link Scheduler.start} before the
+ * first periodic evaluation, after `main.ts`'s migration barrier (AD-28). It
+ * reuses the SAME shared write tail ({@link Scheduler.commitLedger}) as the live
+ * tick — one write path, one lock, one degrade stance.
  *
  * Whether evaluation continues while the window is closed (Tray_Mode) is a
  * concern of `tray.ts` + `main.ts` wiring: this scheduler simply keeps ticking
  * until {@link Scheduler.stop} is called.
  */
 
-import { dueLeadTimes, prune, reminderDay, unfired } from "core/notify";
-import { rollForward, type ISODate } from "core/renewal";
+import { catchUp, dueLeadTimes, prune, reminderDay, unfired } from "core/notify";
+import { rollForward } from "core/renewal";
 import type { ReminderEvent, ReminderLedger } from "core/models/reminder";
 import type { ReminderLeadTime, SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -102,6 +110,15 @@ export const DEFAULT_INTERVAL_MS = 30 * 60 * 1000;
  */
 export const RETENTION_DAYS = 90;
 
+/**
+ * How far back the launch catch-up pass (Story 4.3) looks for reminders whose
+ * moment passed while the app was closed. 24h is the PRD FR-7 look-back cap — the
+ * MAXIMUM, not a blind window: `catchUp` anchors the real window on
+ * `max(lastRunAt, now - LOOKBACK_HOURS)`, so a 2h-ago last run yields a 2h window
+ * (never a flat 24h). This value must never widen past 24h (spec Boundaries).
+ */
+export const LOOKBACK_HOURS = 24;
+
 /** Construction options for {@link Scheduler}. */
 export interface SchedulerOptions {
   /** Reads settings + subscriptions + the ledger each cycle, writes the ledger back. */
@@ -125,19 +142,11 @@ export interface SchedulerOptions {
   offsetMinutes?: () => number;
 }
 
-/** Derive the UTC `YYYY-MM-DD` "today" from a `Date`. */
-function toISODate(date: Date): ISODate {
-  // UTC slice keeps "today" consistent with core's UTC date arithmetic — this
-  // is the RENEWAL-DUE comparison date passed to `dueLeadTimes`, distinct from
-  // the canonical LOCAL day used as the ledger dedupe bucket.
-  return date.toISOString().slice(0, 10);
-}
-
 /**
  * Periodic + launch reminder evaluator. Construct with injected seams, then
- * call {@link start} (begins ticking, runs an immediate launch evaluation) or
- * {@link evaluateNow} to run a single cycle directly (used by the deferred
- * launch tick and by tests).
+ * call {@link start} (runs the launch catch-up pass, then begins ticking with an
+ * immediate launch evaluation) or {@link evaluateNow} to run a single cycle
+ * directly (used by the deferred launch tick and by tests).
  */
 export class Scheduler {
   private readonly services: SchedulerServices;
@@ -164,10 +173,18 @@ export class Scheduler {
   }
 
   /**
-   * Begin periodic evaluation and run an immediate launch evaluation. Safe to
-   * call repeatedly: a second call without {@link stop} is a no-op so the timer
-   * is never duplicated. Returns the promise for the launch cycle so callers
-   * (and tests) can await the first evaluation.
+   * Run the launch catch-up pass (Story 4.3), begin periodic evaluation, and run
+   * an immediate launch evaluation. Safe to call repeatedly: a second call
+   * without {@link stop} is a no-op so the timer is never duplicated. Returns a
+   * promise for the launch work so callers (and tests) can await it.
+   *
+   * Launch ORDERING (AD-28): the single catch-up pass runs ONCE here, BEFORE the
+   * first periodic `evaluateNow()`, so a reminder missed while the app was closed
+   * is caught before the live path evaluates. The scheduler is only constructed
+   * and started AFTER `main.ts`'s migration barrier, so catch-up never reads
+   * un-migrated data. The catch-up degrades on throw internally (never rejects),
+   * so chaining the launch evaluation after it cannot be short-circuited by a
+   * catch-up fault.
    */
   start(): Promise<void> {
     if (this.timer === null) {
@@ -176,8 +193,14 @@ export class Scheduler {
       }, this.intervalMs);
       // Don't let the timer keep the (headless/test) event loop alive.
       this.timer.unref?.();
+      // FIRST start only: the launch catch-up pass runs ONCE per launch (AD-20),
+      // inside this guard, so a repeat `start()` (timer already live) does NOT
+      // re-run it. Catch-up FIRST (Req 13.1): fire reminders missed while closed,
+      // THEN the immediate launch evaluation for anything due right now.
+      return this.catchUpOnLaunch().then(() => this.evaluateNow());
     }
-    // Launch evaluation (Req 13.1): evaluate once immediately on start.
+    // Repeat `start()` with the timer already live: idempotent — no second
+    // catch-up pass; just run a single launch evaluation (the prior contract).
     return this.evaluateNow();
   }
 
@@ -226,12 +249,10 @@ export class Scheduler {
       if (!settings.notification.enabled) return;
 
       const enabled = settings.notification.leadTimes;
-      // Capture the clock ONCE so the UTC `today` (renewal-due arithmetic), the
-      // canonical `localDay` bucket, and the advanced `lastRunAt` all derive from
-      // the SAME instant — no sub-millisecond skew between the two date roles.
+      // Capture the clock ONCE so the local-day `today` (dueness AND the stored
+      // dedupe bucket) and the advanced `lastRunAt` derive from the SAME instant.
       const now = this.now();
       const nowIso = now.toISOString();
-      const today = toISODate(now);
 
       // (2) Current subscription set + the persisted ledger (the dedupe source).
       //     A ledger READ failure degrades the whole cycle (emit nothing, write
@@ -252,8 +273,15 @@ export class Scheduler {
         return;
       }
 
-      // (3) The ONE canonical local-day bucket (AD-18).
-      const localDay = reminderDay(nowIso, this.offsetMinutes());
+      // (3) The ONE canonical local day (AD-18), used as BOTH the dueness `today`
+      //     AND the stored dedupe bucket. SEAM FIX (4.3): the live tick now decides
+      //     dueness on the LOCAL day — not a UTC `today` — and stores that SAME
+      //     local day as `localDay`. On the firing local day the resulting bucket
+      //     equals catchUp's `targetDate = nextRenewal - leadDays` (because dueness
+      //     means `localToday + leadDays === nextRenewal`), so the live tick and
+      //     the launch catch-up produce an identical dedupe identity for the same
+      //     `(sub, leadTime, renewal)` and never double-fire across the seam (SM-2).
+      const localToday = reminderDay(nowIso, this.offsetMinutes());
 
       // (4) Build the due events across eligible subs. A sub lookup by id lets
       //     the emit step pass the ACTUAL (rolled-forward) subscription to the
@@ -263,19 +291,19 @@ export class Scheduler {
       for (const sub of subs) {
         // Roll a past renewal forward (autoRenew only) so the evaluated date is
         // the genuine upcoming renewal.
-        const evaluated = rollForward(sub, today);
+        const evaluated = rollForward(sub, localToday);
         // Paused subscriptions never generate reminders (AD-17); Active and
         // Trial are both reminder-eligible.
         if (evaluated.state === "Paused") continue;
         subById.set(evaluated.id, evaluated);
-        // Pure due-decision against the UTC `today` (renewal-date arithmetic).
-        for (const leadTime of dueLeadTimes(evaluated, today, enabled)) {
+        // Pure due-decision against the LOCAL day (AD-18 local dueness).
+        for (const leadTime of dueLeadTimes(evaluated, localToday, enabled)) {
           due.push({
             kind: "renewal",
             subscriptionId: evaluated.id,
             leadTime,
-            // The canonical LOCAL-day dedupe bucket (AD-18).
-            localDay,
+            // The canonical LOCAL-day dedupe bucket = the due date (AD-18).
+            localDay: localToday,
           });
         }
       }
@@ -292,34 +320,18 @@ export class Scheduler {
       }
 
       // (7) Record the fired events, advance `lastRunAt`, prune to the retention
-      //     window, and atomically write back under the lock. Notifications were
-      //     shown BEFORE this write (the user-visible action is the point): a
-      //     caught write failure leaves the prior ledger intact (no partial
-      //     write — the adapter is atomic) and never throws into the event loop.
-      const next: ReminderLedger = {
-        ...ledger,
-        lastRunAt: nowIso,
-        fired: prune(
-          { ...ledger, fired: [...ledger.fired, ...fresh] },
-          localDay,
-          RETENTION_DAYS,
-        ).fired,
-      };
-      try {
-        await this.services.writeReminderLedger(next);
-      } catch (err) {
-        console.error(
-          `[subby] scheduler ledger write failed (reminders shown, not recorded): ${
-            err instanceof Error ? err.message : String(err)
-          }`,
-        );
-      }
+      //     window, and atomically write back under the lock (shared write tail).
+      //     Notifications were shown BEFORE this write (the user-visible action is
+      //     the point): a caught write failure leaves the prior ledger intact (no
+      //     partial write — the adapter is atomic) and never throws into the event
+      //     loop. `localToday` is the prune anchor and matches the fired buckets.
+      await this.commitLedger(ledger, fresh, nowIso, localToday);
     } catch (err) {
       // DEGRADE, never propagate (AD-28): the scheduler must never throw into the
       // event loop. This covers the DECIDE + WRITE region — e.g. `reminderDay`'s
       // fail-closed `RangeError` on a bad offset, a bad clock making
-      // `now.toISOString()`/`toISODate` throw, or an unexpected `prune` throw. On
-      // any such throw the cycle emits/writes nothing beyond what already ran and
+      // `now.toISOString()` throw, or an unexpected `prune` throw. On any such
+      // throw the cycle emits/writes nothing beyond what already ran and
       // `lastRunAt` is left unchanged (a partial-emit followed by a throw before
       // the write simply leaves the prior ledger intact — safe under-fire). The
       // dedicated read-failure catch above handles its case with a specific
@@ -331,6 +343,155 @@ export class Scheduler {
       );
     } finally {
       this.evaluating = false;
+    }
+  }
+
+  /**
+   * Launch catch-up pass (Story 4.3, AD-20). Runs ONCE per launch — invoked by
+   * {@link start} BEFORE the first periodic evaluation, and only after `main.ts`
+   * has crossed the migration barrier (AD-28), so it never reads un-migrated
+   * data. It fires reminders whose moment passed while the app was CLOSED,
+   * consulting the SAME persisted ledger as the live tick so an already-shown
+   * reminder never re-fires (SM-2 across the live/catch-up seam).
+   *
+   *  1. Read settings. If notifications are disabled, return — a no-op that
+   *     writes NOTHING (`lastRunAt` is not advanced), matching the live tick.
+   *  2. Capture `now` once; read subscriptions + the ledger. A read failure
+   *     degrades the whole pass (emit nothing, write nothing, no crash) — launch
+   *     continues.
+   *  3. Roll each sub forward on the canonical local day (as the tick does), then
+   *     `catchUp(evaluatedSubs, ledger, now, LOOKBACK_HOURS)` — the pure decision:
+   *     only Active/Trial subs (never Paused), only events in `[max(lastRunAt,
+   *     now-24h), now]`, only identities not already in `ledger.fired`. The
+   *     returned events already key `localDay` on the TARGET DUE DATE, the same
+   *     canonical bucket the (seam-fixed) live tick stores. `catchUp` has no
+   *     enabled-lead-time param, so its result is filtered by the user's enabled
+   *     lead times — the live tick respects them, and catch-up must too.
+   *  4. Emit one notification per surviving event via the existing notifier.
+   *  5. Append + advance `lastRunAt` + prune + atomic locked write — the SAME
+   *     shared write tail as the live tick ({@link commitLedger}). The prune
+   *     anchor is the catch-up `now`'s local day (today), consistent with the tick.
+   *
+   * The pass never throws into the event loop (AD-28): every failure path above
+   * is caught here and degrades. `lastRunAt` is advanced even when zero reminders
+   * are caught up, so the next window is anchored forward.
+   */
+  async catchUpOnLaunch(): Promise<void> {
+    try {
+      // (1) Settings gate (Req 13.5), mirroring the live tick: disabled → no-op,
+      //     write nothing.
+      const settings = await this.services.getSettings();
+      if (!settings.notification.enabled) return;
+
+      // (2) Capture the clock ONCE so the catch-up window `now`, the advanced
+      //     `lastRunAt`, and the prune anchor all derive from the SAME instant.
+      const now = this.now();
+      const nowIso = now.toISOString();
+
+      // Current subscription set + the persisted ledger. A read failure degrades
+      // the whole pass (emit nothing, write nothing, no crash); launch continues.
+      let subs: SubscriptionV2[];
+      let ledger: ReminderLedger;
+      try {
+        [subs, ledger] = await Promise.all([
+          this.services.listSubscriptions(),
+          this.services.readReminderLedger(),
+        ]);
+      } catch (err) {
+        console.error(
+          `[subby] scheduler catch-up skipped: ledger/subscriptions read failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        return;
+      }
+
+      // (3) The ONE canonical local day (AD-18), used BOTH to roll subs forward
+      //     (so a lapsed autoRenew renewal keys on its NEXT occurrence, matching
+      //     the live tick's `rollForward(sub, localToday)`) AND as the prune
+      //     anchor. Keeping the same local-day basis as the tick is what keeps the
+      //     seam key identical for lapsed renewals.
+      const localToday = reminderDay(nowIso, this.offsetMinutes());
+
+      // (4) Roll each sub forward on the SAME local-day basis as the tick, then
+      //     run the pure catch-up decision (eligibility + window + already-fired)
+      //     over the rolled-forward subs. `SubscriptionV2[]` structurally
+      //     satisfies `CatchUpSubscription[]`. `catchUp` has no enabled-lead-time
+      //     param, so filter its result by the user's enabled lead times — the
+      //     live tick respects them, and catch-up must too.
+      const evaluatedSubs = subs.map((sub) => rollForward(sub, localToday));
+      const enabled = new Set(settings.notification.leadTimes);
+      const fresh = catchUp(evaluatedSubs, ledger, nowIso, LOOKBACK_HOURS).filter(
+        (event) => enabled.has(event.leadTime),
+      );
+
+      // (5) Emit each caught-up reminder (local OS notification, zero network).
+      //     The map is keyed over the ROLLED-FORWARD subs so the notifier receives
+      //     the same evaluated subscription the identity was keyed on.
+      const subById = new Map<string, SubscriptionV2>();
+      for (const sub of evaluatedSubs) subById.set(sub.id, sub);
+      for (const event of fresh) {
+        const sub = subById.get(event.subscriptionId);
+        if (sub !== undefined) {
+          this.notifier.notify(sub, event.leadTime);
+        }
+      }
+
+      // (6) Shared write tail: append + advance `lastRunAt` + prune + atomic
+      //     locked write. The prune anchor is the catch-up `now`'s local day.
+      await this.commitLedger(ledger, fresh, nowIso, localToday);
+    } catch (err) {
+      // DEGRADE, never propagate (AD-28): a bad clock/offset (`reminderDay`
+      // RangeError) or any unexpected throw degrades the pass — emit/write nothing
+      // beyond what already ran, leave the prior ledger intact, and let launch
+      // proceed. The read-failure catch above handles its case specifically; this
+      // is the catch-all backstop.
+      console.error(
+        `[subby] scheduler catch-up degraded (caught, not thrown): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * The SHARED ledger write tail used by BOTH the live tick ({@link evaluateNow})
+   * and the launch catch-up ({@link catchUpOnLaunch}) — one write path, one lock,
+   * one degrade stance, no duplication.
+   *
+   * Appends `fresh` to the prior `fired`, advances `lastRunAt` to `nowIso`, prunes
+   * to the retention window anchored on `localToday`, and atomically writes the
+   * ledger back under `lock("reminderLedger")`. The caller has ALREADY emitted the
+   * notifications (the user-visible action is the point): a caught write failure
+   * leaves the prior ledger intact (the adapter write is atomic — no partial
+   * write) and NEVER throws into the event loop. The under-fire-is-safer stance is
+   * inherited unchanged — a shown-but-unrecorded reminder may re-show on a later
+   * same-day cycle, strictly safer than recording-before-showing (which could drop
+   * a reminder on a crash).
+   */
+  private async commitLedger(
+    ledger: ReminderLedger,
+    fresh: ReminderEvent[],
+    nowIso: string,
+    localToday: string,
+  ): Promise<void> {
+    const next: ReminderLedger = {
+      ...ledger,
+      lastRunAt: nowIso,
+      fired: prune(
+        { ...ledger, fired: [...ledger.fired, ...fresh] },
+        localToday,
+        RETENTION_DAYS,
+      ).fired,
+    };
+    try {
+      await this.services.writeReminderLedger(next);
+    } catch (err) {
+      console.error(
+        `[subby] scheduler ledger write failed (reminders shown, not recorded): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
   }
 }

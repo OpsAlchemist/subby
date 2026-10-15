@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { Scheduler } from "../electron/services/scheduler";
+import { LOOKBACK_HOURS, Scheduler } from "../electron/services/scheduler";
 import type { SchedulerServices, SubscriptionNotifier } from "../electron/services/scheduler";
 import type { ReminderLedger } from "core/models/reminder";
 import type { ReminderLeadTime, SettingsV2 } from "core/models/settings";
@@ -292,19 +292,20 @@ describe("Tray_Mode OFF means evaluation only runs while the app is open (Req 13
     const intervalMs = 1000;
     const scheduler = new Scheduler({ services, notifier, intervalMs, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
 
-    // start() runs an immediate launch evaluation (one cycle).
+    // start() runs the launch catch-up pass (one read) THEN the immediate launch
+    // evaluation (one read) — two subscription reads before any periodic tick.
     await scheduler.start();
-    expect(listSubscriptions).toHaveBeenCalledTimes(1);
+    expect(listSubscriptions).toHaveBeenCalledTimes(2);
 
     // While running, each interval triggers another evaluation cycle.
     await vi.advanceTimersByTimeAsync(intervalMs);
-    expect(listSubscriptions).toHaveBeenCalledTimes(2);
+    expect(listSubscriptions).toHaveBeenCalledTimes(3);
 
     // stop() cancels the timer: advancing time produces NO further cycles.
     // This models Tray_Mode OFF — once the app stops running, evaluation halts.
     scheduler.stop();
     await vi.advanceTimersByTimeAsync(intervalMs * 5);
-    expect(listSubscriptions).toHaveBeenCalledTimes(2);
+    expect(listSubscriptions).toHaveBeenCalledTimes(3);
   });
 
   it("when stopped, evaluation happens only on explicit evaluateNow() (while open)", async () => {
@@ -465,12 +466,17 @@ describe("ledger-backed exactly-once dedupe (Story 4.2 — SM-2)", () => {
     expect(ledger.ledger.fired).toHaveLength(2);
   });
 
-  it("local-day boundary: the ledger bucket is reminderDay(now, offset), not the UTC day", async () => {
-    // now = 2026-03-07T23:30Z, offset +330 (IST) => local day 2026-03-08. The
-    // renewal-due comparison uses the UTC `today` (2026-03-07), so a sub renewing
-    // same-day on 2026-03-07 is due; the DEDUPE bucket stored is the LOCAL day.
+  it("local-day boundary: dueness AND the ledger bucket are both reminderDay(now, offset)", async () => {
+    // SEAM FIX (4.3): now = 2026-03-07T23:30Z, offset +330 (IST) => the canonical
+    // LOCAL day is 2026-03-08. Dueness is now decided on that LOCAL day (not the
+    // UTC day), so a sub is due same-day only when it renews ON the local day
+    // (2026-03-08); the stored `localDay` is that same due date — one canonical
+    // key shared with catchUp. (Under the old 4.2 split, dueness used the UTC day
+    // 2026-03-07 while storing the local day 2026-03-08; the fixture is updated
+    // for local-dueness keying — the emit outcome still holds, keyed on the due
+    // date.)
     const now = () => new Date("2026-03-07T23:30:00Z");
-    const sub = makeSubscription({ id: "boundary", nextRenewal: "2026-03-07" });
+    const sub = makeSubscription({ id: "boundary", nextRenewal: "2026-03-08" });
     const { services, ledger } = makeServices(makeSettings(["same-day"]), [sub]);
     const notifier = makeNotifier();
     const scheduler = new Scheduler({
@@ -483,8 +489,8 @@ describe("ledger-backed exactly-once dedupe (Story 4.2 — SM-2)", () => {
     await scheduler.evaluateNow();
 
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    // The stored `localDay` is the canonical LOCAL day (2026-03-08), proving the
-    // dedupe bucket is `reminderDay(now, offset)` — the one canonical clock.
+    // The stored `localDay` is the canonical LOCAL day (2026-03-08) = the due
+    // date, proving dueness and the dedupe bucket share `reminderDay(now, offset)`.
     expect(ledger.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "boundary", leadTime: "same-day", localDay: "2026-03-08" },
     ]);
@@ -624,5 +630,393 @@ describe("ledger-backed exactly-once dedupe (Story 4.2 — SM-2)", () => {
     expect(
       ledgerStore.store.ledger.fired.some((e) => e.subscriptionId === "due"),
     ).toBe(true);
+  });
+});
+
+describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)", () => {
+  // The headline seam cases prove the live tick and the launch catch-up share ONE
+  // canonical dedupe key (the TARGET DUE DATE) even near a UTC-midnight boundary
+  // with a non-zero offset — so a reminder shown by one path is never re-shown by
+  // the other.
+  //
+  // Trace (verified): now 2026-03-09T20:00Z, offset +330 (IST) => the canonical
+  // LOCAL day is 2026-03-10. A sub renewing 2026-03-11 (one-day lead) is due on
+  // that local day, and BOTH paths key it on the due date 2026-03-10:
+  //   - live tick: localToday = reminderDay(now,+330) = 2026-03-10; dueness is
+  //     localToday+1 == renewal; stored localDay = localToday = 2026-03-10.
+  //   - catch-up:  targetDate = renewal - 1 day = 2026-03-10 (its localDay key).
+  const SEAM_OFFSET = () => 330; // IST, minutes EAST of UTC
+  const SEAM_LIVE_NOW = () => new Date("2026-03-09T20:00:00Z"); // local day 2026-03-10
+  const SEAM_CATCHUP_NOW = () => new Date("2026-03-10T02:00:00Z"); // same local day, within 24h
+  const SEAM_RENEWAL = "2026-03-11"; // one-day lead => due date 2026-03-10
+  const SEAM_DUE_DATE = "2026-03-10";
+
+  it("SEAM: a reminder shown by the live tick is NOT re-fired by a relaunch catch-up (same localDay key)", async () => {
+    const sub = makeSubscription({ id: "seam", nextRenewal: SEAM_RENEWAL });
+    const sharedLedger = makeLedgerStore();
+
+    // Live tick near the UTC-midnight boundary fires the one-day reminder and
+    // persists it keyed on the DUE DATE (2026-03-10).
+    const live = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const liveNotifier = makeNotifier();
+    const liveScheduler = new Scheduler({
+      services: live.services,
+      notifier: liveNotifier,
+      now: SEAM_LIVE_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await liveScheduler.evaluateNow();
+    expect(liveNotifier.notify).toHaveBeenCalledTimes(1);
+    expect(sharedLedger.store.ledger.fired).toEqual([
+      { kind: "renewal", subscriptionId: "seam", leadTime: "one-day", localDay: SEAM_DUE_DATE },
+    ]);
+
+    // Relaunch: catch-up runs over the SAME persisted ledger + sub. It computes
+    // the IDENTICAL localDay (= due date), so `catchUp`'s already-fired filter
+    // suppresses it — NO double-fire across the seam (SM-2).
+    const relaunch = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const cuNotifier = makeNotifier();
+    const cuScheduler = new Scheduler({
+      services: relaunch.services,
+      notifier: cuNotifier,
+      now: SEAM_CATCHUP_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await cuScheduler.catchUpOnLaunch();
+
+    expect(cuNotifier.notify).not.toHaveBeenCalled();
+    // The ledger still has exactly the one entry (no duplicate appended).
+    expect(
+      sharedLedger.store.ledger.fired.filter((e) => e.subscriptionId === "seam"),
+    ).toHaveLength(1);
+  });
+
+  it("SEAM (inverse): a reminder caught up at launch is NOT re-fired by the live tick (same localDay key)", async () => {
+    const sub = makeSubscription({ id: "seam", nextRenewal: SEAM_RENEWAL });
+    const sharedLedger = makeLedgerStore();
+
+    // Catch-up fires first (empty ledger): emits the missed one-day reminder and
+    // records it keyed on the due date 2026-03-10.
+    const launch = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const cuNotifier = makeNotifier();
+    const cuScheduler = new Scheduler({
+      services: launch.services,
+      notifier: cuNotifier,
+      now: SEAM_CATCHUP_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await cuScheduler.catchUpOnLaunch();
+    expect(cuNotifier.notify).toHaveBeenCalledTimes(1);
+    expect(cuNotifier.notify).toHaveBeenCalledWith(sub, "one-day");
+    expect(sharedLedger.store.ledger.fired).toEqual([
+      { kind: "renewal", subscriptionId: "seam", leadTime: "one-day", localDay: SEAM_DUE_DATE },
+    ]);
+
+    // The live tick on the same local day over the SAME ledger dedupes it: the
+    // tick computes the identical key, so `unfired` drops it — no double-fire.
+    const live = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const liveNotifier = makeNotifier();
+    const liveScheduler = new Scheduler({
+      services: live.services,
+      notifier: liveNotifier,
+      now: SEAM_LIVE_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await liveScheduler.evaluateNow();
+
+    expect(liveNotifier.notify).not.toHaveBeenCalled();
+    expect(
+      sharedLedger.store.ledger.fired.filter((e) => e.subscriptionId === "seam"),
+    ).toHaveLength(1);
+  });
+
+  it("missed-while-closed: fires a reminder due within 24h once, appends it, advances lastRunAt", async () => {
+    // now = 2025-03-07T00:00Z (UTC). A sub renewing 2025-03-10 has only its
+    // THREE-days fire moment (UTC midnight of 2025-03-07 == now) inside the 24h
+    // window; its same-day/one-day moments are in the future. three-days is
+    // enabled, so catch-up fires exactly that one reminder.
+    // NOTE: `catchUp` (frozen 4.1) evaluates ALL lead times whose moment lands in
+    // the window — the enabled-lead-times filter is applied at the call site — so
+    // the single emit here comes from a renewal that places only the (enabled)
+    // three-days moment in-window.
+    const sub = makeSubscription({ id: "missed", nextRenewal: "2025-03-10" });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [sub]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days");
+    // Appended, keyed on the due date (renewal - 3 days = TODAY), lastRunAt advanced.
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "renewal", subscriptionId: "missed", leadTime: "three-days", localDay: TODAY },
+    ]);
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("already-fired: catch-up emits nothing for a reminder already in the ledger", async () => {
+    // Same single-in-window setup as missed-while-closed (renewal 2025-03-10 =>
+    // only the enabled three-days moment lands in the window, keyed on due date
+    // TODAY), but the ledger ALREADY has that identity. `catchUp` drops it => no
+    // emit (dedupe is the cause, not the lead-time filter — three-days is enabled).
+    const sub = makeSubscription({ id: "dup", nextRenewal: "2025-03-10" });
+    const seeded = makeLedgerStore({
+      version: 1,
+      lastRunAt: null,
+      fired: [
+        { kind: "renewal", subscriptionId: "dup", leadTime: "three-days", localDay: TODAY },
+      ],
+    });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [sub], seeded);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    // No duplicate appended; still exactly one entry for that identity.
+    expect(
+      ledger.ledger.fired.filter((e) => e.subscriptionId === "dup"),
+    ).toHaveLength(1);
+  });
+
+  it("beyond look-back: a reminder whose moment is > 24h before now is not caught up", async () => {
+    // now = 2025-03-07T00:00Z. A sub renewing 2025-03-05 (same-day) has its fire
+    // moment at UTC midnight 2025-03-05 == 48h before now — outside the 24h cap.
+    const sub = makeSubscription({ id: "old", nextRenewal: "2025-03-05" });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [sub]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    // Nothing fired, but a completed pass still advances `lastRunAt`.
+    expect(ledger.ledger.fired).toEqual([]);
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("Paused: a Paused sub due in the window is never caught up", async () => {
+    const paused = makeSubscription({ id: "paused", nextRenewal: TODAY, state: "Paused" });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [paused]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(ledger.ledger.fired).toEqual([]);
+  });
+
+  it("lastRunAt anchors the window: a reminder before lastRunAt (but within 24h) is not caught up", async () => {
+    // now = 2025-03-07T00:00Z, lastRunAt = 2h before now (2025-03-06T22:00Z). The
+    // sub renews 2025-03-06 (same-day), fire moment UTC midnight 2025-03-06 — that
+    // is within the 24h cap but BEFORE lastRunAt, so the anchored window
+    // [max(lastRunAt, now-24h), now] = [2025-03-06T22:00Z, now] excludes it.
+    const sub = makeSubscription({ id: "pre-anchor", nextRenewal: "2025-03-06" });
+    const seeded = makeLedgerStore({
+      version: 1,
+      lastRunAt: "2025-03-06T22:00:00.000Z",
+      fired: [],
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [sub], seeded);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    // The pass completes and advances `lastRunAt` forward to `now`.
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("read failure degrades the pass: emits nothing, writes nothing, does not crash", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const ledgerStore = makeLedgerStore();
+    ledgerStore.store.failReads = true;
+    const { services, writeReminderLedger } = makeServices(
+      makeSettings(["same-day"]),
+      [sub],
+      ledgerStore,
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    // Must not throw — launch continues.
+    await expect(scheduler.catchUpOnLaunch()).resolves.toBeUndefined();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(writeReminderLedger).not.toHaveBeenCalled();
+    expect(ledgerStore.store.ledger.lastRunAt).toBeNull();
+  });
+
+  it("disabled notifications: catch-up emits nothing and writes nothing (no lastRunAt advance)", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const { services, listSubscriptions, writeReminderLedger, ledger } = makeServices(
+      makeSettings(["same-day"], /* enabled */ false),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(listSubscriptions).not.toHaveBeenCalled();
+    expect(writeReminderLedger).not.toHaveBeenCalled();
+    expect(ledger.ledger.lastRunAt).toBeNull();
+  });
+
+  it("start() runs the catch-up pass before the first periodic evaluation", async () => {
+    // A reminder missed while closed (its three-days moment is in-window; renewal
+    // 2025-03-10, due date TODAY) is caught by start()'s catch-up FIRST. The
+    // chained immediate launch evaluation finds the SAME three-days reminder due
+    // (localToday 2025-03-07 + 3 == renewal) but dedupes it against the entry the
+    // catch-up just recorded — so the reminder emits exactly once overall, proving
+    // the catch-up ran before (and shares one key with) the live evaluation.
+    const sub = makeSubscription({ id: "launch", nextRenewal: "2025-03-10" });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [sub]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.start();
+    scheduler.stop();
+
+    // Exactly once (caught up at launch; the chained live evaluation adds nothing).
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days");
+    expect(
+      ledger.ledger.fired.filter((e) => e.subscriptionId === "launch"),
+    ).toEqual([
+      { kind: "renewal", subscriptionId: "launch", leadTime: "three-days", localDay: TODAY },
+    ]);
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("respects enabled lead times: a DISABLED lead time whose moment is in-window is NOT caught up", async () => {
+    // now = 2025-03-07T00:00Z. A sub renewing 2025-03-08 has only its ONE-day fire
+    // moment (UTC midnight 2025-03-07 == now) in the 24h window. Settings enable
+    // ONLY same-day, so the live tick would never fire one-day — and catch-up must
+    // match: the disabled lead time is filtered out at the call site (`catchUp`
+    // itself has no enabled param), so NOTHING is caught up.
+    const sub = makeSubscription({ id: "disabled-lt", nextRenewal: "2025-03-08" });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [sub]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    // Nothing fired (one-day disabled), but a completed pass still advances lastRunAt.
+    expect(ledger.ledger.fired).toEqual([]);
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("rolls lapsed autoRenew renewals forward: catch-up keys on the next occurrence, matching the live tick", async () => {
+    // A monthly autoRenew sub whose nextRenewal LAPSED while the app was closed
+    // (2025-02-07, a month before now). Catch-up must roll it forward on the same
+    // local-day basis the live tick uses (rollForward(sub, localToday)) so it keys
+    // on the NEXT occurrence 2025-03-07 (== TODAY) — NOT the stale Feb date. With
+    // same-day enabled, catch-up fires same-day keyed on the rolled-forward date.
+    const lapsed = makeSubscription({
+      id: "lapsed",
+      nextRenewal: "2025-02-07",
+      billingCycle: "Monthly",
+      autoRenew: true,
+    });
+    const sharedLedger = makeLedgerStore();
+    const cu = makeServices(makeSettings(["same-day"]), [lapsed], sharedLedger);
+    const cuNotifier = makeNotifier();
+    const cuScheduler = new Scheduler({
+      services: cu.services,
+      notifier: cuNotifier,
+      now: FIXED_NOW,
+      offsetMinutes: OFFSET_UTC,
+    });
+
+    await cuScheduler.catchUpOnLaunch();
+
+    // Caught up and keyed on the rolled-forward occurrence (2025-03-07 == TODAY),
+    // the SAME key a live tick would store — not the stale 2025-02-07.
+    expect(cuNotifier.notify).toHaveBeenCalledTimes(1);
+    expect(cuNotifier.notify).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "lapsed", nextRenewal: TODAY }),
+      "same-day",
+    );
+    expect(sharedLedger.store.ledger.fired).toEqual([
+      { kind: "renewal", subscriptionId: "lapsed", leadTime: "same-day", localDay: TODAY },
+    ]);
+
+    // Seam proof: a live tick over the SAME ledger + sub dedupes it (the tick also
+    // rolls forward to 2025-03-07 and computes the identical key) — no re-fire.
+    const live = makeServices(makeSettings(["same-day"]), [lapsed], sharedLedger);
+    const liveNotifier = makeNotifier();
+    const liveScheduler = new Scheduler({
+      services: live.services,
+      notifier: liveNotifier,
+      now: FIXED_NOW,
+      offsetMinutes: OFFSET_UTC,
+    });
+    await liveScheduler.evaluateNow();
+    expect(liveNotifier.notify).not.toHaveBeenCalled();
+    expect(
+      sharedLedger.store.ledger.fired.filter((e) => e.subscriptionId === "lapsed"),
+    ).toHaveLength(1);
+  });
+
+  it("degrades on a DECIDE-region throw (bad offset → reminderDay RangeError): no emit, no write, no crash", async () => {
+    // Mirrors the live-tick DECIDE-region degrade test: `offsetMinutes: () => NaN`
+    // makes `reminderDay` throw its fail-closed RangeError inside the pass (after
+    // the settings/subs/ledger reads). The catch-all backstop must degrade: resolve
+    // without throwing, emit nothing, write nothing (lastRunAt unchanged) — AD-28.
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const ledgerStore = makeLedgerStore();
+    const { services, writeReminderLedger } = makeServices(
+      makeSettings(["same-day"]),
+      [sub],
+      ledgerStore,
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({
+      services,
+      notifier,
+      now: FIXED_NOW,
+      offsetMinutes: () => Number.NaN, // reminderDay fail-closes with a RangeError
+    });
+
+    await expect(scheduler.catchUpOnLaunch()).resolves.toBeUndefined();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(writeReminderLedger).not.toHaveBeenCalled();
+    expect(ledgerStore.store.ledger.lastRunAt).toBeNull();
+  });
+
+  it("a repeat start() does NOT re-run the catch-up pass (once per launch)", async () => {
+    // start() runs catch-up once inside the first-start guard. A second start()
+    // with the timer already live must NOT re-run catch-up — only a single launch
+    // evaluation. We track catch-up runs via subscription reads: the first start()
+    // reads subs twice (catch-up + evaluate); the second start() reads once (just
+    // the evaluate), proving no second catch-up pass.
+    const sub = makeSubscription({ id: "once", nextRenewal: "2025-12-31" });
+    const { services, listSubscriptions } = makeServices(
+      makeSettings(["same-day"]),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.start();
+    expect(listSubscriptions).toHaveBeenCalledTimes(2); // catch-up + launch eval
+
+    await scheduler.start(); // timer already live → no second catch-up
+    expect(listSubscriptions).toHaveBeenCalledTimes(3); // only one more (eval)
+
+    scheduler.stop();
+  });
+
+  it("LOOKBACK_HOURS is the 24h PRD FR-7 cap (guard against widening)", () => {
+    // Executable boundary: the look-back must never widen past 24h (spec Boundaries).
+    expect(LOOKBACK_HOURS).toBe(24);
   });
 });
