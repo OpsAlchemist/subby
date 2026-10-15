@@ -18,7 +18,9 @@
 
 import { Notification } from "electron";
 
+import { conversionDate } from "core/trial";
 import { toMajor } from "core/money";
+import type { ReminderEventKind } from "core/models/reminder";
 import type { ReminderLeadTime } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
 
@@ -38,11 +40,22 @@ export interface NotificationPayload {
  */
 export type Notifier = (payload: NotificationPayload) => void;
 
-/** Human-readable phrasing for each lead time, relative to "today". */
+/** Human-readable RENEWAL phrasing for each lead time, relative to "today". */
 const LEAD_TIME_PHRASE: Record<ReminderLeadTime, string> = {
   "same-day": "renews today",
   "one-day": "renews tomorrow",
   "three-days": "renews in 3 days",
+};
+
+/**
+ * Human-readable TRIAL-END phrasing for each lead time (Story 5.2) — the "ends
+ * in …" framing a trial-conversion warning uses, so the copy names WHEN the free
+ * trial converts to a paid charge rather than a recurring renewal.
+ */
+const TRIAL_END_PHRASE: Record<ReminderLeadTime, string> = {
+  "same-day": "trial ends today",
+  "one-day": "trial ends tomorrow",
+  "three-days": "trial ends in 3 days",
 };
 
 /**
@@ -59,15 +72,46 @@ export const electronNotifier: Notifier = ({ title, body }) => {
 
 /**
  * Build the title/body text summarizing a subscription reminder for a given
- * lead time. Pure and exported so tests can assert the copy without emitting.
+ * lead time and event `kind`. Pure and exported so tests can assert the copy
+ * without emitting.
  *
- * Example: `{ title: "Netflix renews tomorrow", body: "₹—  •  INR 499 on 2025-02-01" }`
- * (amount/currency only included when an amount is present).
+ * `kind:"renewal"` renders the recurring-renewal body (unchanged), e.g.
+ *   `{ title: "Netflix renews tomorrow", body: "INR 499.00 • renews on 2025-02-01" }`.
+ *
+ * `kind:"trial-end"` (Story 5.2) renders a factual trial-conversion warning that
+ * NAMES the post-trial price — the amount that will actually be charged once the
+ * free trial converts — drawn from `sub.trial.postAmountMinor` through the money
+ * seam (`toMajor`, no "/mo" — a per-cycle figure, consistent with 5.1), e.g.
+ *   `{ title: "Notion trial ends in 3 days", body: "USD 10.00 after • converts 2026-12-15" }`.
+ * No hype, no emoji — the copy states the facts plainly.
  */
 export function renderReminder(
   sub: SubscriptionV2,
   leadTime: ReminderLeadTime,
+  kind: ReminderEventKind,
 ): NotificationPayload {
+  if (kind === "trial-end" && sub.trial !== undefined) {
+    const phrase = TRIAL_END_PHRASE[leadTime];
+    const title = `${sub.name} ${phrase}`;
+    const converts = conversionDate(sub.trial);
+    // Post-trial price: the amount charged once the trial converts, routed
+    // through the money seam. No "/mo" — a per-cycle figure (consistent with
+    // 5.1's framing). The plain "ends …"/"… after" wording stays factual.
+    //
+    // DEGRADE, never throw (AD-28): `toMajor` throws on an unknown currency or a
+    // non-integer minor amount. A throw here would propagate through `notify`
+    // into the scheduler emit loop and abort the cycle BEFORE `commitLedger`,
+    // leaving already-shown reminders unrecorded (so they could re-fire). The
+    // notifier must never throw: fall back to a price-less body that still names
+    // the conversion so the user is warned, factually, even on bad money data.
+    try {
+      const postMajor = toMajor(sub.trial.postAmountMinor, sub.currency);
+      const body = `${sub.currency} ${postMajor} after • converts ${converts}`;
+      return { title, body };
+    } catch {
+      return { title, body: `converts ${converts}` };
+    }
+  }
   const phrase = LEAD_TIME_PHRASE[leadTime];
   const title = `${sub.name} ${phrase}`;
   const amountPart = `${sub.currency} ${toMajor(sub.amountMinor, sub.currency)}`;
@@ -93,11 +137,11 @@ export class NotificationService {
   }
 
   /**
-   * Emit a single desktop reminder for `sub` at the given `leadTime`. Builds the
-   * summary copy and hands it to the injected {@link Notifier}. Offline by
-   * construction (Req 13.2).
+   * Emit a single desktop reminder for `sub` at the given `leadTime` and event
+   * `kind`. Builds the summary copy (renewal vs trial-end) and hands it to the
+   * injected {@link Notifier}. Offline by construction (Req 13.2).
    */
-  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime): void {
-    this.notifier(renderReminder(sub, leadTime));
+  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime, kind: ReminderEventKind): void {
+    this.notifier(renderReminder(sub, leadTime, kind));
   }
 }

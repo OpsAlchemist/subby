@@ -66,15 +66,27 @@
  * until {@link Scheduler.stop} is called.
  */
 
-import { catchUp, dueLeadTimes, prune, reminderDay, unfired } from "core/notify";
+import {
+  catchUp,
+  catchUpTrialEnds,
+  dueLeadTimes,
+  prune,
+  reminderDay,
+  trialEndDue,
+  unfired,
+} from "core/notify";
 import { rollForward } from "core/renewal";
-import type { ReminderEvent, ReminderLedger } from "core/models/reminder";
+import type {
+  ReminderEvent,
+  ReminderEventKind,
+  ReminderLedger,
+} from "core/models/reminder";
 import type { ReminderLeadTime, SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
 
-/** Emits one desktop reminder for a `(subscription, leadTime)` pair. */
+/** Emits one desktop reminder for a `(subscription, leadTime, kind)` triple. */
 export interface SubscriptionNotifier {
-  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime): void;
+  notify(sub: SubscriptionV2, leadTime: ReminderLeadTime, kind: ReminderEventKind): void;
 }
 
 /**
@@ -282,6 +294,12 @@ export class Scheduler {
       //     the launch catch-up produce an identical dedupe identity for the same
       //     `(sub, leadTime, renewal)` and never double-fire across the seam (SM-2).
       const localToday = reminderDay(nowIso, this.offsetMinutes());
+      // The UTC calendar day of `nowIso` — the SECOND interpretation the
+      // trial-end earlier-of-local/UTC rule needs (Story 5.2). It is derived from
+      // the SAME captured instant as `localToday` (no second clock): `reminderDay`
+      // with a zero offset yields the UTC `YYYY-MM-DD` day. Renewal dueness still
+      // keys purely on `localToday` — this is used only by `trialEndDue`.
+      const utcToday = reminderDay(nowIso, 0);
 
       // (4) Build the due events across eligible subs. A sub lookup by id lets
       //     the emit step pass the ACTUAL (rolled-forward) subscription to the
@@ -306,16 +324,23 @@ export class Scheduler {
             localDay: localToday,
           });
         }
+        // Trial-End reminders (Story 5.2): a Trial sub ALSO contributes trial-end
+        // events, keyed on the STABLE conversion-target day and due on the
+        // conservative earlier of the local/UTC interpretation (never after the
+        // charge). `trialEndDue` returns [] for a non-Trial sub, so this is a
+        // no-op for plain-Active subs — renewal keying is untouched.
+        due.push(...trialEndDue(evaluated, localToday, utcToday, enabled));
       }
 
       // (5) Exactly-once dedupe against the PERSISTED ledger (SM-2).
       const fresh = unfired(due, ledger);
 
-      // (6) Emit each surviving event (local OS notification, zero network).
+      // (6) Emit each surviving event (local OS notification, zero network). The
+      //     event `kind` (renewal vs trial-end) selects the notifier's body copy.
       for (const event of fresh) {
         const sub = subById.get(event.subscriptionId);
         if (sub !== undefined) {
-          this.notifier.notify(sub, event.leadTime);
+          this.notifier.notify(sub, event.leadTime, event.kind);
         }
       }
 
@@ -421,19 +446,28 @@ export class Scheduler {
       //     live tick respects them, and catch-up must too.
       const evaluatedSubs = subs.map((sub) => rollForward(sub, localToday));
       const enabled = new Set(settings.notification.leadTimes);
-      const fresh = catchUp(evaluatedSubs, ledger, nowIso, LOOKBACK_HOURS).filter(
-        (event) => enabled.has(event.leadTime),
-      );
+      // Renewal catch-up (frozen 4.1) AND the Story 5.2 trial-end catch-up sibling
+      // run over the SAME window/ledger with the SAME `(now, LOOKBACK_HOURS)`
+      // signature (both are offset-independent). Both are filtered by the user's
+      // enabled lead times (the live tick respects them, and catch-up must too)
+      // and both flow through the one shared `commitLedger` write tail below. The
+      // ledger's discriminated `kind` keeps renewal and trial-end identities
+      // distinct, so the two result sets never collide.
+      const fresh = [
+        ...catchUp(evaluatedSubs, ledger, nowIso, LOOKBACK_HOURS),
+        ...catchUpTrialEnds(evaluatedSubs, ledger, nowIso, LOOKBACK_HOURS),
+      ].filter((event) => enabled.has(event.leadTime));
 
       // (5) Emit each caught-up reminder (local OS notification, zero network).
       //     The map is keyed over the ROLLED-FORWARD subs so the notifier receives
-      //     the same evaluated subscription the identity was keyed on.
+      //     the same evaluated subscription the identity was keyed on. The event
+      //     `kind` selects the renewal vs trial-end body copy.
       const subById = new Map<string, SubscriptionV2>();
       for (const sub of evaluatedSubs) subById.set(sub.id, sub);
       for (const event of fresh) {
         const sub = subById.get(event.subscriptionId);
         if (sub !== undefined) {
-          this.notifier.notify(sub, event.leadTime);
+          this.notifier.notify(sub, event.leadTime, event.kind);
         }
       }
 

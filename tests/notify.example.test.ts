@@ -2,12 +2,17 @@ import { describe, it, expect } from "vitest";
 
 import {
   catchUp,
+  catchUpTrialEnds,
   prune,
   reminderDay,
+  trialEndDue,
   unfired,
   type CatchUpSubscription,
+  type CatchUpTrialSubscription,
+  type TrialEndSubscription,
 } from "core/notify";
 import type { ReminderEvent, ReminderLedger } from "core/models/reminder";
+import type { TrialV2 } from "core/models/subscription";
 
 /**
  * Concrete example tests for the Story 4.1 reminder-ledger decision helpers —
@@ -168,6 +173,197 @@ describe("catchUp — events whose moment passed while closed (AD-20)", () => {
     const bad = sub({ id: "bad", nextRenewal: "nope" });
     const result = catchUp([bad, good], ledger(), now, 24);
     // The bad sub emits nothing; the good one still fires its same-day event.
+    expect(result.every((e) => e.subscriptionId === "good")).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+describe("trialEndDue — the one-shot trial-end live-tick decision (Story 5.2)", () => {
+  function trialSub(
+    trial: TrialV2,
+    overrides: Partial<TrialEndSubscription> = {},
+  ): TrialEndSubscription {
+    return { id: "t", state: "Trial", trial, ...overrides };
+  }
+
+  it("fires on the local interpretation (localToday === targetDay)", () => {
+    // Converts 2026-12-15, one-day lead => targetDay 2026-12-14 = localToday.
+    const result = trialEndDue(
+      trialSub({ endDate: "2026-12-15", postAmountMinor: 1000 }),
+      "2026-12-14", // localToday
+      "2026-12-14", // utcToday
+      ["one-day"],
+    );
+    expect(result).toEqual([
+      { kind: "trial-end", subscriptionId: "t", leadTime: "one-day", localDay: "2026-12-14" },
+    ]);
+  });
+
+  it("earlier-of-local/UTC: fires when the UTC day reaches the target first (west offset)", () => {
+    // localToday 2026-12-14, utcToday 2026-12-13, same-day target 2026-12-13.
+    // The UTC interpretation reaches the target first => due (never after charge).
+    const result = trialEndDue(
+      trialSub({ endDate: "2026-12-13", postAmountMinor: 1000 }),
+      "2026-12-14", // localToday (west of UTC)
+      "2026-12-13", // utcToday
+      ["same-day"],
+    );
+    expect(result).toEqual([
+      { kind: "trial-end", subscriptionId: "t", leadTime: "same-day", localDay: "2026-12-13" },
+    ]);
+  });
+
+  it("stable target-day key: identical whether local or UTC fired", () => {
+    const trial: TrialV2 = { endDate: "2026-12-15", postAmountMinor: 1000 };
+    // Local reaches target.
+    const viaLocal = trialEndDue(trialSub(trial), "2026-12-12", "2026-12-11", ["three-days"]);
+    // UTC reaches target.
+    const viaUtc = trialEndDue(trialSub(trial), "2026-12-11", "2026-12-12", ["three-days"]);
+    expect(viaLocal).toEqual(viaUtc);
+    expect(viaLocal[0]?.localDay).toBe("2026-12-12"); // target = conversion - 3 days
+  });
+
+  it("returns [] for a non-Trial sub (no trial to warn about)", () => {
+    expect(
+      trialEndDue(
+        { id: "a", state: "Active" },
+        "2026-12-14",
+        "2026-12-14",
+        ["same-day", "one-day", "three-days"],
+      ),
+    ).toEqual([]);
+    expect(
+      trialEndDue(
+        { id: "p", state: "Paused", trial: { endDate: "2026-12-14", postAmountMinor: 1 } },
+        "2026-12-14",
+        "2026-12-14",
+        ["same-day"],
+      ),
+    ).toEqual([]);
+  });
+
+  it("enabled-gated: a disabled lead time whose target is today is not emitted", () => {
+    // Converts today under same-day, but only three-days is enabled.
+    const result = trialEndDue(
+      trialSub({ endDate: "2026-12-14", postAmountMinor: 1000 }),
+      "2026-12-14",
+      "2026-12-14",
+      ["three-days"],
+    );
+    expect(result).toEqual([]);
+  });
+
+  it("not due when neither interpretation reaches the target", () => {
+    const result = trialEndDue(
+      trialSub({ endDate: "2026-12-20", postAmountMinor: 1000 }),
+      "2026-12-14",
+      "2026-12-14",
+      ["same-day", "one-day", "three-days"],
+    );
+    expect(result).toEqual([]);
+  });
+
+  it("start+lengthDays trial: targets conversionDate(start+days) - leadDays", () => {
+    // start 2026-12-01 + 14 days = converts 2026-12-15; three-days => 2026-12-12.
+    const result = trialEndDue(
+      trialSub({ startDate: "2026-12-01", lengthDays: 14, postAmountMinor: 1000 }),
+      "2026-12-12",
+      "2026-12-12",
+      ["three-days"],
+    );
+    expect(result).toEqual([
+      { kind: "trial-end", subscriptionId: "t", leadTime: "three-days", localDay: "2026-12-12" },
+    ]);
+  });
+
+  it("fail-closed: an unparseable conversion date yields no trial-end events", () => {
+    // A Trial whose endDate cannot be parsed emits nothing — the explicit guard
+    // (symmetric with catchUpTrialEnds), not merely the no-match path.
+    const result = trialEndDue(
+      trialSub({ endDate: "nope", postAmountMinor: 1000 }),
+      "2026-12-14",
+      "2026-12-14",
+      ["same-day", "one-day", "three-days"],
+    );
+    expect(result).toEqual([]);
+  });
+});
+
+describe("catchUpTrialEnds — the one-shot trial-end catch-up (Story 5.2)", () => {
+  const now = "2026-06-15T12:00:00.000Z";
+
+  function trialSub(
+    overrides: Partial<CatchUpTrialSubscription> = {},
+  ): CatchUpTrialSubscription {
+    return {
+      id: "a",
+      state: "Trial",
+      trial: { endDate: "2026-06-15", postAmountMinor: 1000 },
+      ...overrides,
+    };
+  }
+
+  it("returns a trial-end event whose fire-moment is within [now-lookback, now]", () => {
+    // same-day lead on a trial converting today => fire moment 2026-06-15T00:00Z,
+    // 12h before now => inside a 24h look-back.
+    const result = catchUpTrialEnds([trialSub()], ledger(), now, 24);
+    const sameDay = result.find((e) => e.leadTime === "same-day");
+    expect(sameDay).toBeDefined();
+    expect(sameDay?.kind).toBe("trial-end");
+    expect(sameDay?.localDay).toBe("2026-06-15");
+  });
+
+  it("Trial-only: an Active or Paused sub (even with a stale trial) is skipped", () => {
+    expect(catchUpTrialEnds([trialSub({ state: "Active" })], ledger(), now, 24)).toEqual([]);
+    expect(catchUpTrialEnds([trialSub({ state: "Paused" })], ledger(), now, 24)).toEqual([]);
+  });
+
+  it("excludes an event whose moment is OLDER than the look-back window", () => {
+    const past = catchUpTrialEnds(
+      [trialSub({ trial: { endDate: "2026-06-13", postAmountMinor: 1000 } })],
+      ledger({ lastRunAt: "2026-06-13T12:00:00.000Z" }),
+      now,
+      24,
+    );
+    expect(past.some((e) => e.leadTime === "same-day")).toBe(false);
+  });
+
+  it("does not re-fire a trial-end already in the ledger", () => {
+    const alreadyFired: ReminderEvent = {
+      kind: "trial-end",
+      subscriptionId: "a",
+      leadTime: "same-day",
+      localDay: "2026-06-15",
+    };
+    const result = catchUpTrialEnds([trialSub()], ledger({ fired: [alreadyFired] }), now, 24);
+    expect(result.some((e) => e.leadTime === "same-day")).toBe(false);
+  });
+
+  it("distinct from a fired RENEWAL of the same id/leadTime/day (different kind)", () => {
+    const firedRenewal: ReminderEvent = {
+      kind: "renewal",
+      subscriptionId: "a",
+      leadTime: "same-day",
+      localDay: "2026-06-15",
+    };
+    // The renewal is fired, but the trial-end is a distinct identity => still emits.
+    const result = catchUpTrialEnds([trialSub()], ledger({ fired: [firedRenewal] }), now, 24);
+    expect(result.some((e) => e.leadTime === "same-day" && e.kind === "trial-end")).toBe(true);
+  });
+
+  it("fail-closed: a bad `now` returns [] (never emits every event)", () => {
+    expect(catchUpTrialEnds([trialSub()], ledger(), "not-a-date", 24)).toEqual([]);
+  });
+
+  it("fail-closed: a non-finite `lookbackHours` returns []", () => {
+    expect(catchUpTrialEnds([trialSub()], ledger(), now, Number.NaN)).toEqual([]);
+    expect(catchUpTrialEnds([trialSub()], ledger(), now, Number.POSITIVE_INFINITY)).toEqual([]);
+  });
+
+  it("fail-closed: a trial with an unparseable conversion date is skipped, others still fire", () => {
+    const good = trialSub({ id: "good" });
+    const bad = trialSub({ id: "bad", trial: { endDate: "nope", postAmountMinor: 1 } });
+    const result = catchUpTrialEnds([bad, good], ledger(), now, 24);
     expect(result.every((e) => e.subscriptionId === "good")).toBe(true);
     expect(result.length).toBeGreaterThan(0);
   });

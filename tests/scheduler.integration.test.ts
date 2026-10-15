@@ -181,7 +181,7 @@ describe("offline emission (Req 13.2)", () => {
 
     // Exactly one local notification was produced for the due same-day reminder.
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(sameDaySub, "same-day");
+    expect(notifier.notify).toHaveBeenCalledWith(sameDaySub, "same-day", "renewal");
   });
 
   it("emits one notification per due lead time across multiple subscriptions", async () => {
@@ -203,9 +203,9 @@ describe("offline emission (Req 13.2)", () => {
     await scheduler.evaluateNow();
 
     expect(notifier.notify).toHaveBeenCalledTimes(3);
-    expect(notifier.notify).toHaveBeenCalledWith(subs[0], "same-day");
-    expect(notifier.notify).toHaveBeenCalledWith(subs[1], "one-day");
-    expect(notifier.notify).toHaveBeenCalledWith(subs[2], "three-days");
+    expect(notifier.notify).toHaveBeenCalledWith(subs[0], "same-day", "renewal");
+    expect(notifier.notify).toHaveBeenCalledWith(subs[1], "one-day", "renewal");
+    expect(notifier.notify).toHaveBeenCalledWith(subs[2], "three-days", "renewal");
   });
 });
 
@@ -241,7 +241,7 @@ describe("Tray_Mode ON keeps the scheduler evaluating while the window is closed
     state.subs = [...subs, newlyDue];
     await scheduler.evaluateNow();
     expect(notifier.notify).toHaveBeenCalledTimes(4);
-    expect(notifier.notify).toHaveBeenLastCalledWith(newlyDue, "same-day");
+    expect(notifier.notify).toHaveBeenLastCalledWith(newlyDue, "same-day", "renewal");
   });
 
   it("re-emits the same reminder on a NEW day (different `now`)", async () => {
@@ -275,7 +275,7 @@ describe("Tray_Mode ON keeps the scheduler evaluating while the window is closed
     // New LOCAL day => different `localDay` bucket => not deduped => emits again.
     await scheduler.evaluateNow();
     expect(notifier.notify).toHaveBeenCalledTimes(2);
-    expect(notifier.notify).toHaveBeenLastCalledWith(nextDaySub, "same-day");
+    expect(notifier.notify).toHaveBeenLastCalledWith(nextDaySub, "same-day", "renewal");
   });
 });
 
@@ -323,7 +323,7 @@ describe("Tray_Mode OFF means evaluation only runs while the app is open (Req 13
     // The app invokes evaluation explicitly (i.e. while the window is open).
     await scheduler.evaluateNow();
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day");
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day", "renewal");
   });
 });
 
@@ -344,11 +344,14 @@ describe("state-based reminder eligibility (AD-17)", () => {
 
   it("a due Trial subscription DOES produce a notification (Trial is reminder-eligible)", async () => {
     // Same-day due; Trial is live and reminder-eligible alongside Active (AD-17).
+    // The trial's conversion is far in the future so ONLY the renewal fires here —
+    // this test pins the renewal eligibility of a Trial state; the trial-END
+    // reminder gets its own dedicated coverage below (Story 5.2).
     const trial = makeSubscription({
       id: "trial",
       nextRenewal: TODAY,
       state: "Trial",
-      trial: { endDate: TODAY, postAmountMinor: 49900 },
+      trial: { endDate: "2099-01-01", postAmountMinor: 49900 },
     });
     const { services, ledger } = makeServices(makeSettings(["same-day"]), [trial]);
     const notifier = makeNotifier();
@@ -357,7 +360,7 @@ describe("state-based reminder eligibility (AD-17)", () => {
     await scheduler.evaluateNow();
 
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(trial, "same-day");
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "same-day", "renewal");
     // A fired Trial renewal reminder is recorded in the ledger.
     expect(ledger.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "trial", leadTime: "same-day", localDay: TODAY },
@@ -397,7 +400,7 @@ describe("ledger-backed exactly-once dedupe (Story 4.2 — SM-2)", () => {
     await scheduler.evaluateNow();
 
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day");
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day", "renewal");
     expect(ledger.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "a", leadTime: "same-day", localDay: TODAY },
     ]);
@@ -707,7 +710,7 @@ describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)
     });
     await cuScheduler.catchUpOnLaunch();
     expect(cuNotifier.notify).toHaveBeenCalledTimes(1);
-    expect(cuNotifier.notify).toHaveBeenCalledWith(sub, "one-day");
+    expect(cuNotifier.notify).toHaveBeenCalledWith(sub, "one-day", "renewal");
     expect(sharedLedger.store.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "seam", leadTime: "one-day", localDay: SEAM_DUE_DATE },
     ]);
@@ -747,7 +750,7 @@ describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)
     await scheduler.catchUpOnLaunch();
 
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days");
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days", "renewal");
     // Appended, keyed on the due date (renewal - 3 days = TODAY), lastRunAt advanced.
     expect(ledger.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "missed", leadTime: "three-days", localDay: TODAY },
@@ -885,7 +888,7 @@ describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)
 
     // Exactly once (caught up at launch; the chained live evaluation adds nothing).
     expect(notifier.notify).toHaveBeenCalledTimes(1);
-    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days");
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "three-days", "renewal");
     expect(
       ledger.ledger.fired.filter((e) => e.subscriptionId === "launch"),
     ).toEqual([
@@ -943,6 +946,7 @@ describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)
     expect(cuNotifier.notify).toHaveBeenCalledWith(
       expect.objectContaining({ id: "lapsed", nextRenewal: TODAY }),
       "same-day",
+      "renewal",
     );
     expect(sharedLedger.store.ledger.fired).toEqual([
       { kind: "renewal", subscriptionId: "lapsed", leadTime: "same-day", localDay: TODAY },
@@ -1018,5 +1022,254 @@ describe("launch catch-up pass (Story 4.3 — AD-20) + live/catch-up seam (SM-2)
   it("LOOKBACK_HOURS is the 24h PRD FR-7 cap (guard against widening)", () => {
     // Executable boundary: the look-back must never widen past 24h (spec Boundaries).
     expect(LOOKBACK_HOURS).toBe(24);
+  });
+});
+
+describe("Trial-End reminders (Story 5.2) — tick, seam, catch-up, eligibility", () => {
+  /**
+   * A Trial sub whose conversion is `TODAY` with same-day enabled fires a
+   * trial-end reminder on the live tick, keyed on the conversion target day, and
+   * records a `kind:"trial-end"` ledger entry. The notifier is called with the
+   * `trial-end` kind so it renders the post-trial body.
+   */
+  it("live tick fires a due trial-end (notifier called with kind:'trial-end') and records it", async () => {
+    // Conversion TODAY, same-day lead => targetDay = TODAY => due. nextRenewal is
+    // far in the future so NO renewal reminder fires — isolating the trial-end.
+    const trial = makeSubscription({
+      id: "notion",
+      name: "Notion",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: TODAY, postAmountMinor: 1000 }, // $10.00-equivalent
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "same-day", "trial-end");
+    // The ledger records a distinct trial-end event keyed on the conversion day.
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "trial-end", subscriptionId: "notion", leadTime: "same-day", localDay: TODAY },
+    ]);
+  });
+
+  it("trial-end fires on an enabled lead time BEFORE the conversion day (three-days)", async () => {
+    // Conversion 2025-03-10, three-days enabled => targetDay = 2025-03-07 = TODAY.
+    const trial = makeSubscription({
+      id: "ahead",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: "2025-03-10", postAmountMinor: 500 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "three-days", "trial-end");
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "trial-end", subscriptionId: "ahead", leadTime: "three-days", localDay: TODAY },
+    ]);
+  });
+
+  it("earlier-of-local/UTC: fires on the UTC interpretation when it reaches the target first (west offset)", async () => {
+    // now 2026-12-14T02:00Z, offset -480 (PST) => localToday 2026-12-13,
+    // utcToday 2026-12-14. A trial converting 2026-12-14 with same-day lead has
+    // targetDay 2026-12-14 — equal to utcToday (NOT localToday). The conservative
+    // earlier-of rule fires it on the UTC interpretation (never after the charge).
+    const trial = makeSubscription({
+      id: "west",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: "2026-12-14", postAmountMinor: 999 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({
+      services,
+      notifier,
+      now: () => new Date("2026-12-14T02:00:00Z"),
+      offsetMinutes: () => -480,
+    });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "same-day", "trial-end");
+    // Dedupe key is the STABLE target day (= conversion day for a same-day lead),
+    // not whichever interpretation fired.
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "trial-end", subscriptionId: "west", leadTime: "same-day", localDay: "2026-12-14" },
+    ]);
+  });
+
+  it("a Paused (or plain Active) sub NEVER fires a trial-end", async () => {
+    // A Paused sub (even with a stale embedded trial) and a plain Active sub both
+    // produce no trial-end. The Active sub's renewal is also future, so nothing
+    // fires at all.
+    const paused = makeSubscription({
+      id: "paused",
+      nextRenewal: "2099-01-01",
+      state: "Paused",
+      trial: { endDate: TODAY, postAmountMinor: 1000 },
+    });
+    const active = makeSubscription({
+      id: "active",
+      nextRenewal: "2099-01-01",
+      state: "Active",
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [paused, active]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(ledger.ledger.fired).toEqual([]);
+  });
+
+  it("disabled lead time: a trial-end whose target is today is not emitted (enabled-gated)", async () => {
+    // Conversion TODAY, but ONLY three-days enabled => same-day target (TODAY) is
+    // gated off; three-days target would be 3 days ago (not today) => nothing.
+    const trial = makeSubscription({
+      id: "gated",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: TODAY, postAmountMinor: 1000 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).not.toHaveBeenCalled();
+    expect(ledger.ledger.fired).toEqual([]);
+  });
+
+  it("same-day restart: a trial-end already in the ledger does NOT re-fire", async () => {
+    const trial = makeSubscription({
+      id: "restart",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: TODAY, postAmountMinor: 1000 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    // First tick fires + records it.
+    await scheduler.evaluateNow();
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    // Re-run on the same day over the SAME persisted ledger: unfired suppresses it.
+    await scheduler.evaluateNow();
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(ledger.ledger.fired).toHaveLength(1);
+  });
+
+  // Seam fixtures: a trial converting on SEAM_CONVERSION with one-day lead has a
+  // stable target day SEAM_DUE_DATE. The live tick (local day = SEAM_DUE_DATE via
+  // +330 near the UTC-midnight boundary) and the launch catch-up (fire-moment =
+  // UTC midnight of SEAM_DUE_DATE, in the 24h window) stamp the IDENTICAL
+  // (trial-end, sub, one-day, SEAM_DUE_DATE) identity — so neither re-fires it.
+  const SEAM_OFFSET = () => 330; // IST
+  const SEAM_LIVE_NOW = () => new Date("2026-03-09T20:00:00Z"); // local day 2026-03-10
+  const SEAM_CATCHUP_NOW = () => new Date("2026-03-10T02:00:00Z"); // same local day, within 24h
+  const SEAM_CONVERSION = "2026-03-11"; // one-day lead => target 2026-03-10
+  const SEAM_DUE_DATE = "2026-03-10";
+
+  it("SEAM: a trial-end shown by the live tick is NOT re-fired by a relaunch catch-up", async () => {
+    const sub = makeSubscription({
+      id: "seam",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: SEAM_CONVERSION, postAmountMinor: 1000 },
+    });
+    const sharedLedger = makeLedgerStore();
+
+    const live = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const liveNotifier = makeNotifier();
+    const liveScheduler = new Scheduler({
+      services: live.services,
+      notifier: liveNotifier,
+      now: SEAM_LIVE_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await liveScheduler.evaluateNow();
+    expect(liveNotifier.notify).toHaveBeenCalledTimes(1);
+    expect(liveNotifier.notify).toHaveBeenCalledWith(sub, "one-day", "trial-end");
+    expect(sharedLedger.store.ledger.fired).toEqual([
+      { kind: "trial-end", subscriptionId: "seam", leadTime: "one-day", localDay: SEAM_DUE_DATE },
+    ]);
+
+    // Relaunch catch-up over the SAME ledger computes the IDENTICAL key => no re-fire.
+    const relaunch = makeServices(makeSettings(["one-day"]), [sub], sharedLedger);
+    const cuNotifier = makeNotifier();
+    const cuScheduler = new Scheduler({
+      services: relaunch.services,
+      notifier: cuNotifier,
+      now: SEAM_CATCHUP_NOW,
+      offsetMinutes: SEAM_OFFSET,
+    });
+    await cuScheduler.catchUpOnLaunch();
+
+    expect(cuNotifier.notify).not.toHaveBeenCalled();
+    expect(
+      sharedLedger.store.ledger.fired.filter((e) => e.subscriptionId === "seam"),
+    ).toHaveLength(1);
+  });
+
+  it("missed-while-closed: catch-up fires a missed trial-end once and records it", async () => {
+    // now 2025-03-07T00:00Z (UTC). A trial converting 2025-03-10 with three-days
+    // lead has its target day = TODAY; the UTC-midnight fire moment == now, inside
+    // the 24h window => catch-up fires exactly one trial-end.
+    const trial = makeSubscription({
+      id: "missed",
+      nextRenewal: "2099-01-01",
+      state: "Trial",
+      trial: { endDate: "2025-03-10", postAmountMinor: 1000 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["three-days"]), [trial]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.catchUpOnLaunch();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(notifier.notify).toHaveBeenCalledWith(trial, "three-days", "trial-end");
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "trial-end", subscriptionId: "missed", leadTime: "three-days", localDay: TODAY },
+    ]);
+    expect(ledger.ledger.lastRunAt).toBe(FIXED_NOW().toISOString());
+  });
+
+  it("renewal AND trial-end fire together when both are due in the same cycle", async () => {
+    // Same sub: renewal due same-day (nextRenewal TODAY) AND trial converts TODAY
+    // (same-day lead) => BOTH a renewal and a trial-end event, distinct kinds.
+    const sub = makeSubscription({
+      id: "both",
+      nextRenewal: TODAY,
+      state: "Trial",
+      trial: { endDate: TODAY, postAmountMinor: 1000 },
+    });
+    const { services, ledger } = makeServices(makeSettings(["same-day"]), [sub]);
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(notifier.notify).toHaveBeenCalledTimes(2);
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day", "renewal");
+    expect(notifier.notify).toHaveBeenCalledWith(sub, "same-day", "trial-end");
+    // Both distinct-kind events recorded; renewal keying unchanged alongside.
+    expect(ledger.ledger.fired).toEqual([
+      { kind: "renewal", subscriptionId: "both", leadTime: "same-day", localDay: TODAY },
+      { kind: "trial-end", subscriptionId: "both", leadTime: "same-day", localDay: TODAY },
+    ]);
   });
 });

@@ -3,14 +3,18 @@ import fc from "fast-check";
 
 import {
   catchUp,
+  catchUpTrialEnds,
   dueLeadTimes,
   prune,
   reminderDay,
+  trialEndDue,
   unfired,
   type CatchUpSubscription,
+  type CatchUpTrialSubscription,
+  type TrialEndSubscription,
 } from "core/notify";
 import type { ISODate } from "core/renewal";
-import type { Subscription } from "core/models/subscription";
+import type { Subscription, TrialV2 } from "core/models/subscription";
 import type { ReminderLeadTime } from "core/models/settings";
 import type { ReminderEvent, ReminderLedger } from "core/models/reminder";
 
@@ -394,5 +398,169 @@ describe("Feature: subby, Story 4.1: catchUp never fires a Paused or already-fir
       ),
       { numRuns: NUM_RUNS },
     );
+  });
+});
+
+// =============================================================================
+// Trial-End reminder decision helpers (Story 5.2).
+//
+// Property coverage for the two new pure helpers the scheduler consumes:
+//   - trialEndDue is Trial-only, enabled-gated, fires on the earlier-of-local/UTC
+//     interpretation, and ALWAYS keys the dedupe `localDay` on the STABLE target
+//     day (= conversionDate - leadDays), independent of which interpretation fired.
+//   - catchUpTrialEnds returns only Trial, in-window, not-already-fired trial-end
+//     events (never Active/Paused), with the same stable target-day key.
+// =============================================================================
+
+/** Days before the conversion date each lead time targets (per the spec). */
+const TRIAL_OFFSET_BY_LEAD_TIME = OFFSET_BY_LEAD_TIME;
+
+const trialStateArb = fc.constantFrom<TrialEndSubscription["state"]>(
+  "Active",
+  "Paused",
+  "Trial",
+);
+
+describe("Feature: subby, Story 5.2: trialEndDue is Trial-only, enabled-gated, earlier-of-local/UTC, stable key", () => {
+  it("returns exactly the enabled lead times whose stable target day equals local OR utc today", () => {
+    fc.assert(
+      fc.property(
+        isoDateArb, // conversion date
+        isoDateArb, // localToday
+        isoDateArb, // utcToday
+        enabledArb,
+        trialStateArb,
+        (conversion, localToday, utcToday, enabled, state) => {
+          const sub: TrialEndSubscription = {
+            id: "t",
+            state,
+            trial: { endDate: conversion, postAmountMinor: 1000 },
+          };
+          const result = trialEndDue(sub, localToday, utcToday, enabled);
+          const enabledSet = new Set(enabled);
+
+          // A non-Trial sub NEVER fires — regardless of dates/enabled.
+          if (state !== "Trial") {
+            expect(result).toEqual([]);
+            return;
+          }
+
+          // Independent reference: enabled AND targetDay ∈ {localToday, utcToday}.
+          const expected = ALL_LEAD_TIMES.filter((lt) => {
+            if (!enabledSet.has(lt)) return false;
+            const targetDay = addDays(conversion, -TRIAL_OFFSET_BY_LEAD_TIME[lt]);
+            return targetDay === localToday || targetDay === utcToday;
+          }).map((lt) => ({
+            kind: "trial-end" as const,
+            subscriptionId: "t",
+            leadTime: lt,
+            // The STABLE target day — the conversion date minus the lead offset.
+            localDay: addDays(conversion, -TRIAL_OFFSET_BY_LEAD_TIME[lt]),
+          }));
+
+          // EXACT match (set + canonical ordering + stable key).
+          expect(result).toEqual(expected);
+
+          for (const e of result) {
+            // Only trial-end kind, only enabled lead times.
+            expect(e.kind).toBe("trial-end");
+            expect(enabledSet.has(e.leadTime)).toBe(true);
+            // The dedupe key is the stable target day, NOT whichever `today` fired.
+            expect(e.localDay).toBe(addDays(conversion, -TRIAL_OFFSET_BY_LEAD_TIME[e.leadTime]));
+          }
+          // No duplicates.
+          expect(new Set(result.map((e) => e.leadTime)).size).toBe(result.length);
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("stable key: for a fixed trial, local-fired and utc-fired events are identical", () => {
+    fc.assert(
+      fc.property(isoDateArb, leadTimeArb, (conversion, lead) => {
+        const targetDay = addDays(conversion, -TRIAL_OFFSET_BY_LEAD_TIME[lead]);
+        const trial: TrialV2 = { endDate: conversion, postAmountMinor: 1000 };
+        const sub: TrialEndSubscription = { id: "t", state: "Trial", trial };
+        // Local reaches target (utc one day earlier); then utc reaches it.
+        const viaLocal = trialEndDue(sub, targetDay, addDays(targetDay, -1), [lead]);
+        const viaUtc = trialEndDue(sub, addDays(targetDay, -1), targetDay, [lead]);
+        expect(viaLocal).toEqual(viaUtc);
+        expect(viaLocal[0]?.localDay).toBe(targetDay);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+describe("Feature: subby, Story 5.2: catchUpTrialEnds is Trial-only, in-window, not-already-fired", () => {
+  it("returns only Trial trial-end events in [max(lastRunAt, now-lookback), now], not already fired", () => {
+    fc.assert(
+      fc.property(
+        fc.uniqueArray(
+          fc.record({
+            id: fc.constantFrom("a", "b", "c", "d"),
+            dayOffset: fc.integer({ min: -5, max: 10 }),
+            state: stateArb,
+          }),
+          { maxLength: 4, selector: (s) => s.id },
+        ),
+        fc.integer({ min: 1, max: 240 }), // lookbackHours
+        fc.option(fc.integer({ min: 1, max: 480 }), { nil: null }), // lastRunAt hours before now
+        fc.array(reminderEventArb, { maxLength: 8 }), // pre-fired
+        (subSpecs, lookbackHours, lastRunHoursAgo, firedEvents) => {
+          const nowMs = Date.parse("2026-06-15T12:00:00.000Z");
+          const now = new Date(nowMs).toISOString();
+          const nowDay = "2026-06-15";
+
+          const subs: CatchUpTrialSubscription[] = subSpecs.map((s) => ({
+            id: s.id,
+            state: s.state,
+            // The conversion date is `now`'s day shifted by dayOffset.
+            trial: { endDate: addDays(nowDay, s.dayOffset), postAmountMinor: 1000 },
+          }));
+
+          const lastRunAt =
+            lastRunHoursAgo === null
+              ? null
+              : new Date(nowMs - lastRunHoursAgo * 3_600_000).toISOString();
+          const ledger: ReminderLedger = { version: 1, lastRunAt, fired: firedEvents };
+          const firedIds = new Set(firedEvents.map(identity));
+
+          const anchorMs = Math.max(
+            nowMs - lookbackHours * 3_600_000,
+            lastRunAt === null ? -Infinity : Date.parse(lastRunAt),
+          );
+
+          const result = catchUpTrialEnds(subs, ledger, now, lookbackHours);
+
+          for (const e of result) {
+            // (1) Only trial-end events.
+            expect(e.kind).toBe("trial-end");
+            // (2) Never a non-Trial sub.
+            const sub = subs.find((s) => s.id === e.subscriptionId);
+            expect(sub?.state).toBe("Trial");
+            // (3) Never an already-fired identity.
+            expect(firedIds.has(identity(e))).toBe(false);
+            // (4) Fire-moment (UTC midnight of localDay) within the window.
+            const fireMs = Date.parse(`${e.localDay}T00:00:00.000Z`);
+            expect(fireMs >= anchorMs && fireMs <= nowMs).toBe(true);
+          }
+          // No duplicate identities in a single pass over unique-id subs.
+          expect(new Set(result.map(identity)).size).toBe(result.length);
+        },
+      ),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("fail-closed: a bad now or non-finite lookback returns [] (never every event)", () => {
+    const subs: CatchUpTrialSubscription[] = [
+      { id: "a", state: "Trial", trial: { endDate: "2026-06-15", postAmountMinor: 1000 } },
+    ];
+    const ledger: ReminderLedger = { version: 1, lastRunAt: null, fired: [] };
+    expect(catchUpTrialEnds(subs, ledger, "garbage", 24)).toEqual([]);
+    expect(catchUpTrialEnds(subs, ledger, "2026-06-15T12:00:00Z", Number.NaN)).toEqual([]);
+    expect(catchUpTrialEnds(subs, ledger, "2026-06-15T12:00:00Z", Infinity)).toEqual([]);
   });
 });

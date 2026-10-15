@@ -16,6 +16,8 @@
 
 import type { ReminderLeadTime } from "./models/settings";
 import type { ISODate } from "./renewal";
+import type { SubscriptionState, TrialV2 } from "./models/subscription";
+import { conversionDate } from "./trial";
 import type {
   ReminderEvent,
   ReminderEventKind,
@@ -94,6 +96,84 @@ export function dueLeadTimes(
     const targetDate = addDays(today, LEAD_TIME_OFFSET_DAYS[leadTime]);
     return sub.nextRenewal === targetDate;
   });
+}
+
+/**
+ * The minimal, structural subscription shape {@link trialEndDue} reads: the
+ * three-way `state` (only a `Trial` carries a trial) and the optional embedded
+ * `trial`, plus the `id` that keys the emitted events. Structural so it serves
+ * the live `SubscriptionV2` and any test fixture without a breaking retype.
+ */
+export interface TrialEndSubscription {
+  id: string;
+  state: SubscriptionState;
+  trial?: TrialV2;
+}
+
+/**
+ * The due TRIAL-END reminder events for a Trial subscription (Story 5.2) — the
+ * one-shot sibling of {@link dueLeadTimes}'s recurring renewal decision, keyed
+ * on the trial's conversion date instead of a billing renewal.
+ *
+ * Returns `[]` unless `sub.state === "Trial"` (only a Trial carries a trial — an
+ * Active/Paused sub has no conversion to warn about). For each ENABLED lead time
+ * it computes the STABLE target fire date
+ * `targetDay = addDays(conversionDate(trial), -LEAD_TIME_OFFSET_DAYS[leadTime])`
+ * and includes a `{kind:"trial-end", subscriptionId, leadTime, localDay: targetDay}`
+ * event when `targetDay === localToday || targetDay === utcToday`.
+ *
+ * CONSERVATIVE earlier-of-local/UTC (AD-18): a trial reminder that arrives AFTER
+ * the card is charged is worthless, so the due check fires on whichever of the
+ * local-wall-clock or UTC calendar interpretation reaches the target day FIRST
+ * (the earlier interpretation triggers first → NEVER after the charge). Keying
+ * the dedupe `localDay` on the STABLE `targetDay` (derived from the trial, not
+ * from `today`) means the periodic tick and the launch catch-up stamp an
+ * IDENTICAL `(trial-end, sub, leadTime, conversion)` identity, so a reminder
+ * shown by one path is never re-shown by the other (same seam discipline as the
+ * renewal fix in 4.3). Result is in canonical lead-time order, no duplicates.
+ *
+ * Pure and total: it reads only the sub's state/trial and the two injected
+ * calendar days; it never reads a wall clock and never throws (a Trial always
+ * carries its `trial` per the v2 schema invariant, so the guard is defensive).
+ */
+export function trialEndDue(
+  sub: TrialEndSubscription,
+  localToday: ISODate,
+  utcToday: ISODate,
+  enabled: ReminderLeadTime[],
+): ReminderEvent[] {
+  // Only a Trial has a conversion to warn about; Active/Paused never fire a
+  // trial-end reminder. The `trial` guard is defensive (the schema guarantees a
+  // Trial carries it) so a malformed fixture degrades to [] rather than throwing.
+  if (sub.state !== "Trial" || sub.trial === undefined) {
+    return [];
+  }
+  const converts = conversionDate(sub.trial);
+  // FAIL-CLOSED (symmetric with `catchUpTrialEnds`): a trial whose conversion
+  // date is unparseable emits nothing — skip it explicitly rather than relying on
+  // the no-match path, so a NaN-bearing target can never leak into a dedupe key.
+  if (!isParseableISODate(converts)) {
+    return [];
+  }
+  const enabledSet = new Set(enabled);
+  const out: ReminderEvent[] = [];
+  for (const leadTime of LEAD_TIME_ORDER) {
+    if (!enabledSet.has(leadTime)) continue;
+    const targetDay = addDays(converts, -LEAD_TIME_OFFSET_DAYS[leadTime]);
+    // Earlier-of-local/UTC: due the moment EITHER calendar interpretation
+    // reaches the target day — the earlier one fires before the later charge.
+    if (targetDay === localToday || targetDay === utcToday) {
+      out.push({
+        kind: "trial-end" satisfies ReminderEventKind,
+        subscriptionId: sub.id,
+        leadTime,
+        // STABLE target-day dedupe bucket (derived from the trial, not `today`)
+        // — identical across the tick and the catch-up (seam-safe, SM-2).
+        localDay: targetDay,
+      });
+    }
+  }
+  return out;
 }
 
 // =============================================================================
@@ -278,6 +358,110 @@ export function catchUp(
       }
       const event: ReminderEvent = {
         kind: "renewal" satisfies ReminderEventKind,
+        subscriptionId: sub.id,
+        leadTime,
+        localDay: targetDate,
+      };
+      if (!firedSet.has(eventIdentity(event))) {
+        out.push(event);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The minimal, structural subscription shape {@link catchUpTrialEnds} reads: the
+ * `id` that keys events, the three-way `state` that gates eligibility (only
+ * `Trial` fires a trial-end), and the optional embedded `trial` whose conversion
+ * date anchors the target. Structural so it serves the live `SubscriptionV2` and
+ * any test fixture without a breaking retype.
+ */
+export interface CatchUpTrialSubscription {
+  id: string;
+  state: SubscriptionState;
+  trial?: TrialV2;
+}
+
+/**
+ * The TRIAL-END events whose fire-moment passed while the app was CLOSED — the
+ * one-shot sibling of {@link catchUp} (which stays renewal-only and is NOT
+ * modified). Same window/fail-closed shape; the only differences are the
+ * eligibility (`state:"Trial"` only — never Active or Paused) and the target
+ * (`addDays(conversionDate(trial), -leadDays)` instead of a renewal offset).
+ *
+ * The window is `[anchor, now]` where `anchor = max(lastRunAt ?? -inf,
+ * now - lookbackHours)` — identical to `catchUp`. Each `(sub, leadTime)` fires at
+ * the START of its target day; its fire-moment is that day's UTC midnight (the
+ * earliest instant any timezone assigns to the day — the conservative lower
+ * bound), and its `localDay` is the target date itself. Because that target is
+ * the STABLE `conversionDate - leadDays`, it matches the identity
+ * {@link trialEndDue} stamps on the live tick, so a trial-end shown by one path
+ * is never re-shown by the other (seam-safe, SM-2). Already-fired identities (per
+ * the ledger) are dropped.
+ *
+ * FAIL-CLOSED (exactly like `catchUp`): a non-parseable `now` or a non-finite
+ * `lookbackHours` returns `[]` (emit NOTHING — never wave every event through a
+ * NaN comparison); a per-sub unparseable `conversionDate` SKIPS that sub only.
+ * The result is in a deterministic order: subs in input order, lead times in
+ * canonical order. No `offsetMinutes` parameter — the UTC-midnight fire-moment is
+ * offset-independent, so (like the frozen `catchUp`) none is needed.
+ *
+ * ONE-SHOT CONSEQUENCE: unlike a recurring renewal — which re-arms every billing
+ * cycle, so a missed one simply fires on the next cycle — a trial-end is a single
+ * event; a trial-end whose moment passed more than LOOKBACK_HOURS (24h) before
+ * launch falls outside this inherited window and is UNRECOVERABLE (it never fires
+ * at all). This is a conscious trade-off: the 24h value is the PRD FR-7 cap and is
+ * NOT widened for trial-end.
+ */
+export function catchUpTrialEnds(
+  subs: CatchUpTrialSubscription[],
+  ledger: ReminderLedger,
+  now: string,
+  lookbackHours: number,
+): ReminderEvent[] {
+  // FAIL-CLOSED guard on the window inputs: a bad `now`/`lookbackHours` must emit
+  // NOTHING rather than let a NaN comparison wave every event through.
+  const nowMs = Date.parse(now);
+  if (Number.isNaN(nowMs) || !Number.isFinite(lookbackHours)) {
+    return [];
+  }
+
+  // Anchor = max(lastRunAt, now - lookbackHours) — identical to `catchUp`.
+  const lookbackMs = lookbackHours * MS_PER_HOUR;
+  const windowStartMs = nowMs - lookbackMs;
+  let anchorMs = windowStartMs;
+  if (ledger.lastRunAt !== null) {
+    const lastRunMs = Date.parse(ledger.lastRunAt);
+    if (!Number.isNaN(lastRunMs) && lastRunMs > anchorMs) {
+      anchorMs = lastRunMs;
+    }
+  }
+
+  const firedSet = new Set(ledger.fired.map(eventIdentity));
+  const out: ReminderEvent[] = [];
+
+  for (const sub of subs) {
+    // Eligibility: ONLY a Trial fires a trial-end — Active AND Paused never do.
+    if (sub.state !== "Trial" || sub.trial === undefined) {
+      continue;
+    }
+    const converts = conversionDate(sub.trial);
+    // FAIL-CLOSED: a trial whose conversion date is unparseable emits nothing —
+    // skip it rather than let its NaN fire-moment slip through the window check.
+    if (!isParseableISODate(converts)) {
+      continue;
+    }
+    for (const leadTime of LEAD_TIME_ORDER) {
+      const targetDate = addDays(converts, -LEAD_TIME_OFFSET_DAYS[leadTime]);
+      // Conservative lower bound: UTC midnight of the target day is the earliest
+      // instant any timezone assigns to that calendar day.
+      const fireMomentMs = utcMidnightMs(targetDate);
+      if (fireMomentMs < anchorMs || fireMomentMs > nowMs) {
+        continue; // outside the catch-up window
+      }
+      const event: ReminderEvent = {
+        kind: "trial-end" satisfies ReminderEventKind,
         subscriptionId: sub.id,
         leadTime,
         localDay: targetDate,
