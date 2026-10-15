@@ -24,6 +24,7 @@ import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
 import type { Category } from "core/models/category";
+import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
 import type { StoragePort } from "core/ports/storagePort";
@@ -193,6 +194,20 @@ export interface AppServices {
   updateSettings(patch: Partial<SettingsV2>): Promise<SettingsV2>;
   /** Switch the active data folder and persist it into settings (Req 15.3). */
   setDataFolder(path: string | null): Promise<SettingsV2>;
+
+  // --- Reminder ledger (Epic 4) ---
+  /**
+   * Read the persisted reminder ledger. Lock-free snapshot read (mirrors
+   * `getSettings`): the adapter writes atomically, so a lock-free read observes
+   * either the pre-write or the post-write file, never a torn state.
+   */
+  readReminderLedger(): Promise<ReminderLedger>;
+  /**
+   * Write the reminder ledger back, serialized under `lock("reminderLedger")`
+   * so the scheduler (its only writer) is a single serialized writer and a
+   * crash mid-cycle leaves a consistent prior ledger (atomic write — AD-19/4.2).
+   */
+  writeReminderLedger(ledger: ReminderLedger): Promise<void>;
 
   // --- Import / Export (Req 16, 17) ---
   /** Backup, then plan + persist an import; returns the outcome (Req 16.4). */
@@ -445,6 +460,20 @@ export function buildAppServices(storage: StoragePort): AppServices {
         await storage.writeSettings(merged);
         return merged;
       });
+    },
+
+    // --- Reminder ledger -----------------------------------------------------
+    readReminderLedger() {
+      // Lock-free snapshot read, like `getSettings`/`listSubscriptions`: the
+      // adapter writes atomically so a lock-free read never observes a torn file.
+      return storage.readReminderLedger();
+    },
+
+    writeReminderLedger(ledger) {
+      // Serialize on the file it writes (`reminderLedger`): the scheduler is the
+      // lone writer, so this lock makes it a single serialized writer whose
+      // atomic write leaves a consistent prior ledger on a mid-cycle crash.
+      return lock("reminderLedger", () => storage.writeReminderLedger(ledger));
     },
 
     // --- Import / Export -----------------------------------------------------

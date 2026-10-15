@@ -276,6 +276,101 @@ describe("per-file write serialization (AD-29): same-file concurrency loses noth
   });
 });
 
+describe("reminder-ledger write goes through lock(\"reminderLedger\"); read is lock-free (Story 4.2)", () => {
+  it("two concurrent writeReminderLedger calls serialize (one write fully before the next starts)", async () => {
+    const storage = new InstrumentedStorage();
+    const services = buildAppServices(storage);
+
+    const a: ReminderLedger = {
+      version: 1,
+      lastRunAt: "2026-03-07T00:00:00.000Z",
+      fired: [{ kind: "renewal", subscriptionId: "a", leadTime: "same-day", localDay: "2026-03-07" }],
+    };
+    const b: ReminderLedger = {
+      version: 1,
+      lastRunAt: "2026-03-08T00:00:00.000Z",
+      fired: [{ kind: "renewal", subscriptionId: "b", leadTime: "one-day", localDay: "2026-03-08" }],
+    };
+
+    // Fire two writes WITHOUT awaiting between them. Under lock("reminderLedger")
+    // the second write must not START until the first has fully ENDED — the write
+    // events never interleave (same-file serialization, mirroring settings/cats).
+    await Promise.all([
+      services.writeReminderLedger(a),
+      services.writeReminderLedger(b),
+    ]);
+
+    const writeStarts = storage.log.filter((e) => e === "write:ledger:start").length;
+    const writeEnds = storage.log.filter((e) => e === "write:ledger:end").length;
+    expect(writeStarts).toBe(2);
+    expect(writeEnds).toBe(2);
+    // Serialized: the log is start,end,start,end — never start,start,end,end.
+    const ledgerEvents = storage.log.filter((e) => e.startsWith("write:ledger:"));
+    expect(ledgerEvents).toEqual([
+      "write:ledger:start",
+      "write:ledger:end",
+      "write:ledger:start",
+      "write:ledger:end",
+    ]);
+
+    // Last write wins the final state (both ran; neither torn).
+    expect([a.lastRunAt, b.lastRunAt]).toContain(storage.reminderLedger.lastRunAt);
+  });
+
+  it("readReminderLedger is lock-free: a read interleaves with a concurrent ledger write", async () => {
+    const storage = new InstrumentedStorage();
+    const services = buildAppServices(storage);
+
+    const next: ReminderLedger = {
+      version: 1,
+      lastRunAt: "2026-03-07T00:00:00.000Z",
+      fired: [],
+    };
+
+    // A lock-free read issued concurrently with a write begins BEFORE the write
+    // ends (a lock would force it to wait). The adapter write is atomic, so the
+    // read still observes a whole ledger — never a torn one.
+    const [, readResult] = await Promise.all([
+      services.writeReminderLedger(next),
+      services.readReminderLedger(),
+    ]);
+
+    const readStart = storage.log.indexOf("read:ledger:start");
+    const writeEnd = storage.log.indexOf("write:ledger:end");
+    expect(readStart).toBeGreaterThanOrEqual(0);
+    expect(writeEnd).toBeGreaterThanOrEqual(0);
+    // The read started before the write finished: it did not block on the lock.
+    expect(readStart).toBeLessThan(writeEnd);
+
+    // The read observed a complete, schema-valid ledger (before OR after snapshot).
+    expect(readResult.version).toBe(1);
+    expect(Array.isArray(readResult.fired)).toBe(true);
+  });
+
+  it("a ledger write does not block a concurrent subscriptions mutation (per-file, not global)", async () => {
+    const storage = new InstrumentedStorage();
+    const services = buildAppServices(storage);
+
+    const ledger: ReminderLedger = { version: 1, lastRunAt: null, fired: [] };
+    await Promise.all([
+      services.writeReminderLedger(ledger),
+      services.createSubscription(makeInput({ name: "A" })),
+    ]);
+
+    expect((await services.listSubscriptions())).toHaveLength(1);
+    // The two different-file sections interleaved: the ledger write ran its own
+    // critical section while the subscriptions section (its read → core → write)
+    // was still in flight — a GLOBAL lock would force one entirely after the
+    // other. We prove overlap by showing the ledger write began before the subs
+    // section finished.
+    const ledgerWriteStart = storage.log.indexOf("write:ledger:start");
+    const subsWriteEnd = storage.log.indexOf("write:subs:end");
+    expect(ledgerWriteStart).toBeGreaterThanOrEqual(0);
+    expect(subsWriteEnd).toBeGreaterThanOrEqual(0);
+    expect(ledgerWriteStart).toBeLessThan(subsWriteEnd);
+  });
+});
+
 describe("serialization is PER-FILE, not global (AD-29)", () => {
   it("a subscriptions mutation and a settings mutation proceed concurrently (interleaved)", async () => {
     const storage = new InstrumentedStorage();

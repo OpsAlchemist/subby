@@ -311,8 +311,14 @@ app.whenReady().then(async () => {
     //     barrier so a catch-up/periodic read can only ever see migrated data.
     stage = "scheduler";
     scheduler = new Scheduler({
+      // `AppServices` structurally satisfies `SchedulerServices`, including the
+      // ledger-backed dedupe methods (`readReminderLedger` lock-free /
+      // `writeReminderLedger` under `lock("reminderLedger")`) added for 4.2.
       services: appContext.services,
       notifier: new NotificationService(),
+      // `offsetMinutes` is omitted: the SchedulerOptions default is already the
+      // live OS local offset (`-new Date().getTimezoneOffset()`), so the offset
+      // convention (AD-18) has a single source rather than a duplicated literal.
     });
 
     // Seed the Tray_Mode cache from (now barrier-passed) persisted settings so
