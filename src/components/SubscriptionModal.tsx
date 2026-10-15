@@ -20,10 +20,17 @@
  *
  * State (AD-17): the old `isActive` boolean toggle is replaced by a **segmented
  * State control** — an accessible `radiogroup` of Active / Paused / Trial, each
- * a text-labelled option. Selecting Trial reveals a minimal trial block (end
- * date + post-trial amount) so the v2 schema invariant holds (`trial` present
- * iff state === 'Trial'); non-Trial states carry no `trial`. The full Epic-5
- * trial setup/conversion is out of scope.
+ * a text-labelled option. Selecting Trial reveals the trial block so the v2
+ * schema invariant holds (`trial` present iff state === 'Trial'); non-Trial
+ * states carry no `trial`.
+ *
+ * Trial length (Story 5.1; AD-18 — months unrepresentable): the reveal offers a
+ * two-way choice — "Trial ends on [date]" (an explicit `endDate`) OR "Trial lasts
+ * [N] days from [start]" (`startDate` + a whole number of `lengthDays`) —
+ * producing the matching schema-valid {@link TrialV2} variant on save. The
+ * post-trial amount carries a short dated hint ("$X/mo after {conversionDate}")
+ * computed via `core/trial.conversionDate`. The end-date variant is the DEFAULT
+ * choice (back-compat with the pre-5.1 behavior).
  *
  * The form exposes inputs for every editable field (Req 4.1) and a custom-
  * interval control shown only when the billing cycle is "Custom". Client-side
@@ -52,6 +59,8 @@ import type {
   TrialV2,
 } from "core/models/subscription";
 import { minorUnits, toMajor } from "core/money";
+import { trialSchema } from "core/models/schema";
+import { conversionDate } from "core/trial";
 import type { SubscriptionInputV2 } from "shared/types";
 import { cn } from "@/lib/utils";
 import {
@@ -134,10 +143,18 @@ interface FormState {
   autoRenew: boolean;
   // Free-form tags, edited via the TagEditor (de-duplicated by core helpers).
   tags: string[];
-  // Minimal trial fields (used only when state === 'Trial').
-  trialEndDate: string;
+  // Trial fields (used only when state === 'Trial'). The length is specified by
+  // ONE of two variants — an explicit end date OR start + a whole number of DAYS
+  // (never months) — selected by `trialLengthMode` (AD-18, Story 5.1).
+  trialLengthMode: TrialLengthMode;
+  trialEndDate: string; // used when trialLengthMode === 'endDate'
+  trialStartDate: string; // used when trialLengthMode === 'startDays'
+  trialLengthDays: string; // whole-days string; used when trialLengthMode === 'startDays'
   trialPostAmount: string; // major-unit string
 }
+
+/** Which trial-length variant the modal is editing (Story 5.1; AD-18). */
+type TrialLengthMode = "endDate" | "startDays";
 
 /** Per-field validation messages (only populated for fields that fail). */
 interface FieldErrors {
@@ -145,6 +162,8 @@ interface FieldErrors {
   amount?: string;
   customCount?: string;
   trialEndDate?: string;
+  trialStartDate?: string;
+  trialLengthDays?: string;
   trialPostAmount?: string;
 }
 
@@ -180,7 +199,15 @@ function initialState(
       state: subscription.state,
       autoRenew: subscription.autoRenew,
       tags: [...subscription.tags],
+      // Detect the stored variant: a `lengthDays` trial seeds the start+days
+      // mode; everything else (endDate variant, or no trial) defaults to the
+      // explicit end-date mode (back-compat).
+      trialLengthMode:
+        trial?.lengthDays !== undefined ? "startDays" : "endDate",
       trialEndDate: trial?.endDate ?? todayIso(),
+      trialStartDate: trial?.startDate ?? todayIso(),
+      trialLengthDays:
+        trial?.lengthDays !== undefined ? String(trial.lengthDays) : "",
       trialPostAmount:
         trial !== undefined
           ? minorToMajor(trial.postAmountMinor, subscription.currency)
@@ -207,7 +234,10 @@ function initialState(
     state: "Active",
     autoRenew: true,
     tags: [],
+    trialLengthMode: "endDate",
     trialEndDate: todayIso(),
+    trialStartDate: todayIso(),
+    trialLengthDays: "",
     trialPostAmount: "",
   };
 }
@@ -269,33 +299,164 @@ function validate(form: FormState): {
     errors.customCount = "Interval count must be a positive whole number.";
   }
 
-  // A Trial state requires a minimal trial (end date + post-trial amount) so the
-  // v2 schema invariant holds (AD-17, AD-18 — months unrepresentable; an end
-  // date is used). Non-Trial states carry no trial.
+  // A Trial state requires a valid trial so the v2 schema invariant holds
+  // (AD-17, AD-18 — months unrepresentable). The length is specified by ONE of
+  // two variants: an explicit end date, OR start + a whole number of DAYS.
+  // Non-Trial states carry no trial.
   let trial: TrialV2 | undefined;
   if (form.state === "Trial") {
+    // Post-trial amount is common to both variants; parse it through the money
+    // seam so an invalid/over-precise value surfaces inline (nothing persists).
     let postAmountMinor = 0;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(form.trialEndDate)) {
-      errors.trialEndDate = "Enter a valid trial end date.";
-    }
+    let postAmountOk = false;
     if (form.trialPostAmount.trim() === "") {
       errors.trialPostAmount = "Enter the amount charged after the trial.";
     } else {
       try {
         postAmountMinor = minorUnits(form.trialPostAmount.trim(), form.currency);
+        postAmountOk = true;
       } catch {
         errors.trialPostAmount = "Enter a valid post-trial amount.";
       }
     }
-    if (
-      errors.trialEndDate === undefined &&
-      errors.trialPostAmount === undefined
-    ) {
-      trial = { endDate: form.trialEndDate, postAmountMinor };
+
+    if (form.trialLengthMode === "startDays") {
+      // start + N whole days. The start date must be a valid ISO date and the
+      // length a positive whole number of days (mirrors `trialSchema`).
+      let startOk = false;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(form.trialStartDate)) {
+        errors.trialStartDate = "Enter a valid trial start date.";
+      } else {
+        startOk = true;
+      }
+      const lengthDays = Number(form.trialLengthDays);
+      let lengthOk = false;
+      if (
+        form.trialLengthDays.trim() === "" ||
+        !Number.isInteger(lengthDays) ||
+        lengthDays <= 0
+      ) {
+        errors.trialLengthDays =
+          "Enter a positive whole number of days.";
+      } else {
+        lengthOk = true;
+      }
+      if (startOk && lengthOk && postAmountOk) {
+        trial = {
+          startDate: form.trialStartDate,
+          lengthDays,
+          postAmountMinor,
+        };
+      }
+    } else {
+      // Explicit end date variant (the default). The end date must be a valid
+      // ISO date (an invalid end date is an inline error).
+      let endOk = false;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(form.trialEndDate)) {
+        errors.trialEndDate = "Enter a valid trial end date.";
+      } else {
+        endOk = true;
+      }
+      if (endOk && postAmountOk) {
+        trial = { endDate: form.trialEndDate, postAmountMinor };
+      }
+    }
+
+    // Authority: the fast pre-checks above are for UX; the ZOD `trialSchema` is
+    // the single runtime source of truth (frozen spec). Parse the built trial
+    // through it and, if it rejects (e.g. end-before-start, or any rule the
+    // pre-checks don't fully mirror), surface a field-named inline error on the
+    // offending field so nothing invalid persists.
+    if (trial !== undefined) {
+      const parsed = trialSchema.safeParse(trial);
+      if (!parsed.success) {
+        const issue = parsed.error.issues[0];
+        const field = trialFieldForPath(issue?.path, form.trialLengthMode);
+        if (errors[field] === undefined) {
+          errors[field] = issue?.message ?? "Enter a valid trial.";
+        }
+        // Do not carry an unschema-valid trial forward.
+        trial = undefined;
+      }
     }
   }
 
   return { errors, amountMinor, customCount, trial };
+}
+
+/**
+ * Map a zod {@link trialSchema} issue path onto the form field it belongs to,
+ * so a schema rejection names the right inline field. `startDate` maps to the
+ * active variant's date field, `lengthDays`/`endDate` to their inputs, and
+ * `postAmountMinor` to the post-amount field; anything else falls back to the
+ * variant's primary date field.
+ */
+function trialFieldForPath(
+  path: (string | number)[] | undefined,
+  mode: TrialLengthMode,
+): keyof FieldErrors {
+  const key = path?.[0];
+  switch (key) {
+    case "postAmountMinor":
+      return "trialPostAmount";
+    case "lengthDays":
+      return "trialLengthDays";
+    case "endDate":
+      return "trialEndDate";
+    case "startDate":
+      return mode === "startDays" ? "trialStartDate" : "trialEndDate";
+    default:
+      return mode === "startDays" ? "trialStartDate" : "trialEndDate";
+  }
+}
+
+/**
+ * Build the dated post-trial hint string ("$X after {conversionDate}") from the
+ * current form, or `null` when the inputs are not yet coherent. It mirrors the
+ * save-path variant logic (end date OR start + whole days) to derive the
+ * conversion day via the pure `core/trial.conversionDate`, and formats the
+ * entered post-trial major amount in the form's currency. The amount carries NO
+ * "/mo" suffix — it is the post-trial charge per the sub's own billing cycle,
+ * not a monthly figure. Purely informational.
+ */
+function computeTrialHint(form: FormState): string | null {
+  // The post-trial amount must parse to minor units before we can show a figure.
+  if (form.trialPostAmount.trim() === "") return null;
+  let postAmountMinor: number;
+  try {
+    postAmountMinor = minorUnits(form.trialPostAmount.trim(), form.currency);
+  } catch {
+    return null;
+  }
+
+  // Derive the conversion date from whichever variant is active, bailing out
+  // (no hint) when the inputs are incomplete/invalid.
+  let convertsOn: string;
+  if (form.trialLengthMode === "startDays") {
+    const lengthDays = Number(form.trialLengthDays);
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(form.trialStartDate) ||
+      form.trialLengthDays.trim() === "" ||
+      !Number.isInteger(lengthDays) ||
+      lengthDays <= 0
+    ) {
+      return null;
+    }
+    convertsOn = conversionDate({
+      startDate: form.trialStartDate,
+      lengthDays,
+      postAmountMinor,
+    });
+  } else {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(form.trialEndDate)) return null;
+    convertsOn = conversionDate({
+      endDate: form.trialEndDate,
+      postAmountMinor,
+    });
+  }
+
+  const amount = minorToMajor(postAmountMinor, form.currency);
+  return `${amount} after ${convertsOn}`;
 }
 
 // --- Props -------------------------------------------------------------------
@@ -322,6 +483,7 @@ export default function SubscriptionModal({
   const isEdit = subscription !== undefined;
   const titleId = useId();
   const stateGroupId = useId();
+  const trialModeGroupId = useId();
 
   const [form, setForm] = useState<FormState>(() =>
     initialState(subscription, settings.homeCurrency, settings.accentColor),
@@ -534,6 +696,14 @@ export default function SubscriptionModal({
   }
 
   const title = isEdit ? "Edit subscription" : "Add subscription";
+
+  // Dated post-trial-amount hint ("$X/mo after {conversionDate}"), shown under
+  // the "Amount after trial" field when the current trial inputs are coherent
+  // enough to compute both a conversion date (via `core/trial.conversionDate`)
+  // and a formatted amount. Purely informational — never gates save, and it
+  // yields `null` (nothing rendered) when an input is still incomplete/invalid.
+  const trialHint =
+    form.state === "Trial" ? computeTrialHint(form) : null;
 
   return (
     <div
@@ -870,27 +1040,85 @@ export default function SubscriptionModal({
               />
             </div>
 
-            {/* Trial reveal — only when state === "Trial" (AD-18 minimal fields). */}
+            {/* Trial reveal — only when state === "Trial" (AD-18; Story 5.1). */}
             {form.state === "Trial" && (
-              <>
-                <Field
-                  label="Trial end date"
-                  htmlFor="sub-trial-end"
-                  required
-                  error={errors.trialEndDate}
-                >
-                  <input
-                    id="sub-trial-end"
-                    type="date"
-                    className={CONTROL_CLASS}
-                    value={form.trialEndDate}
-                    onChange={(e) => set("trialEndDate", e.target.value)}
-                    aria-invalid={errors.trialEndDate ? true : undefined}
-                    aria-describedby={
-                      errors.trialEndDate ? "sub-trial-end-error" : undefined
-                    }
+              <div className="sm:col-span-2 grid grid-cols-1 gap-4 rounded-md border border-border bg-background/40 p-4 sm:grid-cols-2">
+                {/* Trial-length variant choice: end date OR start + N days. */}
+                <div className="sm:col-span-2">
+                  <TrialLengthModeControl
+                    groupId={trialModeGroupId}
+                    value={form.trialLengthMode}
+                    onChange={(next) => set("trialLengthMode", next)}
                   />
-                </Field>
+                </div>
+
+                {form.trialLengthMode === "endDate" ? (
+                  <Field
+                    label="Trial ends on"
+                    htmlFor="sub-trial-end"
+                    required
+                    error={errors.trialEndDate}
+                  >
+                    <input
+                      id="sub-trial-end"
+                      type="date"
+                      className={CONTROL_CLASS}
+                      value={form.trialEndDate}
+                      onChange={(e) => set("trialEndDate", e.target.value)}
+                      aria-invalid={errors.trialEndDate ? true : undefined}
+                      aria-describedby={
+                        errors.trialEndDate ? "sub-trial-end-error" : undefined
+                      }
+                    />
+                  </Field>
+                ) : (
+                  <>
+                    <Field
+                      label="Trial starts on"
+                      htmlFor="sub-trial-start"
+                      required
+                      error={errors.trialStartDate}
+                    >
+                      <input
+                        id="sub-trial-start"
+                        type="date"
+                        className={CONTROL_CLASS}
+                        value={form.trialStartDate}
+                        onChange={(e) => set("trialStartDate", e.target.value)}
+                        aria-invalid={errors.trialStartDate ? true : undefined}
+                        aria-describedby={
+                          errors.trialStartDate
+                            ? "sub-trial-start-error"
+                            : undefined
+                        }
+                      />
+                    </Field>
+                    <Field
+                      label="Trial length (days)"
+                      htmlFor="sub-trial-days"
+                      required
+                      error={errors.trialLengthDays}
+                    >
+                      <input
+                        id="sub-trial-days"
+                        type="number"
+                        inputMode="numeric"
+                        min={1}
+                        step={1}
+                        className={CONTROL_CLASS}
+                        value={form.trialLengthDays}
+                        onChange={(e) => set("trialLengthDays", e.target.value)}
+                        aria-invalid={errors.trialLengthDays ? true : undefined}
+                        aria-describedby={
+                          errors.trialLengthDays
+                            ? "sub-trial-days-error"
+                            : undefined
+                        }
+                      />
+                    </Field>
+                  </>
+                )}
+
                 <Field
                   label="Amount after trial"
                   htmlFor="sub-trial-amount"
@@ -908,11 +1136,24 @@ export default function SubscriptionModal({
                     onChange={(e) => set("trialPostAmount", e.target.value)}
                     aria-invalid={errors.trialPostAmount ? true : undefined}
                     aria-describedby={
-                      errors.trialPostAmount ? "sub-trial-amount-error" : undefined
+                      errors.trialPostAmount
+                        ? "sub-trial-amount-error"
+                        : trialHint
+                          ? "sub-trial-amount-hint"
+                          : undefined
                     }
                   />
+                  {/* Dated post-amount hint: "$X/mo after {conversionDate}". */}
+                  {trialHint && (
+                    <p
+                      id="sub-trial-amount-hint"
+                      className="text-xs text-muted-foreground"
+                    >
+                      {trialHint}
+                    </p>
+                  )}
                 </Field>
-              </>
+              </div>
             )}
 
             {/* Tags (full width) — add/remove chips, de-duplicated by core. */}
@@ -1068,6 +1309,67 @@ function StateControl({
               )}
             >
               {option}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The two-way trial-length variant control (Story 5.1; AD-18): an accessible
+ * `radiogroup` choosing "Trial ends on [date]" vs "Trial lasts [N] days from
+ * start". Months are deliberately NOT offered. Each option is a real
+ * `role="radio"` button reached by Tab (each is a focusable button; there is no
+ * roving tabindex, so Arrow keys do not move selection) and selected with
+ * Space/Enter (native button activation), with a visible focus ring — the same
+ * pattern as {@link StateControl}.
+ */
+function TrialLengthModeControl({
+  groupId,
+  value,
+  onChange,
+}: {
+  groupId: string;
+  value: TrialLengthMode;
+  onChange: (next: TrialLengthMode) => void;
+}): JSX.Element {
+  const options: readonly { mode: TrialLengthMode; label: string }[] = [
+    { mode: "endDate", label: "Ends on a date" },
+    { mode: "startDays", label: "Lasts N days from start" },
+  ];
+  return (
+    <div className="space-y-1.5">
+      <span
+        id={`${groupId}-label`}
+        className="block text-sm font-medium text-foreground"
+      >
+        Trial length
+      </span>
+      <div
+        role="radiogroup"
+        aria-labelledby={`${groupId}-label`}
+        className="inline-flex rounded-md border border-input p-0.5"
+      >
+        {options.map(({ mode, label }) => {
+          const selected = value === mode;
+          return (
+            <button
+              key={mode}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              onClick={() => onChange(mode)}
+              className={cn(
+                "rounded-md px-3 py-1.5 text-sm font-medium transition-colors",
+                FOCUS_RING,
+                selected
+                  ? "bg-accent text-accent-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {label}
             </button>
           );
         })}

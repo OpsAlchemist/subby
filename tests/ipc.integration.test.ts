@@ -145,6 +145,50 @@ describe("AppServices subscription round-trips (Req 2.3)", () => {
     expect(listed.find((s) => s.id === id)!.name).toBe("Spotify Family");
   });
 
+  it("Trial→Active convert round-trips: persists state Active with NO trial key (Story 5.1)", async () => {
+    // Seed a Trial subscription directly (schema-valid: trial present iff Trial).
+    await storage.writeSubscriptions([
+      makeSubscription({
+        id: "t1",
+        name: "Notion",
+        state: "Trial",
+        amountMinor: 0,
+        trial: { endDate: "2026-12-31", postAmountMinor: 2000 },
+      }),
+    ]);
+
+    // The live convert path: `subs:update` with Active + the post amount + a
+    // cleared trial (exactly the patch the List "Convert to Active" sends).
+    const updated = await services.updateSubscription("t1", {
+      state: "Active",
+      amountMinor: 2000,
+      trial: undefined,
+    });
+    const target = updated.find((s) => s.id === "t1")!;
+    expect(target.state).toBe("Active");
+    expect(target.amountMinor).toBe(2000);
+    // In-memory, the patch's explicit `trial: undefined` clears the value (the
+    // key may still exist with value undefined — it is dropped on serialize).
+    expect(target.trial).toBeUndefined();
+
+    // Re-read through the adapter: the persisted record is Active and carries
+    // NO `trial` key (the invariant "trial absent unless state Trial" holds —
+    // `JSON.stringify` drops the `undefined` key on write).
+    const listed = await services.listSubscriptions();
+    const persisted = listed.find((s) => s.id === "t1")!;
+    expect(persisted.state).toBe("Active");
+    expect(persisted.amountMinor).toBe(2000);
+    expect("trial" in persisted).toBe(false);
+    expect(persisted.trial).toBeUndefined();
+
+    // The on-disk JSON itself has no `trial` key for the converted record.
+    const raw = JSON.parse(
+      await readFile(join(userData, "subscriptions.json"), "utf8"),
+    ) as { subscriptions: Array<Record<string, unknown>> };
+    const diskRecord = raw.subscriptions.find((s) => s.id === "t1")!;
+    expect("trial" in diskRecord).toBe(false);
+  });
+
   it("setState changes the state and persists", async () => {
     const created = await services.createSubscription(makeInput({ state: "Active" }));
     const id = created[0].id;

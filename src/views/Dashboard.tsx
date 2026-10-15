@@ -20,7 +20,7 @@
  * configured default currency.
  */
 
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
 import {
   CalendarClock,
   History,
@@ -38,6 +38,7 @@ import {
   totalMonthly,
   totalYearly,
 } from "core/analytics";
+import { trialsConvertFigure } from "core/trial";
 import { exponentOf } from "core/money";
 import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
@@ -96,15 +97,21 @@ function formatDate(iso: string): string {
   });
 }
 
-/** A single metric card: a label, a prominent value, and an icon. */
+/**
+ * A single metric card: a label, a prominent value, and an icon. An optional
+ * `secondary` node renders beneath the value as a muted supporting line (used by
+ * the month card for the trials-convert figure).
+ */
 function MetricCard({
   label,
   value,
   icon: Icon,
+  secondary,
 }: {
   label: string;
   value: string;
   icon: LucideIcon;
+  secondary?: ReactNode;
 }): JSX.Element {
   return (
     <div className="rounded-lg border border-border bg-card p-4">
@@ -115,6 +122,7 @@ function MetricCard({
         <Icon className="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
       </div>
       <p className="mt-2 text-2xl font-semibold tracking-tight">{value}</p>
+      {secondary}
     </div>
   );
 }
@@ -196,6 +204,10 @@ export default function Dashboard(): JSX.Element {
     () => recentlyChanged(subs, RECENT_CHANGED_COUNT),
     [subs],
   );
+  // The trial-aware "+ $X/mo when N trials convert" figure (Story 5.1): a
+  // native-minor sum over the Trial subset (Trials are excluded from "This
+  // month"). `count === 0` renders NOTHING (the line clears when no trials).
+  const trialsFigure = useMemo(() => trialsConvertFigure(subs), [subs]);
 
   const currency = useMemo(
     () => makeCurrencyFormatter(settings.homeCurrency),
@@ -204,6 +216,12 @@ export default function Dashboard(): JSX.Element {
   // Totals are minor-unit sums (Story 3.3, no FX); render in Home-Currency major.
   const monthly = minorToMajorNumber(monthlyMinor, settings.homeCurrency);
   const yearly = minorToMajorNumber(yearlyMinor, settings.homeCurrency);
+  // The trials-convert line's figure in Home-Currency major (same no-FX scaling
+  // as the month total — Story 5.1 Design: deliberately a native-minor sum).
+  const trialsMonthly = minorToMajorNumber(
+    trialsFigure.monthlyMinor,
+    settings.homeCurrency,
+  );
 
   return (
     <div className="space-y-6">
@@ -221,6 +239,25 @@ export default function Dashboard(): JSX.Element {
             label="Total Monthly Spend"
             value={currency.format(monthly)}
             icon={IndianRupee}
+            secondary={
+              // Muted trials-convert line with a small accent dot; rendered only
+              // when at least one Trial exists (clears at zero) (Story 5.1).
+              trialsFigure.count > 0 ? (
+                <p className="mt-2 flex items-center gap-1.5 text-sm text-muted-foreground">
+                  <span
+                    aria-hidden="true"
+                    className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                  />
+                  <span>
+                    + {currency.format(trialsMonthly)}/mo when{" "}
+                    {trialsFigure.count}{" "}
+                    {trialsFigure.count === 1
+                      ? "trial converts"
+                      : "trials convert"}
+                  </span>
+                </p>
+              ) : undefined
+            }
           />
           <MetricCard
             label="Total Yearly Spend"

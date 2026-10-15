@@ -28,6 +28,7 @@ import {
   ArrowDown,
   ArrowUp,
   ChevronsUpDown,
+  CircleCheck,
   Pause,
   Pencil,
   Power,
@@ -42,10 +43,12 @@ import type {
 import { fuzzySearch } from "core/search";
 import { minorUnits, toMajor } from "core/money";
 import { monthlyAmount } from "core/billing";
+import { conversionDate, convertTrial } from "core/trial";
 import { distinctTags } from "core/subscriptions";
-import { subscriptionsApi, isSubbyError } from "@/api/subby";
+import { subscriptionsApi, isSubbyError, toAppError } from "@/api/subby";
 import { subscriptionsStore } from "@/stores/subscriptionsStore";
 import { categoriesStore } from "@/stores/categoriesStore";
+import { errorStore } from "@/stores/errorStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
 import CategoryColorDot from "@/components/CategoryColorDot";
@@ -455,6 +458,30 @@ export default function SubscriptionList({
         if (isSubbyError(err)) console.error(err.appError);
         else console.error(err);
       }
+    }
+  }
+
+  /**
+   * Convert a Trial subscription to Active (Story 5.1). The Trial→Active rule is
+   * the pure {@link convertTrial} transform (the single tested source); the
+   * handler derives the `subs:update` patch from its result — state Active, the
+   * converted amount, and a cleared `trial` — so there is ONE implementation of
+   * the rule. Rides the existing `subs:update` path (no new channel). A non-Trial
+   * sub is a no-op (`convertTrial` returns it unchanged). Failures go to the
+   * global error surface (Req 19.4).
+   */
+  async function convertTrialToActive(sub: SubscriptionV2): Promise<void> {
+    const converted = convertTrial(sub);
+    // No-op guard: `convertTrial` returns the same reference for a non-Trial sub.
+    if (converted === sub) return;
+    try {
+      await subscriptionsApi.update(sub.id, {
+        state: converted.state,
+        amountMinor: converted.amountMinor,
+        trial: undefined,
+      });
+    } catch (err) {
+      errorStore.set(toAppError(err));
     }
   }
 
@@ -946,7 +973,15 @@ export default function SubscriptionList({
                       {sub.billingCycle}
                     </td>
                     <td className="px-3 py-2">
-                      <StatusBadge state={sub.state} />
+                      <div className="flex items-center gap-2">
+                        <StatusBadge sub={sub} />
+                        {sub.state === "Trial" && (
+                          <ConvertTrialButton
+                            subName={sub.name}
+                            onConvert={() => void convertTrialToActive(sub)}
+                          />
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -998,7 +1033,15 @@ export default function SubscriptionList({
                             </p>
                           )}
                         </div>
-                        <StatusBadge state={sub.state} />
+                        <div className="flex items-center gap-2">
+                          <StatusBadge sub={sub} />
+                          {sub.state === "Trial" && (
+                            <ConvertTrialButton
+                              subName={sub.name}
+                              onConvert={() => void convertTrialToActive(sub)}
+                            />
+                          )}
+                        </div>
                       </div>
                       <dl className="mt-2 grid grid-cols-2 gap-2 text-sm">
                         <div>
@@ -1258,14 +1301,53 @@ function TagChips({ tags }: { tags: string[] }): JSX.Element | null {
 }
 
 /**
+ * The per-row "Convert to Active" affordance shown only on Trial rows (Story
+ * 5.1). A small text-labelled button whose accessible name names the exact
+ * subscription ("Convert {name} to Active"), keyboard-operable with a visible
+ * focus ring. Clicking it rides the existing `subs:update` patch (via the
+ * parent's handler) — no new channel.
+ */
+function ConvertTrialButton({
+  subName,
+  onConvert,
+}: {
+  subName: string;
+  onConvert: () => void;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onConvert}
+      aria-label={`Convert ${subName} to Active`}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1 rounded-md border border-input px-2 py-0.5 text-xs font-medium text-foreground hover:bg-secondary/60",
+        focusRing,
+      )}
+    >
+      <CircleCheck className="h-3 w-3" aria-hidden="true" />
+      Convert to Active
+    </button>
+  );
+}
+
+/**
  * The three-state State badge (Active / Paused / Trial). State is conveyed by a
  * visible TEXT label (never color alone, per the DESIGN state-badge rule) plus a
  * decorative leading dot that is `aria-hidden`:
  *   - Trial  = accent-tint fill + accent text + accent dot ("live but not yet charged").
  *   - Paused = muted fill + muted text (recedes).
  *   - Active = muted fill + foreground text + a neutral dot.
+ *
+ * For a Trial, the badge's ACCESSIBLE NAME is enriched (Story 5.1) to compose
+ * state + post-trial amount + conversion date (e.g. "Trial, $10.00 after,
+ * converts 2026-12-31") via an `aria-label`, so a screen-reader user hears the
+ * stakes without seeing the accent tint. The post amount carries NO "/mo"
+ * suffix — `postAmountMinor` is per the sub's own billing cycle, not a monthly
+ * figure (only the Dashboard's aggregate line normalizes to monthly). The
+ * visible label stays the single word "Trial"; the dot remains `aria-hidden`.
  */
-function StatusBadge({ state }: { state: SubscriptionState }): JSX.Element {
+function StatusBadge({ sub }: { sub: SubscriptionV2 }): JSX.Element {
+  const state = sub.state;
   const styles: Record<SubscriptionState, { badge: string; dot: string }> = {
     Active: {
       badge: "bg-muted text-foreground",
@@ -1281,8 +1363,16 @@ function StatusBadge({ state }: { state: SubscriptionState }): JSX.Element {
     },
   };
   const { badge, dot } = styles[state];
+  // Compose the Trial accessible name from the embedded trial (present iff
+  // Trial). The visible text stays "Trial"; only the a11y name carries the
+  // post-trial amount + conversion date.
+  const ariaLabel =
+    state === "Trial" && sub.trial
+      ? `Trial, ${formatCurrency(sub.trial.postAmountMinor, sub.currency)} after, converts ${conversionDate(sub.trial)}`
+      : undefined;
   return (
     <span
+      aria-label={ariaLabel}
       className={cn(
         "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs font-medium",
         badge,

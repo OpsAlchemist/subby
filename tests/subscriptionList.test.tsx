@@ -887,6 +887,115 @@ describe("StatusBadge conveys state by text, not color alone (Story 3.7)", () =>
   );
 });
 
+// --- Trial badge accessible name + Convert to Active (Story 5.1) -------------
+
+describe("Trial badge accessible name + Convert to Active (Story 5.1)", () => {
+  it("a Trial row's badge composes state + post amount + conversion date (no /mo suffix)", async () => {
+    await renderList([
+      makeSub({
+        id: "t1",
+        name: "Notion",
+        state: "Trial",
+        currency: "USD",
+        // A Yearly trial: the post amount ($120) is per the sub's cycle, NOT a
+        // monthly figure, so the badge must NOT read "/mo".
+        billingCycle: "Yearly",
+        trial: { endDate: "2026-12-31", postAmountMinor: 12000 },
+      }),
+    ]);
+
+    const table = screen.getByRole("table");
+    // The badge's accessible name carries the stakes (post amount + conversion
+    // date); the formatting matches the row currency formatter (USD → "$120.00").
+    const badge = within(table).getByLabelText(
+      /Trial, \$120\.00 after, converts 2026-12-31/,
+    );
+    expect(badge).toBeInTheDocument();
+    // The amount is NOT labelled "/mo" (it is per the billing cycle).
+    expect(badge.getAttribute("aria-label")).not.toMatch(/\/mo/);
+    // The visible text is still the single word "Trial".
+    expect(badge).toHaveTextContent("Trial");
+    // The decorative dot is hidden from assistive tech.
+    expect(badge.querySelector('[aria-hidden="true"]')).not.toBeNull();
+  });
+
+  it("composes the accessible name for the start+days variant via conversionDate", async () => {
+    await renderList([
+      makeSub({
+        id: "t1",
+        name: "Figma",
+        state: "Trial",
+        currency: "USD",
+        trial: { startDate: "2026-12-01", lengthDays: 14, postAmountMinor: 1500 },
+      }),
+    ]);
+
+    const table = screen.getByRole("table");
+    // start 2026-12-01 + 14 days → converts 2026-12-15.
+    expect(
+      within(table).getByLabelText(
+        /Trial, \$15\.00 after, converts 2026-12-15/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("Convert to Active calls update with Active + post amount + cleared trial", async () => {
+    const user = userEvent.setup();
+    await renderList([
+      makeSub({
+        id: "t1",
+        name: "Notion",
+        state: "Trial",
+        amountMinor: 0,
+        currency: "USD",
+        trial: { endDate: "2026-12-31", postAmountMinor: 2000 },
+      }),
+    ]);
+
+    const table = screen.getByRole("table");
+    await user.click(
+      within(table).getByRole("button", { name: "Convert Notion to Active" }),
+    );
+
+    await waitFor(() =>
+      expect(fake.updateSubscription).toHaveBeenCalledTimes(1),
+    );
+    expect(fake.updateSubscription).toHaveBeenCalledWith("t1", {
+      state: "Active",
+      amountMinor: 2000,
+      trial: undefined,
+    });
+  });
+
+  it("shows the Convert affordance only on Trial rows (not Active/Paused)", async () => {
+    await renderList([
+      makeSub({ id: "a", name: "Active One", state: "Active" }),
+      makeSub({ id: "p", name: "Paused One", state: "Paused" }),
+      makeSub({
+        id: "t",
+        name: "Trial One",
+        state: "Trial",
+        trial: { endDate: "2026-12-31", postAmountMinor: 1000 },
+      }),
+    ]);
+
+    const table = screen.getByRole("table");
+    expect(
+      within(table).getByRole("button", { name: "Convert Trial One to Active" }),
+    ).toBeInTheDocument();
+    expect(
+      within(table).queryByRole("button", {
+        name: "Convert Active One to Active",
+      }),
+    ).toBeNull();
+    expect(
+      within(table).queryByRole("button", {
+        name: "Convert Paused One to Active",
+      }),
+    ).toBeNull();
+  });
+});
+
 // --- Accessibility of the new surfaces (Story 3.5) ---------------------------
 
 describe("new-surface accessibility (Story 3.5)", () => {

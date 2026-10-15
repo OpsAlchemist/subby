@@ -17,6 +17,7 @@ import {
   totalMonthly,
   totalYearly,
 } from "core/analytics";
+import { trialsConvertFigure } from "core/trial";
 import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
 import { exponentOf } from "core/money";
 import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
@@ -256,5 +257,108 @@ describe("Dashboard reactivity (Req 8.6)", () => {
     expect(metricCardValue("Total Yearly Spend")).toBe(
       formatCurrency(minorToMajor(expectedUpdatedYearly)),
     );
+  });
+});
+
+// --- Trials-convert line (Story 5.1) -----------------------------------------
+
+describe("trials-convert line (Story 5.1)", () => {
+  it("renders '+ $X/mo when N trials convert' with the right figure/count when ≥1 Trial", async () => {
+    // One Active + two Trials (monthly post 1000 minor, yearly post 12000 minor).
+    const subs: SubscriptionV2[] = [
+      makeSubscription({ id: "a", name: "Netflix", state: "Active", amountMinor: 49900 }),
+      makeSubscription({
+        id: "t1",
+        name: "Notion",
+        state: "Trial",
+        billingCycle: "Monthly",
+        trial: { endDate: "2026-12-31", postAmountMinor: 1000 },
+      }),
+      makeSubscription({
+        id: "t2",
+        name: "Figma",
+        state: "Trial",
+        billingCycle: "Yearly",
+        trial: { endDate: "2026-12-31", postAmountMinor: 12000 },
+      }),
+    ];
+    fake = createFakeApi(subs);
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    const figure = trialsConvertFigure(subs);
+    expect(figure.count).toBe(2);
+    // 1000 + 12000/12 = 2000 minor worth of monthly.
+    expect(figure.monthlyMinor).toBe(2000);
+    const expectedMoney = formatCurrency(minorToMajor(figure.monthlyMinor));
+
+    // The muted secondary line names the figure and count (pluralized). The
+    // text sits in a single leaf <span> (the sibling accent dot is a separate
+    // node), so match the leaf whose own text content carries both the money
+    // and the copy. `findByText` throws if it is absent (no jest-dom needed).
+    await screen.findByText((_content, node) => {
+      if (!node || node.children.length > 0) return false;
+      const text = node.textContent ?? "";
+      return (
+        text.includes(expectedMoney) &&
+        /\/mo when 2 trials convert/.test(text)
+      );
+    });
+  });
+
+  it("reads 'when 1 trial converts' (singular verb) for exactly one Trial", async () => {
+    const subs: SubscriptionV2[] = [
+      makeSubscription({ id: "a", name: "Netflix", state: "Active" }),
+      makeSubscription({
+        id: "t1",
+        name: "Notion",
+        state: "Trial",
+        billingCycle: "Monthly",
+        trial: { endDate: "2026-12-31", postAmountMinor: 1000 },
+      }),
+    ];
+    fake = createFakeApi(subs);
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    const figure = trialsConvertFigure(subs);
+    expect(figure.count).toBe(1);
+    const expectedMoney = formatCurrency(minorToMajor(figure.monthlyMinor));
+
+    // Singular: "trial converts" (noun + verb both singular), not "trials
+    // convert" and not the ungrammatical "trial convert".
+    await screen.findByText((_content, node) => {
+      if (!node || node.children.length > 0) return false;
+      const text = node.textContent ?? "";
+      return (
+        text.includes(expectedMoney) &&
+        /\/mo when 1 trial converts/.test(text) &&
+        !/trials convert/.test(text)
+      );
+    });
+  });
+
+  it("renders NOTHING (line absent) when there are 0 Trials", async () => {
+    const subs: SubscriptionV2[] = [
+      makeSubscription({ id: "a", name: "Netflix", state: "Active" }),
+      makeSubscription({ id: "p", name: "Hulu", state: "Paused" }),
+    ];
+    fake = createFakeApi(subs);
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    // Let the stores load so the Dashboard reflects the (trial-free) data.
+    await screen.findByText("Dashboard");
+    await waitFor(() =>
+      expect(metricCardValue("Active Subscriptions")).toBe("1"),
+    );
+
+    expect(screen.queryByText(/trials? convert/)).toBeNull();
   });
 });

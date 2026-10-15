@@ -342,7 +342,8 @@ describe("happy path create (Req 3.1, 4.4)", () => {
     await user.type(screen.getByLabelText(/^Amount/), "299");
 
     // The default State is Active, so the trial fields are not even rendered.
-    expect(screen.queryByLabelText(/Trial end date/)).toBeNull();
+    expect(screen.queryByLabelText(/Trial ends on/)).toBeNull();
+    expect(screen.queryByLabelText(/Amount after trial/)).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /add subscription/i }));
     await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
@@ -362,14 +363,16 @@ describe("Trial state reveals the trial fields and carries them in the payload (
     await user.type(screen.getByLabelText(/^Name/), "Trial Service");
     await user.type(screen.getByLabelText(/^Amount/), "0");
 
-    // Trial fields are hidden until the Trial state is selected.
-    expect(screen.queryByLabelText(/Trial end date/)).toBeNull();
+    // Trial fields are hidden until the Trial state is selected. The end-date
+    // variant field is labelled "Trial ends on" (Story 5.1 renamed it from the
+    // pre-5.1 "Trial end date" when it added the start+days variant).
+    expect(screen.queryByLabelText(/Trial ends on/)).toBeNull();
 
     // Select the Trial option in the segmented State radiogroup.
     await user.click(screen.getByRole("radio", { name: "Trial" }));
 
-    // The minimal trial block is now revealed (AD-18 minimal fields).
-    const trialEnd = await screen.findByLabelText(/Trial end date/);
+    // The trial block is now revealed; the default variant is "Ends on a date".
+    const trialEnd = await screen.findByLabelText(/Trial ends on/);
     const trialAmount = screen.getByLabelText(/Amount after trial/);
 
     fireEvent.change(trialEnd, { target: { value: "2026-12-31" } });
@@ -383,6 +386,132 @@ describe("Trial state reveals the trial fields and carries them in the payload (
     // The entered post-trial MAJOR amount (9.99 GBP, exp 2) is parsed to minor units.
     expect(payload.trial).toEqual({ endDate: "2026-12-31", postAmountMinor: 999 });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- Trial-length variants (Story 5.1; AD-18) --------------------------------
+
+describe("trial-length variants (Story 5.1)", () => {
+  it("the start+days variant saves trial:{startDate,lengthDays,postAmountMinor}", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<SubscriptionModal open onClose={onClose} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Days Trial");
+    await user.type(screen.getByLabelText(/^Amount/), "0");
+
+    // Reveal the trial block and switch to the "Lasts N days from start" variant.
+    await user.click(screen.getByRole("radio", { name: "Trial" }));
+    await user.click(
+      await screen.findByRole("radio", { name: /Lasts N days from start/ }),
+    );
+
+    const start = await screen.findByLabelText(/Trial starts on/);
+    fireEvent.change(start, { target: { value: "2026-12-01" } });
+    await user.type(screen.getByLabelText(/Trial length \(days\)/), "14");
+    await user.type(screen.getByLabelText(/Amount after trial/), "9.99");
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.state).toBe("Trial");
+    // The start+days variant is persisted verbatim (GBP exp 2 → 999 minor).
+    expect(payload.trial).toEqual({
+      startDate: "2026-12-01",
+      lengthDays: 14,
+      postAmountMinor: 999,
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("the end-date variant still saves trial:{endDate,postAmountMinor} (default back-compat)", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "End Trial");
+    await user.type(screen.getByLabelText(/^Amount/), "0");
+
+    await user.click(screen.getByRole("radio", { name: "Trial" }));
+    // The default variant is "Ends on a date"; no mode switch needed.
+    const end = await screen.findByLabelText(/Trial ends on/);
+    fireEvent.change(end, { target: { value: "2026-12-31" } });
+    await user.type(screen.getByLabelText(/Amount after trial/), "10");
+
+    await user.click(screen.getByRole("button", { name: /add subscription/i }));
+    await waitFor(() => expect(fake.createSpy).toHaveBeenCalledTimes(1));
+
+    const payload = fake.createSpy.mock.calls[0][0] as SubscriptionInput;
+    expect(payload.trial).toEqual({ endDate: "2026-12-31", postAmountMinor: 1000 });
+  });
+
+  it("an invalid (zero/empty) trial length shows an inline error and persists nothing", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Bad Days");
+    await user.type(screen.getByLabelText(/^Amount/), "0");
+
+    await user.click(screen.getByRole("radio", { name: "Trial" }));
+    await user.click(
+      await screen.findByRole("radio", { name: /Lasts N days from start/ }),
+    );
+    const start = await screen.findByLabelText(/Trial starts on/);
+    fireEvent.change(start, { target: { value: "2026-12-01" } });
+    // A zero-day length is invalid (positive whole days only).
+    const days = screen.getByLabelText(/Trial length \(days\)/);
+    fireEvent.change(days, { target: { value: "0" } });
+    await user.type(screen.getByLabelText(/Amount after trial/), "9.99");
+
+    const form = screen
+      .getByRole("button", { name: /add subscription/i })
+      .closest("form") as HTMLFormElement;
+    fireEvent.submit(form);
+
+    expect(
+      await screen.findByText("Enter a positive whole number of days."),
+    ).toBeInTheDocument();
+    expect(fake.createSpy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a dated post-amount hint ($X after {conversionDate}, no /mo suffix)", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Hinted");
+    await user.type(screen.getByLabelText(/^Amount/), "0");
+
+    await user.click(screen.getByRole("radio", { name: "Trial" }));
+    const end = await screen.findByLabelText(/Trial ends on/);
+    fireEvent.change(end, { target: { value: "2026-12-31" } });
+    await user.type(screen.getByLabelText(/Amount after trial/), "10");
+
+    // The hint names the conversion date (the end date here) and the amount,
+    // with NO "/mo" suffix (post amount is per the sub's cycle, not monthly).
+    const hint = await screen.findByText(/ after 2026-12-31/);
+    expect(hint).toBeInTheDocument();
+    expect(hint.textContent).not.toMatch(/\/mo/);
+  });
+
+  it("pre-populates the start+days variant in EDIT mode", async () => {
+    const subscription = makeSubscription({
+      id: "edit-trial",
+      state: "Trial",
+      currency: "USD",
+      trial: { startDate: "2026-11-01", lengthDays: 7, postAmountMinor: 500 },
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    // The start+days variant radio is selected and its fields are seeded.
+    expect(
+      screen.getByRole("radio", { name: /Lasts N days from start/ }),
+    ).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByLabelText(/Trial starts on/)).toHaveValue("2026-11-01");
+    expect(screen.getByLabelText(/Trial length \(days\)/)).toHaveValue(7);
+    // Post amount rendered back to major (USD exp 2: 500 → 5).
+    expect(screen.getByLabelText(/Amount after trial/)).toHaveValue(5);
   });
 });
 

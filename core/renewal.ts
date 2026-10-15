@@ -33,8 +33,13 @@ function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
-/** Adds a whole number of days to an ISO date using UTC arithmetic. */
-function addDays(date: ISODate, days: number): ISODate {
+/**
+ * Adds a whole number of days to an ISO date using UTC arithmetic.
+ *
+ * Exported so other pure core helpers can reuse the single, UTC-correct day
+ * shift (e.g. `core/trial.conversionDate` derives a trial's start + N days).
+ */
+export function addDays(date: ISODate, days: number): ISODate {
   const { year, month, day } = parseISODate(date);
   const utc = new Date(Date.UTC(year, month - 1, day));
   utc.setUTCDate(utc.getUTCDate() + days);
