@@ -45,6 +45,9 @@ const api: SubbyApi = {
   updateSettings: (patch) => ipcRenderer.invoke(CH.settings.update, patch),
   chooseDataFolder: () => ipcRenderer.invoke(CH.settings.chooseDataFolder),
 
+  // --- Suggested price (FR-13, Story 5.4) ---
+  getPriceSuggestion: (name) => ipcRenderer.invoke(CH.price.suggest, name),
+
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData: (req) => ipcRenderer.invoke(CH.data.importFile, req),
   exportData: (req) => ipcRenderer.invoke(CH.data.exportFile, req),

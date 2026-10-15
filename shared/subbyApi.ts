@@ -17,6 +17,7 @@ import type { Category } from "core/models/category";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
 import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
+import type { PriceSuggestion } from "core/priceSeed";
 import type { ImportOutcome } from "core/import";
 import type {
   AppError,
@@ -93,6 +94,16 @@ export interface SubbyApi {
   updateSettings(patch: Partial<SettingsV2>): Promise<IpcResult<SettingsV2>>;
   /** Opens the native folder picker; `data` is `null` when the dialog is dismissed (Req 15.3). */
   chooseDataFolder(): Promise<IpcResult<SettingsV2 | null>>;
+
+  // --- Suggested price (FR-13, Story 5.4) ---
+  /**
+   * Look up a bundled suggested price for a service name (CREATE-mode Add
+   * convenience). Resolves with the matching seed entry's figures plus the
+   * seed's `asOf` (so the renderer applies the staleness guard with its own
+   * local today), or `null` on no match / an absent-or-corrupt seed. READ-ONLY:
+   * no mutation, no `evt:dataChanged`; any failure is treated as "no suggestion".
+   */
+  getPriceSuggestion(name: string): Promise<IpcResult<PriceSuggestion | null>>;
 
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;

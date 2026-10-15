@@ -50,6 +50,7 @@ import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription
 import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { CreateCategoryResult } from "core/categories";
 import type { ImportOutcome } from "core/import";
+import type { PriceSuggestion } from "core/priceSeed";
 import type {
   AppError,
   ExportRequest,
@@ -354,6 +355,16 @@ export function registerIpcHandlers(
       mutate(() => services.updateSettings(patch)),
   );
 
+  // --- Suggested price (FR-13, Story 5.4) ------------------------------------
+  // READ-ONLY: never broadcasts `evt:dataChanged`, returns the result inline.
+  // The service never throws (a failed/absent seed yields null); `query` still
+  // wraps it defensively so any unexpected throw becomes an IpcResult failure
+  // the renderer treats as "no suggestion" — a crash never crosses the bridge.
+  handle<IpcResult<PriceSuggestion | null>>(
+    CH.price.suggest,
+    (_event, name: string) => query(() => services.getPriceSuggestion(name)),
+  );
+
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
 
   handle<IpcResult<ImportOutcome>>(
@@ -412,6 +423,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.categories.remove,
   CH.settings.get,
   CH.settings.update,
+  CH.price.suggest,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,

@@ -72,12 +72,14 @@ import { minorUnits, toMajor } from "core/money";
 import { trialSchema } from "core/models/schema";
 import { conversionDate } from "core/trial";
 import { appendPriceEntry, priceChanged } from "core/priceHistory";
+import { isSeedStale, type PriceSuggestion } from "core/priceSeed";
 import type { SubscriptionInputV2 } from "shared/types";
 import { cn } from "@/lib/utils";
 import {
   categoriesApi,
   isSubbyError,
   subscriptionsApi,
+  suggestPriceSafe,
   toAppError,
 } from "@/api/subby";
 import PriceHistoryList from "@/components/PriceHistoryList";
@@ -112,6 +114,14 @@ const STATES: readonly SubscriptionState[] = ["Active", "Paused", "Trial"];
 
 /** Default custom interval used until the user edits it. */
 const DEFAULT_CUSTOM_INTERVAL: CustomInterval = { unit: "month", count: 1 };
+
+/**
+ * The ~1-year staleness guard for the suggested-price seed (Story 5.4; FR-13).
+ * A seed whose `asOf` is strictly MORE than this many days before the local
+ * today is stale: its suggestion is shown as a non-filling hint but is NEVER
+ * silently auto-filled. 365 days is the "~1yr" guard from the spec.
+ */
+const SUGGESTION_MAX_AGE_DAYS = 365;
 
 /** Shared focus-ring utility, consistent with the app shell (Req 22.1, 22.3). */
 const FOCUS_RING =
@@ -483,6 +493,34 @@ function computeTrialHint(form: FormState): string | null {
 }
 
 /**
+ * Build the dated suggested-price note (Story 5.4; FR-13):
+ * "Suggested {money} — typical as of {asOf}, please confirm. Approximate — always
+ * verify against your own plan."
+ *
+ * The money is the seed amount formatted in the seed's own currency via the
+ * money seam; an unknown currency falls back to "{currency} {amountMinor}" so
+ * the note never crashes. The note NAMES the as-of date and the "please confirm"
+ * / "approximate, always verify" disclaimer the spec requires, and is purely
+ * informational — it never gates save and never overwrites the user's entry.
+ */
+function buildSuggestionNote(suggestion: PriceSuggestion): string {
+  // The currency appears exactly ONCE: on the success path we join the major
+  // string with the code ("15.49 USD"); on the unknown-currency fallback the
+  // code already leads the raw minor units ("USD 1549"). The template never
+  // appends the code again.
+  let money: string;
+  try {
+    money = `${toMajor(suggestion.amountMinor, suggestion.currency)} ${suggestion.currency}`;
+  } catch {
+    money = `${suggestion.currency} ${suggestion.amountMinor}`;
+  }
+  return (
+    `Suggested ${money} — typical as of ${suggestion.asOf}, ` +
+    "please confirm. Approximate — always verify against your own plan."
+  );
+}
+
+/**
  * Parse the amount field into integer minor units for the form's currency, or
  * `null` when it is empty / unparseable (Story 5.3). Used to drive the reactive
  * price-change offer without duplicating the money-seam parse — it mirrors
@@ -531,6 +569,20 @@ export default function SubscriptionModal({
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
+  // Suggested price (Story 5.4; FR-13) — CREATE mode only. As the user types a
+  // name, we look up a bundled suggestion over the IPC bridge and, on a FRESH
+  // match while the amount is still untouched, pre-fill the amount (and
+  // currency/cycle) ONCE and show a dated note. The user's entry is sacred: an
+  // explicit "amount user-edited" flag (`amountUserEdited`) is set on the first
+  // manual amount change; once set, a suggestion only ever shows the note and
+  // never writes the field or re-fires. `suggestion` holds the current match (or
+  // null for a miss / absent seed) so the note can render; `suggestionFilled`
+  // records whether we already auto-filled from it (so we never re-fill).
+  const suggestionSeqRef = useRef(0);
+  const [suggestion, setSuggestion] = useState<PriceSuggestion | null>(null);
+  const amountUserEdited = useRef(false);
+  const suggestionFilled = useRef(false);
+
   // Inline "+ add new" category affordance next to the Category select: when
   // open, a small labelled input creates a category via `categoriesApi.create`
   // and selects the result WITHOUT leaving the modal. Its own inline error echoes
@@ -559,6 +611,12 @@ export default function SubscriptionModal({
     setAddingCategory(false);
     setNewCategoryName("");
     setCategoryError(null);
+    // Reset the suggestion machinery on every (re)open so a fresh Add starts
+    // with no note, an untouched amount, and no prior pre-fill (Story 5.4).
+    setSuggestion(null);
+    amountUserEdited.current = false;
+    suggestionFilled.current = false;
+    suggestionSeqRef.current += 1; // invalidate any in-flight lookup
     // We intentionally re-seed only on (re)open or identity change of the
     // target subscription, not on every keystroke.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -610,11 +668,94 @@ export default function SubscriptionModal({
     priceChangeOfferShown.current = priceChangedForEdit;
   }, [open, priceChangedForEdit]);
 
+  // Suggested-price lookup (Story 5.4; FR-13) — CREATE mode only. On each name
+  // change we query the bundled seed over the IPC bridge (via `suggestPriceSafe`,
+  // which NEVER throws — any failure degrades to "no suggestion"). The lookup is
+  // local and cheap, but a per-keystroke sequence guard (`suggestionSeqRef`)
+  // discards a stale async result if the name changed again before it resolved.
+  //
+  // Behavior on resolve:
+  //   - no match (null)  → clear the note (silent miss), never touch the amount.
+  //   - a match          → store it so the note renders. Then AUTO-FILL exactly
+  //     once IFF the seed is NOT stale AND the user has not edited the amount AND
+  //     we have not already pre-filled: write amount/currency/cycle. A STALE seed
+  //     (asOf > ~1yr before today, a UTC day) is NEVER auto-filled — the note
+  //     shows as a non-filling hint. The user's typed value always wins.
+  useEffect(() => {
+    if (!open || isEdit) return;
+    const name = form.name;
+    // An empty / whitespace-only name can never match (the seed lookup is an
+    // exact normalized-key match), so skip the query entirely and clear any
+    // prior note — this also means the very first mount (name === "") never
+    // fires a pointless lookup. Bump the sequence ref so ANY in-flight lookup
+    // started by a prior keystroke is ignored when it resolves (otherwise a
+    // late match could re-show a stale note on a now-empty field).
+    if (name.trim() === "") {
+      suggestionSeqRef.current += 1;
+      setSuggestion(null);
+      return;
+    }
+    const seq = ++suggestionSeqRef.current;
+    void (async () => {
+      const result = await suggestPriceSafe(name);
+      // A newer keystroke superseded this lookup — drop the stale result.
+      if (seq !== suggestionSeqRef.current) return;
+      if (result === null) {
+        setSuggestion(null);
+        return;
+      }
+      setSuggestion(result);
+      const stale = isSeedStale(result.asOf, todayIso(), SUGGESTION_MAX_AGE_DAYS);
+      if (stale || amountUserEdited.current || suggestionFilled.current) {
+        // Stale seed, user already edited the amount, or we already pre-filled:
+        // show the note only, never (re)write the field.
+        return;
+      }
+      // Fresh match on an untouched amount: pre-fill ONCE (amount + currency +
+      // cycle), then latch so a later keystroke never re-fills.
+      suggestionFilled.current = true;
+      let major: string;
+      try {
+        major = toMajor(result.amountMinor, result.currency);
+      } catch {
+        // An unknown currency can't be rendered to a major string — skip the
+        // amount pre-fill (the note still informs), but adopt currency/cycle.
+        setForm((prev) => ({
+          ...prev,
+          currency: result.currency,
+          billingCycle: result.billingCycle,
+        }));
+        return;
+      }
+      setForm((prev) => ({
+        ...prev,
+        amount: major,
+        currency: result.currency,
+        billingCycle: result.billingCycle,
+      }));
+    })();
+    // Re-run on name change (and on open/mode flips, which reset above).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, isEdit, form.name]);
+
   if (!open) return null;
 
   /** Patch a single form field. */
   function set<K extends keyof FormState>(key: K, value: FormState[K]): void {
     setForm((prev) => ({ ...prev, [key]: value }));
+  }
+
+  /**
+   * Amount-field change handler (Story 5.4). Marks the amount as USER-EDITED on
+   * the first manual change so a suggestion never clobbers the typed value and
+   * never re-fires after an edit (the user's entry is sacred). It does NOT clear
+   * the suggestion note — a dated note may still inform even once the user owns
+   * the value. The auto-fill writes `form.amount` via `setForm` directly (not
+   * this handler), so programmatic pre-fill never trips the flag.
+   */
+  function handleAmountChange(value: string): void {
+    amountUserEdited.current = true;
+    set("amount", value);
   }
 
   /**
@@ -800,6 +941,17 @@ export default function SubscriptionModal({
   const trialHint =
     form.state === "Trial" ? computeTrialHint(form) : null;
 
+  // Dated suggested-price note (Story 5.4; FR-13) — CREATE mode only. When a
+  // bundled suggestion matched the typed name, surface a note that NAMES the "as
+  // of" date, says "please confirm", and carries the "approximate, always
+  // verify" disclaimer. Shown whether or not the amount was auto-filled: a FRESH
+  // match that pre-filled, AND a stale match that only hinted, both inform here.
+  // Non-match (`suggestion === null`) or EDIT mode → no note.
+  const suggestionNote =
+    !isEdit && suggestion !== null
+      ? buildSuggestionNote(suggestion)
+      : null;
+
   return (
     <div
       // Backdrop: clicking it cancels without persisting (Req 4.4).
@@ -975,10 +1127,31 @@ export default function SubscriptionModal({
                 step="0.01"
                 className={CONTROL_CLASS}
                 value={form.amount}
-                onChange={(e) => set("amount", e.target.value)}
+                onChange={(e) => handleAmountChange(e.target.value)}
                 aria-invalid={errors.amount ? true : undefined}
-                aria-describedby={errors.amount ? "sub-amount-error" : undefined}
+                aria-describedby={
+                  // Announce BOTH when present (space-joined), so a validation
+                  // error never drops the suggestion note from the a11y name.
+                  [
+                    errors.amount ? "sub-amount-error" : null,
+                    suggestionNote ? "sub-amount-suggestion" : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" ") || undefined
+                }
               />
+              {/* Dated suggestion note + "approximate, always verify" disclaimer
+                  (Story 5.4; FR-13). Shown in CREATE mode on a seed match. It is
+                  purely informational — the field stays fully editable and the
+                  user's entry always wins. */}
+              {suggestionNote && (
+                <p
+                  id="sub-amount-suggestion"
+                  className="text-xs text-muted-foreground"
+                >
+                  {suggestionNote}
+                </p>
+              )}
             </Field>
 
             {/* Currency */}

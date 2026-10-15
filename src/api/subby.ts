@@ -135,6 +135,32 @@ export const settingsApi = {
   chooseDataFolder: () => unwrap(getSubby().chooseDataFolder()),
 } as const;
 
+/**
+ * Suggested-price operations (FR-13, Story 5.4). READ-ONLY: `suggest` returns
+ * the matching seed entry + `asOf` (or `null` on no match / absent seed). The
+ * caller treats ANY failure as "no suggestion" — a suggestion is never
+ * load-bearing — so prefer {@link suggestPriceSafe} in UI hot paths.
+ */
+export const priceApi = {
+  suggest: (name: string) => unwrap(getSubby().getPriceSuggestion(name)),
+} as const;
+
+/**
+ * Suggestion lookup that NEVER throws: resolves to the suggestion (or `null`)
+ * and swallows any bridge/IPC failure as `null`. This is the ergonomic front
+ * door the Add modal uses — a failed lookup must silently become "no
+ * suggestion", never surface an error or block typing.
+ */
+export async function suggestPriceSafe(
+  name: string,
+): Promise<Awaited<ReturnType<typeof priceApi.suggest>> | null> {
+  try {
+    return await priceApi.suggest(name);
+  } catch {
+    return null;
+  }
+}
+
 /** Import / export / backup operations (Req 16, 17, 18). */
 export const dataApi = {
   importData: (req: Parameters<SubbyApi["importData"]>[0]) =>

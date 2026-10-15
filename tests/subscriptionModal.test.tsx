@@ -19,6 +19,7 @@ import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
+import type { PriceSuggestion } from "core/priceSeed";
 import type { IpcResult, SubscriptionInput } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
 
@@ -88,10 +89,18 @@ interface FakeApi extends SubbyApi {
   createSpy: ReturnType<typeof vi.fn>;
   updateSpy: ReturnType<typeof vi.fn>;
   createCategorySpy: ReturnType<typeof vi.fn>;
+  suggestSpy: ReturnType<typeof vi.fn>;
   state: {
     subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsV2;
+    /**
+     * The suggestion the fake returns from `getPriceSuggestion` for ANY name
+     * (Story 5.4). Tests set it to a {@link PriceSuggestion} to simulate a seed
+     * match or leave it `null` for a miss / absent seed. The default is `null`
+     * so unrelated modal tests see no suggestion behavior.
+     */
+    suggestion: PriceSuggestion | null;
   };
 }
 
@@ -116,15 +125,23 @@ function createFakeApi(): FakeApi {
     fake.state.categories = [...fake.state.categories, created];
     return ok({ categories: fake.state.categories, created });
   });
+  // Suggested price (Story 5.4): returns whatever the test seeded on
+  // `fake.state.suggestion` for ANY queried name (the modal only queries in
+  // CREATE mode). Default null = no match / absent seed.
+  const suggestSpy = vi.fn((_name: string) =>
+    ok<PriceSuggestion | null>(fake.state.suggestion),
+  );
 
   const fake: FakeApi = {
     createSpy,
     updateSpy,
     createCategorySpy,
+    suggestSpy,
     state: {
       subscriptions: [],
       categories: [makeCategory()],
       settings,
+      suggestion: null,
     },
 
     // --- Subscriptions ---
@@ -145,6 +162,9 @@ function createFakeApi(): FakeApi {
     getSettings: () => ok(fake.state.settings),
     updateSettings: () => ok(fake.state.settings),
     chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
+
+    // --- Suggested price (Story 5.4) ---
+    getPriceSuggestion: suggestSpy as SubbyApi["getPriceSuggestion"],
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -1007,6 +1027,222 @@ describe("price history (Story 5.3; AD-21)", () => {
     );
 
     expect(screen.getByText("No price changes recorded.")).toBeInTheDocument();
+  });
+});
+
+// --- Suggested price on add (Story 5.4; FR-13) -------------------------------
+
+describe("suggested price on add (Story 5.4)", () => {
+  /** Today as YYYY-MM-DD (matches the modal's `todayIso`), so a fresh seed. */
+  function todayIso(): string {
+    return new Date().toISOString().slice(0, 10);
+  }
+
+  /** A fresh (today-dated) USD/Monthly suggestion for $15.49. */
+  function freshNetflix(): PriceSuggestion {
+    return {
+      amountMinor: 1549,
+      currency: "USD",
+      billingCycle: "Monthly",
+      asOf: todayIso(),
+    };
+  }
+
+  it("CREATE: typing a known name pre-fills the amount and shows a dated note + disclaimer", async () => {
+    const user = userEvent.setup();
+    fake.state.suggestion = freshNetflix();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    const amount = screen.getByLabelText(/^Amount/);
+    expect(amount).toHaveValue(null); // empty to start
+
+    await user.type(screen.getByLabelText(/^Name/), "Netflix");
+
+    // The lookup fired for the typed name.
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    // The amount pre-filled to the suggestion's major value (USD 1549 → 15.49),
+    // and the currency/cycle adopted the suggestion.
+    await waitFor(() => expect(amount).toHaveValue(15.49));
+    expect(screen.getByLabelText(/Currency/)).toHaveValue("USD");
+    expect(screen.getByLabelText(/Billing cycle/)).toHaveValue("Monthly");
+
+    // A dated note names the as-of date, says "please confirm", and carries the
+    // "approximate, always verify" disclaimer.
+    const note = await screen.findByText(/typical as of/i);
+    expect(note.textContent).toContain(todayIso());
+    expect(note.textContent).toMatch(/please confirm/i);
+    expect(note.textContent).toMatch(/approximate/i);
+    expect(note.textContent).toMatch(/verify/i);
+    // The note shows the FORMATTED money (USD 1549 → 15.49) with the currency
+    // code exactly ONCE (no "15.49 USD USD" double-print).
+    expect(note.textContent).toMatch(/15\.49/);
+    expect(note.textContent).toMatch(/15\.49 USD/);
+    expect(note.textContent).not.toMatch(/USD\s+USD/);
+  });
+
+  it("CREATE: an unknown-currency match does NOT pre-fill the amount but adopts currency/cycle and shows a one-currency note", async () => {
+    const user = userEvent.setup();
+    // "ZZZZ" is not in the money exponent table, so `toMajor` throws → the amount
+    // is NOT pre-filled (the note still informs via the raw-minor fallback).
+    fake.state.suggestion = {
+      amountMinor: 1549,
+      currency: "ZZZZ",
+      billingCycle: "Yearly",
+      asOf: todayIso(),
+    };
+
+    expect(() =>
+      render(<SubscriptionModal open onClose={() => {}} />),
+    ).not.toThrow();
+
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.type(screen.getByLabelText(/^Name/), "Mystery");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    // The dated note renders (nothing threw) with its unknown-currency fallback:
+    // "ZZZZ 1549", with the currency code shown exactly ONCE.
+    const note = await screen.findByText(/typical as of/i);
+    expect(note.textContent).toMatch(/ZZZZ\s+1549/);
+    expect(note.textContent).not.toMatch(/ZZZZ[^]*ZZZZ/);
+
+    // Currency and cycle still adopt the suggestion, but the amount stays empty
+    // (toMajor could not render a major string for the unknown currency).
+    await waitFor(() =>
+      expect(screen.getByLabelText(/Currency/)).toHaveValue("ZZZZ"),
+    );
+    expect(screen.getByLabelText(/Billing cycle/)).toHaveValue("Yearly");
+    expect(amount).toHaveValue(null);
+  });
+
+  it("CREATE: the user's already-typed amount is NEVER overwritten by a later match", async () => {
+    const user = userEvent.setup();
+    fake.state.suggestion = freshNetflix();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    // The user types an amount FIRST (marking it user-edited)...
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.type(amount, "42");
+    expect(amount).toHaveValue(42);
+
+    // ...then types a name that matches. The suggestion must NOT clobber "42".
+    await user.type(screen.getByLabelText(/^Name/), "Netflix");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    // Give the async lookup a chance to resolve, then assert the value is still 42.
+    const note = await screen.findByText(/typical as of/i); // note still shows
+    expect(note).toBeInTheDocument();
+    expect(amount).toHaveValue(42);
+  });
+
+  it("CREATE: after a pre-fill, editing the amount then re-typing the name does NOT re-fill", async () => {
+    const user = userEvent.setup();
+    fake.state.suggestion = freshNetflix();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    const name = screen.getByLabelText(/^Name/);
+    const amount = screen.getByLabelText(/^Amount/);
+
+    // First match pre-fills 15.49.
+    await user.type(name, "Netflix");
+    await waitFor(() => expect(amount).toHaveValue(15.49));
+
+    // The user edits the amount — their value now wins forever.
+    await user.clear(amount);
+    await user.type(amount, "7");
+    expect(amount).toHaveValue(7);
+
+    // Keep typing the name (still a match): the suggestion must NOT re-overwrite.
+    await user.type(name, " Premium");
+    // (unknown "netflix premium" would miss anyway, so also type a known match)
+    await user.clear(name);
+    await user.type(name, "Netflix");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    expect(amount).toHaveValue(7);
+  });
+
+  it("CREATE: a non-matching name shows no note and pre-fills nothing (silent)", async () => {
+    const user = userEvent.setup();
+    fake.state.suggestion = null; // the seed misses for every name
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "MyCustomThing");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    expect(screen.getByLabelText(/^Amount/)).toHaveValue(null);
+    expect(screen.queryByText(/typical as of/i)).toBeNull();
+  });
+
+  it("CREATE: clearing the name ignores a late-resolving match (no stale note on an empty field)", async () => {
+    const user = userEvent.setup();
+    // The lookup for a non-empty name resolves ONLY when we release it, so we can
+    // clear the name while it is in flight and prove the late match is ignored.
+    let release!: (v: IpcResult<PriceSuggestion | null>) => void;
+    const pending = new Promise<IpcResult<PriceSuggestion | null>>((r) => {
+      release = r;
+    });
+    fake.suggestSpy.mockImplementation((_name: string) => pending);
+
+    render(<SubscriptionModal open onClose={() => {}} />);
+    const name = screen.getByLabelText(/^Name/);
+
+    // Type a name (fires the in-flight lookup), then CLEAR it before resolving.
+    await user.type(name, "Netflix");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+    await user.clear(name);
+
+    // Now resolve the stale lookup with a match. The empty-name branch already
+    // bumped the sequence ref, so this resolve is dropped — no note appears.
+    release({ ok: true, data: freshNetflix() });
+    await pending;
+
+    // Give React a tick to process any (ignored) resolution.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText(/typical as of/i)).toBeNull();
+    expect(screen.getByLabelText(/^Amount/)).toHaveValue(null);
+  });
+
+  it("CREATE: a STALE seed (>~1yr) shows the note but does NOT auto-fill the amount", async () => {
+    const user = userEvent.setup();
+    // asOf far in the past → always stale relative to any real `today`.
+    fake.state.suggestion = {
+      amountMinor: 1549,
+      currency: "USD",
+      billingCycle: "Monthly",
+      asOf: "2020-01-01",
+    };
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.type(screen.getByLabelText(/^Name/), "Netflix");
+    await waitFor(() => expect(fake.suggestSpy).toHaveBeenCalled());
+
+    // The dated note still informs (naming the old date)...
+    const note = await screen.findByText(/typical as of/i);
+    expect(note.textContent).toContain("2020-01-01");
+    // ...but the amount is NOT silently pre-filled from the stale seed.
+    expect(amount).toHaveValue(null);
+  });
+
+  it("EDIT: never queries a suggestion and never shows the note", async () => {
+    const subscription = makeSubscription({
+      id: "edit-no-suggest",
+      name: "Netflix",
+      currency: "USD",
+      amountMinor: 49900,
+    });
+    // Even if the fake WOULD return a suggestion, EDIT mode must not query.
+    fake.state.suggestion = freshNetflix();
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    // Give any (erroneous) async lookup time to resolve.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(fake.suggestSpy).not.toHaveBeenCalled();
+    expect(screen.queryByText(/typical as of/i)).toBeNull();
   });
 });
 

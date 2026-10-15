@@ -34,9 +34,16 @@ import {
   parseBundledSnapshot,
   type BundledFxSnapshot,
 } from "core/fxSnapshot";
+import {
+  parsePriceSeed,
+  type PriceSeed,
+} from "core/priceSeed";
 
 /** The canonical name of the bundled FX snapshot resource. */
 export const FX_SNAPSHOT_RESOURCE = "fx-snapshot.json" as const;
+
+/** The canonical name of the bundled suggested-price-seed resource (Story 5.4). */
+export const PRICE_SEED_RESOURCE = "price-seed.json" as const;
 
 /**
  * Inputs for {@link resolveResourceDir}, supplied by the app-wiring layer at the
@@ -141,6 +148,21 @@ export function readBundledFxSnapshot(
   opts: ResolveResourceDirOptions = defaultResolveOptions(),
 ): BundledFxSnapshot {
   return parseBundledSnapshot(readBundledResource(FX_SNAPSHOT_RESOURCE, opts));
+}
+
+/**
+ * Convenience: read AND validate the bundled suggested-price seed into a typed
+ * {@link PriceSeed} (Story 5.4). Delegates parsing/validation to the pure
+ * {@link parsePriceSeed} (loud on a bad shape / schema / entry), so a corrupt
+ * bundle is an explicit error here — a missing/unreadable file throws a
+ * {@link ResourceReadError}, a malformed shape throws a `PriceSeedError`. The
+ * app-wiring layer catches BOTH and degrades the suggestion feature off (a
+ * suggestion is a convenience, never load-bearing), so Add never crashes.
+ */
+export function readBundledPriceSeed(
+  opts: ResolveResourceDirOptions = defaultResolveOptions(),
+): PriceSeed {
+  return parsePriceSeed(readBundledResource(PRICE_SEED_RESOURCE, opts));
 }
 
 /**

@@ -31,6 +31,10 @@ export const CH = {
     update: "settings:update",
     chooseDataFolder: "settings:chooseDataFolder",
   },
+  price: {
+    // Read-only suggested-price lookup for the Add modal (FR-13, Story 5.4).
+    suggest: "price:suggest",
+  },
   data: {
     importFile: "data:import", // {format, conflictMode, path}
     exportFile: "data:export", // {format, path}

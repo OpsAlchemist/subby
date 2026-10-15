@@ -118,6 +118,9 @@ function createFakeApi(): FakeApi {
     updateSettings: () => ok(fake.state.settings),
     chooseDataFolder: () => ok<SettingsV2 | null>(fake.state.settings),
 
+    // --- Suggested price (Story 5.4): default fake returns no suggestion ---
+    getPriceSuggestion: (() => ok(null)) as SubbyApi["getPriceSuggestion"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),

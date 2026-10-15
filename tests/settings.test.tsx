@@ -128,6 +128,9 @@ function createFakeApi(): FakeApi {
     updateSettings: updateSpy as SubbyApi["updateSettings"],
     chooseDataFolder: chooseFolderSpy as SubbyApi["chooseDataFolder"],
 
+    // --- Suggested price (Story 5.4): default fake returns no suggestion ---
+    getPriceSuggestion: (() => ok(null)) as SubbyApi["getPriceSuggestion"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),

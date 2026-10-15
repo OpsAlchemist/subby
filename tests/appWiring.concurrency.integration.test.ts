@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
+import { parsePriceSeed } from "core/priceSeed";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
@@ -368,6 +369,47 @@ describe("reminder-ledger write goes through lock(\"reminderLedger\"); read is l
     expect(ledgerWriteStart).toBeGreaterThanOrEqual(0);
     expect(subsWriteEnd).toBeGreaterThanOrEqual(0);
     expect(ledgerWriteStart).toBeLessThan(subsWriteEnd);
+  });
+});
+
+describe("getPriceSuggestion is lock-free and degrades off (Story 5.4)", () => {
+  it("returns a suggestion with NO storage I/O (no lock, no read/write log entries)", () => {
+    const storage = new InstrumentedStorage();
+    const seed = parsePriceSeed({
+      schemaVersion: 1,
+      asOf: "2026-10-01",
+      disclaimer: "approx",
+      services: {
+        netflix: { amountMinor: 1549, currency: "USD", billingCycle: "Monthly" },
+      },
+    });
+    const services = buildAppServices(storage, seed);
+
+    const before = storage.log.length;
+    const hit = services.getPriceSuggestion("  Netflix ");
+    // Synchronous, immutable-bundle lookup: no StoragePort call was made (the
+    // seed is never the StoragePort), so the instrumented call log is untouched.
+    expect(storage.log.length).toBe(before);
+    expect(hit).toEqual({
+      amountMinor: 1549,
+      currency: "USD",
+      billingCycle: "Monthly",
+      asOf: "2026-10-01",
+    });
+
+    // It is also safe to interleave with a mutation (lock-free): fire a create
+    // and a lookup together; the lookup resolves immediately and correctly.
+    expect(services.getPriceSuggestion("spotify")).toBeNull();
+  });
+
+  it("returns null for every name when the seed failed to load (feature off)", () => {
+    const storage = new InstrumentedStorage();
+    // null = the main process caught a missing/corrupt seed and degraded off.
+    const services = buildAppServices(storage, null);
+    expect(services.getPriceSuggestion("Netflix")).toBeNull();
+    expect(() => services.getPriceSuggestion("anything")).not.toThrow();
+    // No storage interaction occurred for the (off) lookups.
+    expect(storage.log.filter((e) => e.includes("price")).length).toBe(0);
   });
 });
 

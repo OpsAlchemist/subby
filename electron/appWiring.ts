@@ -23,6 +23,7 @@ import * as subsCore from "core/subscriptionsV2";
 import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
+import { lookupSuggestion, type PriceSeed, type PriceSuggestion } from "core/priceSeed";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
@@ -32,6 +33,7 @@ import type { ConflictMode, SubscriptionInputV2 } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
 import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
+import { readBundledPriceSeed } from "./storage/resourceReader";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
@@ -187,6 +189,17 @@ export interface AppServices {
     opts?: { confirmed: boolean },
   ): Promise<DeleteCategoryOutcome>;
 
+  // --- Suggested price (FR-13, Story 5.4) ---
+  /**
+   * Look up a bundled suggested price for a queried service name (CREATE-mode
+   * Add convenience). Returns the matching seed entry's figures plus the seed's
+   * `asOf` (so the renderer applies the staleness guard with its own local
+   * `today`), or `null` on no match. Returns `null` when the bundled seed failed
+   * to load (missing/corrupt — the feature degrades off). READ-ONLY, lock-free,
+   * never throws: the seed is an immutable bundle, never the StoragePort.
+   */
+  getPriceSuggestion(name: string): PriceSuggestion | null;
+
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
   getSettings(): Promise<SettingsV2>;
@@ -285,13 +298,44 @@ function nowIso(): string {
 }
 
 /**
+ * Load the bundled suggested-price seed, or `null` on any failure (Story 5.4).
+ *
+ * The default production loader reads the asar-aware bundle via
+ * {@link readBundledPriceSeed} and returns `null` on a `ResourceReadError`
+ * (missing/unreadable) OR a `PriceSeedError` (bad shape) — the whole feature
+ * degrades off. It is injectable so tests can supply a fixed {@link PriceSeed}
+ * (or a null-returning loader to simulate an absent/corrupt seed) WITHOUT
+ * booting Electron (the default would touch the `electron` `app` globals).
+ */
+export type PriceSeedLoader = () => PriceSeed | null;
+
+/** The production seed loader: read the bundle, degrade to `null` on any error. */
+export const defaultPriceSeedLoader: PriceSeedLoader = () => {
+  try {
+    return readBundledPriceSeed();
+  } catch {
+    // ResourceReadError (missing/malformed) OR PriceSeedError (bad shape):
+    // surface as "no suggestions available" by holding null.
+    return null;
+  }
+};
+
+/**
  * Build the application services over an injected {@link StoragePort}.
  *
  * Used directly in tests with an in-memory/temp-dir storage implementation, and
  * by {@link createAppContext} in production with the {@link JsonFileStorage}
  * adapter.
+ *
+ * @param storage      the storage port backing mutable user data.
+ * @param priceSeed    the loaded suggested-price seed (or `null` when it failed
+ *                     to load / the feature is off). Defaults to the production
+ *                     {@link defaultPriceSeedLoader}; tests inject a fixed seed.
  */
-export function buildAppServices(storage: StoragePort): AppServices {
+export function buildAppServices(
+  storage: StoragePort,
+  priceSeed: PriceSeed | null = defaultPriceSeedLoader(),
+): AppServices {
   // Per-file write authority (AD-29). Every mutating method below runs its whole
   // `read → core → write` (and, for a destructive op, its pre-op backup) inside
   // `lock(<file>, ...)` so two same-file mutations never interleave across an
@@ -305,6 +349,14 @@ export function buildAppServices(storage: StoragePort): AppServices {
   // lock-free read observes either the pre-write file or the post-write file —
   // never a torn/partial state — even when issued between two serialized writes.
   const lock = createPerFileLock();
+
+  // The bundled suggested-price seed (Story 5.4) is read ONCE at construction
+  // through the asar-aware resource reader (the `defaultPriceSeedLoader` default
+  // of the `priceSeed` parameter) — never the StoragePort, since the seed is
+  // immutable shipped data. A missing/corrupt seed arrives here as `null`, so the
+  // whole feature degrades OFF (`getPriceSuggestion` returns null): a suggestion
+  // is a convenience, never load-bearing, and must NEVER block or crash Add. No
+  // network, no lock (read-only, immutable in-memory bundle).
 
   return {
     // --- Subscriptions -------------------------------------------------------
@@ -431,6 +483,16 @@ export function buildAppServices(storage: StoragePort): AppServices {
         await storage.writeCategories(next);
         return { ok: true, categories: next };
       });
+    },
+
+    // --- Suggested price (FR-13, Story 5.4) ----------------------------------
+    getPriceSuggestion(name) {
+      // Lock-free, read-only lookup over the immutable in-memory bundle. When the
+      // seed failed to load, the feature is off → null. Staleness is NOT decided
+      // here (core takes no clock); the renderer applies `isSeedStale` with its
+      // real local `today` to the returned `asOf`.
+      if (priceSeed === null) return null;
+      return lookupSuggestion(priceSeed, name);
     },
 
     // --- Settings ------------------------------------------------------------

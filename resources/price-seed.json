@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-10-01",
+  "disclaimer": "Approximate typical prices, bundled offline and read-only. Always verify against your own plan — prices vary by region, tier, and over time.",
+  "services": {
+    "netflix": { "amountMinor": 1549, "currency": "USD", "billingCycle": "Monthly" },
+    "spotify": { "amountMinor": 1199, "currency": "USD", "billingCycle": "Monthly" },
+    "youtube premium": { "amountMinor": 1399, "currency": "USD", "billingCycle": "Monthly" },
+    "disney+": { "amountMinor": 1599, "currency": "USD", "billingCycle": "Monthly" },
+    "hulu": { "amountMinor": 1799, "currency": "USD", "billingCycle": "Monthly" },
+    "hbo max": { "amountMinor": 1699, "currency": "USD", "billingCycle": "Monthly" },
+    "amazon prime": { "amountMinor": 1499, "currency": "USD", "billingCycle": "Monthly" },
+    "apple music": { "amountMinor": 1099, "currency": "USD", "billingCycle": "Monthly" },
+    "apple tv+": { "amountMinor": 999, "currency": "USD", "billingCycle": "Monthly" },
+    "youtube music": { "amountMinor": 1099, "currency": "USD", "billingCycle": "Monthly" },
+    "notion": { "amountMinor": 1000, "currency": "USD", "billingCycle": "Monthly" },
+    "dropbox": { "amountMinor": 1199, "currency": "USD", "billingCycle": "Monthly" },
+    "google one": { "amountMinor": 199, "currency": "USD", "billingCycle": "Monthly" },
+    "icloud+": { "amountMinor": 299, "currency": "USD", "billingCycle": "Monthly" },
+    "github": { "amountMinor": 400, "currency": "USD", "billingCycle": "Monthly" },
+    "chatgpt plus": { "amountMinor": 2000, "currency": "USD", "billingCycle": "Monthly" },
+    "slack": { "amountMinor": 875, "currency": "USD", "billingCycle": "Monthly" },
+    "adobe creative cloud": { "amountMinor": 5999, "currency": "USD", "billingCycle": "Monthly" },
+    "microsoft 365": { "amountMinor": 699, "currency": "USD", "billingCycle": "Monthly" },
+    "1password": { "amountMinor": 299, "currency": "USD", "billingCycle": "Monthly" }
+  }
+}

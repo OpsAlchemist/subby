@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
+import { parsePriceSeed, type PriceSeed } from "core/priceSeed";
 import { DEFAULT_SETTINGS, DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -259,6 +260,48 @@ describe("AppServices settings round-trips (Req 2.3)", () => {
   });
 });
 
+describe("AppServices suggested-price lookup (FR-13, Story 5.4)", () => {
+  /** A tiny valid seed for the lookup-only service. */
+  function makeSeed(): PriceSeed {
+    return parsePriceSeed({
+      schemaVersion: 1,
+      asOf: "2026-10-01",
+      disclaimer: "Approximate typical prices, verify your own plan.",
+      services: {
+        netflix: { amountMinor: 1549, currency: "USD", billingCycle: "Monthly" },
+        spotify: { amountMinor: 1199, currency: "USD", billingCycle: "Monthly" },
+      },
+    });
+  }
+
+  it("a known name returns the suggestion (entry + seed asOf); normalized trim/case", () => {
+    const svc = buildAppServices(storage, makeSeed());
+    expect(svc.getPriceSuggestion("  Netflix ")).toEqual({
+      amountMinor: 1549,
+      currency: "USD",
+      billingCycle: "Monthly",
+      asOf: "2026-10-01",
+    });
+    expect(svc.getPriceSuggestion("SPOTIFY")!.amountMinor).toBe(1199);
+  });
+
+  it("an unknown name returns null (silent miss, no fuzzy)", () => {
+    const svc = buildAppServices(storage, makeSeed());
+    expect(svc.getPriceSuggestion("MyCustomThing")).toBeNull();
+    expect(svc.getPriceSuggestion("net")).toBeNull();
+  });
+
+  it("a missing/corrupt seed (null) returns null for ANY name without throwing", () => {
+    // Simulate the main-process degrade-off: the loader yielded null (seed
+    // missing/corrupt). Every lookup is a quiet null — the feature is off, Add
+    // works normally.
+    const svc = buildAppServices(storage, null);
+    expect(svc.getPriceSuggestion("Netflix")).toBeNull();
+    expect(svc.getPriceSuggestion("")).toBeNull();
+    expect(() => svc.getPriceSuggestion("anything")).not.toThrow();
+  });
+});
+
 describe("AppServices export / import round-trips (Req 2.3)", () => {
   it("exportData('json') returns an importer-compatible string", async () => {
     await services.createSubscription(makeInput({ name: "Disney+" }));
@@ -443,6 +486,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "getSettings",
     "updateSettings",
     "chooseDataFolder",
+    "getPriceSuggestion",
     "importData",
     "exportData",
     "listBackups",
