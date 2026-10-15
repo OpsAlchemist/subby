@@ -18,6 +18,16 @@
  *     from the entered major amount), preserving every untouched field including
  *     `priceHistory`/`tags`/`trial`.
  *
+ * Price history (Story 5.3; AD-21): in EDIT mode, when the submitted amount
+ * differs from the stored amount, the modal OFFERS an opt-in "Record this as a
+ * price change" checkbox (shown only then, defaulting checked). When opted in it
+ * appends a forward-log {@link PriceEntryV2} (the NEW amount + currency + the
+ * renderer's local today) into the `priceHistory` patch via the pure
+ * `core/priceHistory.appendPriceEntry` — persisting append-only through the same
+ * `subs:update` channel (no new IPC surface). An unchanged amount or an unchecked
+ * box records nothing. The modal also renders a READ-ONLY per-subscription price
+ * history list (via `PriceHistoryList`) in edit mode.
+ *
  * State (AD-17): the old `isActive` boolean toggle is replaced by a **segmented
  * State control** — an accessible `radiogroup` of Active / Paused / Trial, each
  * a text-labelled option. Selecting Trial reveals the trial block so the v2
@@ -61,6 +71,7 @@ import type {
 import { minorUnits, toMajor } from "core/money";
 import { trialSchema } from "core/models/schema";
 import { conversionDate } from "core/trial";
+import { appendPriceEntry, priceChanged } from "core/priceHistory";
 import type { SubscriptionInputV2 } from "shared/types";
 import { cn } from "@/lib/utils";
 import {
@@ -69,6 +80,7 @@ import {
   subscriptionsApi,
   toAppError,
 } from "@/api/subby";
+import PriceHistoryList from "@/components/PriceHistoryList";
 import TagEditor from "@/components/TagEditor";
 import { categoriesStore } from "@/stores/categoriesStore";
 import { settingsStore } from "@/stores/settingsStore";
@@ -141,6 +153,12 @@ interface FormState {
   icon: string;
   state: SubscriptionState;
   autoRenew: boolean;
+  // Opt-in "record this as a price change" toggle (Story 5.3; AD-21). Only
+  // meaningful in EDIT mode when the parsed amount differs from the stored
+  // amount; the checkbox is shown ONLY then. Defaults CHECKED (recording the
+  // change is the common intent), but the user can uncheck to make a correction
+  // without polluting the append-only history.
+  recordPriceChange: boolean;
   // Free-form tags, edited via the TagEditor (de-duplicated by core helpers).
   tags: string[];
   // Trial fields (used only when state === 'Trial'). The length is specified by
@@ -198,6 +216,10 @@ function initialState(
       icon: subscription.icon,
       state: subscription.state,
       autoRenew: subscription.autoRenew,
+      // Default CHECKED: if the user changes the amount, recording the change is
+      // the common intent (Story 5.3 Design Notes). Inert until the amount
+      // actually differs (and the checkbox is only shown then).
+      recordPriceChange: true,
       tags: [...subscription.tags],
       // Detect the stored variant: a `lengthDays` trial seeds the start+days
       // mode; everything else (endDate variant, or no trial) defaults to the
@@ -233,6 +255,7 @@ function initialState(
     icon: "",
     state: "Active",
     autoRenew: true,
+    recordPriceChange: true,
     tags: [],
     trialLengthMode: "endDate",
     trialEndDate: todayIso(),
@@ -459,6 +482,22 @@ function computeTrialHint(form: FormState): string | null {
   return `${amount} after ${convertsOn}`;
 }
 
+/**
+ * Parse the amount field into integer minor units for the form's currency, or
+ * `null` when it is empty / unparseable (Story 5.3). Used to drive the reactive
+ * price-change offer without duplicating the money-seam parse — it mirrors
+ * `validate`'s amount parse but never throws (an invalid amount yields `null`,
+ * and the amount's own inline validation reports it on submit).
+ */
+function parsedAmountMinorOrNull(form: FormState): number | null {
+  if (form.amount.trim() === "") return null;
+  try {
+    return minorUnits(form.amount.trim(), form.currency);
+  } catch {
+    return null;
+  }
+}
+
 // --- Props -------------------------------------------------------------------
 
 export interface SubscriptionModalProps {
@@ -538,6 +577,38 @@ export default function SubscriptionModal({
       previouslyFocused.current?.focus?.();
     };
   }, [open]);
+
+  // Price-change offer visibility (Story 5.3; AD-21). The offer is shown ONLY in
+  // EDIT mode, and ONLY when the price actually changed — either the amount field
+  // parses to a different integer-minor-units value than the stored amount, OR
+  // the Native currency differs (a currency-only switch, e.g. USD→EUR at the same
+  // typed figure, is a real price change worth recording; the recorded entry
+  // stores its own currency). A reactive check driven by the amount/currency
+  // inputs. An empty/unparseable amount is "no amount change yet" (its own inline
+  // validation handles invalidity on submit). Amount equality routes through the
+  // pure `priceChanged` seam.
+  const parsedAmountMinor = isEdit ? parsedAmountMinorOrNull(form) : null;
+  const priceChangedForEdit =
+    isEdit &&
+    ((parsedAmountMinor !== null &&
+      priceChanged(subscription.amountMinor, parsedAmountMinor)) ||
+      form.currency !== subscription.currency);
+
+  // Reset the opt-in to CHECKED whenever the offer transitions hidden→shown, so a
+  // user who unchecked it for one edit (then reverted, hiding the offer) is not
+  // silently left opted-OUT when a later genuine change re-reveals the offer.
+  const priceChangeOfferShown = useRef(false);
+  useEffect(() => {
+    if (!open) {
+      priceChangeOfferShown.current = false;
+      return;
+    }
+    if (priceChangedForEdit && !priceChangeOfferShown.current) {
+      // Hidden→shown edge: re-arm the default-checked intent.
+      setForm((prev) => ({ ...prev, recordPriceChange: true }));
+    }
+    priceChangeOfferShown.current = priceChangedForEdit;
+  }, [open, priceChangedForEdit]);
 
   if (!open) return null;
 
@@ -627,6 +698,27 @@ export default function SubscriptionModal({
     setSaving(true);
     try {
       if (isEdit) {
+        // Price history (Story 5.3; AD-21). When the price actually changed
+        // (amount OR Native currency) AND the user opted in, append a FORWARD-log
+        // entry capturing the NEW amount+currency (the price that now takes
+        // effect) dated the renderer's local today, via the pure
+        // `appendPriceEntry` — so the latest entry matches the current amount. The
+        // append rides this same `subs:update` patch (no new channel) and persists
+        // append-only under the subscriptions lock. An unchanged price or an
+        // unchecked box records nothing (the field is omitted, so the existing
+        // `priceHistory` is preserved untouched by the merge).
+        const didChange =
+          priceChanged(subscription.amountMinor, amountMinor) ||
+          form.currency !== subscription.currency;
+        const priceHistory =
+          didChange && form.recordPriceChange
+            ? appendPriceEntry(subscription.priceHistory, {
+                amountMinor,
+                currency: form.currency,
+                date: todayIso(),
+              })
+            : undefined;
+
         // EDIT: a v2 patch carrying the pre-parsed minor units and the resolved
         // trial, preserving every untouched field (priceHistory/tags/etc.).
         await subscriptionsApi.update(subscription.id, {
@@ -649,6 +741,9 @@ export default function SubscriptionModal({
           icon: form.icon.trim(),
           state: form.state,
           trial,
+          // Only include `priceHistory` when a change was recorded; otherwise
+          // omit it so the merge leaves the stored history untouched.
+          ...(priceHistory !== undefined ? { priceHistory } : {}),
           tags: form.tags,
           autoRenew: form.autoRenew,
         });
@@ -1153,6 +1248,29 @@ export default function SubscriptionModal({
                     </p>
                   )}
                 </Field>
+              </div>
+            )}
+
+            {/* Record-price-change offer (Story 5.3; AD-21) — EDIT mode only,
+                shown ONLY when the price changed (amount OR currency). Defaults checked so
+                recording the change is the common path; unchecking makes a silent
+                correction without polluting the append-only history. */}
+            {priceChangedForEdit && (
+              <div className="sm:col-span-2">
+                <Toggle
+                  id="sub-record-price-change"
+                  label="Record this as a price change"
+                  checked={form.recordPriceChange}
+                  onChange={(checked) => set("recordPriceChange", checked)}
+                />
+              </div>
+            )}
+
+            {/* Read-only price history (Story 5.3; AD-21) — EDIT mode only.
+                Append-only, local; no edit/delete controls. */}
+            {isEdit && (
+              <div className="sm:col-span-2">
+                <PriceHistoryList history={subscription.priceHistory} />
               </div>
             )}
 

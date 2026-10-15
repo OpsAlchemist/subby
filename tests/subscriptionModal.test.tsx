@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe } from "jest-axe";
 import "@testing-library/jest-dom/vitest";
@@ -649,6 +649,364 @@ describe("inline add-category in the modal (Story 3.4)", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Category")).toHaveValue("Newsletters"),
     );
+  });
+});
+
+// --- Price history: opt-in record-on-edit + read-only view (Story 5.3) -------
+
+describe("price history (Story 5.3; AD-21)", () => {
+  /** A price entry fixture. */
+  function entry(
+    amountMinor: number,
+    currency = "USD",
+    date = "2026-01-01",
+  ): { amountMinor: number; currency: string; date: string } {
+    return { amountMinor, currency, date };
+  }
+
+  it("offers the record checkbox ONLY when the amount changed (edit mode)", async () => {
+    const user = userEvent.setup();
+    const subscription = makeSubscription({
+      id: "edit-price",
+      currency: "USD",
+      amountMinor: 1000, // $10.00
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    // Unchanged amount: the offer is NOT shown.
+    expect(
+      screen.queryByLabelText("Record this as a price change"),
+    ).toBeNull();
+
+    // Change the amount → the offer appears, defaulting CHECKED.
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.clear(amount);
+    await user.type(amount, "12.00");
+    const checkbox = await screen.findByLabelText(
+      "Record this as a price change",
+    );
+    expect(checkbox).toBeChecked();
+
+    // Revert to the original amount → the offer disappears again.
+    await user.clear(amount);
+    await user.type(amount, "10.00");
+    await waitFor(() =>
+      expect(
+        screen.queryByLabelText("Record this as a price change"),
+      ).toBeNull(),
+    );
+  });
+
+  it("never offers a record in CREATE mode (nothing to compare against)", async () => {
+    const user = userEvent.setup();
+    render(<SubscriptionModal open onClose={() => {}} />);
+
+    await user.type(screen.getByLabelText(/^Name/), "Fresh");
+    await user.type(screen.getByLabelText(/^Amount/), "9.99");
+
+    expect(
+      screen.queryByLabelText("Record this as a price change"),
+    ).toBeNull();
+  });
+
+  it("offers the record on a CURRENCY-only change and appends an entry when opted in", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    // $10.00 USD; both USD and EUR are exponent 2, so the typed amount "10.00"
+    // parses to the SAME 1000 minor units — only the currency changes.
+    const subscription = makeSubscription({
+      id: "edit-currency",
+      currency: "USD",
+      amountMinor: 1000,
+      priceHistory: [],
+    });
+    render(
+      <SubscriptionModal open onClose={onClose} subscription={subscription} />,
+    );
+
+    // No change yet → no offer.
+    expect(
+      screen.queryByLabelText("Record this as a price change"),
+    ).toBeNull();
+
+    // Switch the Native currency USD → EUR, leaving the amount at 10.00.
+    const currency = screen.getByLabelText(/Currency/);
+    await user.clear(currency);
+    await user.type(currency, "EUR");
+
+    // The offer appears (currency-only change) and defaults CHECKED.
+    const checkbox = await screen.findByLabelText(
+      "Record this as a price change",
+    );
+    expect(checkbox).toBeChecked();
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    const patch = fake.updateSpy.mock.calls[0][1] as {
+      amountMinor: number;
+      currency: string;
+      priceHistory?: { amountMinor: number; currency: string; date: string }[];
+    };
+    expect(patch.currency).toBe("EUR");
+    expect(patch.amountMinor).toBe(1000);
+    // An entry is appended capturing the new amount + NEW currency, dated today.
+    expect(patch.priceHistory).toBeDefined();
+    expect(patch.priceHistory).toHaveLength(1);
+    expect(patch.priceHistory![0].amountMinor).toBe(1000);
+    expect(patch.priceHistory![0].currency).toBe("EUR");
+    expect(patch.priceHistory![0].date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-arms the opt-in (checked) when the offer is unchecked, reverted, then re-shown", async () => {
+    const user = userEvent.setup();
+    const subscription = makeSubscription({
+      id: "edit-rearm",
+      currency: "USD",
+      amountMinor: 1000, // $10.00
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    const amount = screen.getByLabelText(/^Amount/);
+
+    // Change the amount → offer appears checked; the user UNCHECKS it.
+    await user.clear(amount);
+    await user.type(amount, "12.00");
+    const checkbox = await screen.findByLabelText(
+      "Record this as a price change",
+    );
+    expect(checkbox).toBeChecked();
+    await user.click(checkbox);
+    expect(checkbox).not.toBeChecked();
+
+    // Revert to the original amount → the offer hides (no change).
+    await user.clear(amount);
+    await user.type(amount, "10.00");
+    await waitFor(() =>
+      expect(
+        screen.queryByLabelText("Record this as a price change"),
+      ).toBeNull(),
+    );
+
+    // Make a genuine change again → the offer re-appears CHECKED (not sticky off).
+    await user.clear(amount);
+    await user.type(amount, "15.00");
+    const reshown = await screen.findByLabelText(
+      "Record this as a price change",
+    );
+    expect(reshown).toBeChecked();
+  });
+
+  it("opting in appends a forward-log entry (new amount, currency, today) to the patch", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const prior = entry(1000, "USD", "2025-06-01"); // an existing entry
+    const subscription = makeSubscription({
+      id: "edit-price",
+      currency: "USD",
+      amountMinor: 1000, // $10.00
+      priceHistory: [prior],
+    });
+    render(
+      <SubscriptionModal open onClose={onClose} subscription={subscription} />,
+    );
+
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.clear(amount);
+    await user.type(amount, "12.00"); // $12.00 → 1200 minor
+
+    // The default is checked; submit.
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    const patch = fake.updateSpy.mock.calls[0][1] as {
+      amountMinor: number;
+      priceHistory?: { amountMinor: number; currency: string; date: string }[];
+    };
+    expect(patch.amountMinor).toBe(1200);
+    // The prior entry is preserved and the NEW amount is appended at the end
+    // (forward log), dated the renderer's local today (YYYY-MM-DD).
+    expect(patch.priceHistory).toBeDefined();
+    const ph = patch.priceHistory!;
+    expect(ph).toHaveLength(2);
+    expect(ph[0]).toEqual(prior);
+    expect(ph[1].amountMinor).toBe(1200);
+    expect(ph[1].currency).toBe("USD");
+    expect(ph[1].date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("declining (unchecking) records nothing — priceHistory is omitted from the patch", async () => {
+    const user = userEvent.setup();
+    const prior = entry(1000, "USD", "2025-06-01");
+    const subscription = makeSubscription({
+      id: "edit-price",
+      currency: "USD",
+      amountMinor: 1000,
+      priceHistory: [prior],
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    const amount = screen.getByLabelText(/^Amount/);
+    await user.clear(amount);
+    await user.type(amount, "12.00");
+
+    // Uncheck the record offer, then save.
+    await user.click(
+      await screen.findByLabelText("Record this as a price change"),
+    );
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    const patch = fake.updateSpy.mock.calls[0][1] as {
+      amountMinor: number;
+      priceHistory?: unknown;
+    };
+    // The amount still updates, but no priceHistory field is sent (the stored
+    // append-only history is left untouched by the merge).
+    expect(patch.amountMinor).toBe(1200);
+    expect(patch).not.toHaveProperty("priceHistory");
+  });
+
+  it("an unchanged amount records nothing even if submitted", async () => {
+    const user = userEvent.setup();
+    const prior = entry(1000, "USD", "2025-06-01");
+    const subscription = makeSubscription({
+      id: "edit-price",
+      name: "Keep Price",
+      currency: "USD",
+      amountMinor: 1000,
+      priceHistory: [prior],
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    // Change only the name; leave the amount at $10.00.
+    const name = screen.getByLabelText(/^Name/);
+    await user.clear(name);
+    await user.type(name, "Keep Price Renamed");
+
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    const patch = fake.updateSpy.mock.calls[0][1] as { priceHistory?: unknown };
+    expect(patch).not.toHaveProperty("priceHistory");
+  });
+
+  it("renders the read-only price history list with each entry's date + formatted money, newest-first", () => {
+    const subscription = makeSubscription({
+      id: "view-history",
+      currency: "USD",
+      amountMinor: 1500,
+      priceHistory: [
+        entry(1000, "USD", "2025-01-01"),
+        entry(1200, "USD", "2025-06-01"),
+        entry(1500, "USD", "2026-01-01"),
+      ],
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    const region = screen.getByRole("region", { name: "Price history" });
+    expect(region).toBeInTheDocument();
+
+    // Dates for all three entries are shown.
+    expect(screen.getByText("2025-01-01")).toBeInTheDocument();
+    expect(screen.getByText("2025-06-01")).toBeInTheDocument();
+    expect(screen.getByText("2026-01-01")).toBeInTheDocument();
+
+    // The money is actually FORMATTED (Intl currency, USD → $X.XX), not a raw
+    // minor-unit integer. Each entry's figure appears in the region.
+    expect(within(region).getByText(/\$10\.00/)).toBeInTheDocument();
+    expect(within(region).getByText(/\$12\.00/)).toBeInTheDocument();
+    expect(within(region).getByText(/\$15\.00/)).toBeInTheDocument();
+
+    // There are no edit/delete controls in the price-history region (read-only).
+    expect(region.querySelectorAll("button")).toHaveLength(0);
+
+    // Newest-first display: the first list item is the most recent entry; the
+    // row pairs the date with its formatted money.
+    const items = region.querySelectorAll("li");
+    expect(items[0].textContent).toContain("2026-01-01");
+    expect(items[0].textContent).toContain("$15.00");
+    expect(items[items.length - 1].textContent).toContain("2025-01-01");
+    expect(items[items.length - 1].textContent).toContain("$10.00");
+  });
+
+  it("renders a price history entry in a currency unknown to the money seam without throwing", () => {
+    // "ZZZZ" is not in the money seam's exponent table (so `toMajor` throws →
+    // raw-minor fallback) AND is not a well-formed ISO-4217 code, so the Intl
+    // currency formatter also rejects it → the final `${currency} ${major}`
+    // fallback. The view must still render — never crash — exercising BOTH catch
+    // branches in `formatEntryMoney`.
+    const subscription = makeSubscription({
+      id: "unknown-currency-history",
+      currency: "USD",
+      amountMinor: 1500,
+      priceHistory: [entry(123456, "ZZZZ", "2025-03-01")],
+    });
+
+    expect(() =>
+      render(
+        <SubscriptionModal
+          open
+          onClose={() => {}}
+          subscription={subscription}
+        />,
+      ),
+    ).not.toThrow();
+
+    const region = screen.getByRole("region", { name: "Price history" });
+    expect(within(region).getByText("2025-03-01")).toBeInTheDocument();
+    // The double-fallback renders the raw integer prefixed by the currency code.
+    expect(within(region).getByText(/ZZZZ\s*123456/)).toBeInTheDocument();
+  });
+
+  it("a populated price history list is axe-clean (no serious/critical violations)", async () => {
+    const subscription = makeSubscription({
+      id: "axe-history",
+      currency: "USD",
+      amountMinor: 1500,
+      priceHistory: [
+        entry(1000, "USD", "2025-01-01"),
+        entry(1500, "USD", "2026-01-01"),
+      ],
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+    await screen.findByRole("region", { name: "Price history" });
+
+    // jsdom cannot compute color contrast, so that one rule stays disabled (the
+    // sanctioned exception — mirrors the modal/List scans); nothing else.
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
+  });
+
+  it("shows a sensible empty state when there is no price history", () => {
+    const subscription = makeSubscription({
+      id: "empty-history",
+      priceHistory: [],
+    });
+    render(
+      <SubscriptionModal open onClose={() => {}} subscription={subscription} />,
+    );
+
+    expect(screen.getByText("No price changes recorded.")).toBeInTheDocument();
   });
 });
 

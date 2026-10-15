@@ -18,6 +18,7 @@ import {
   InvalidAmountError,
 } from "core/money";
 import { roundHalfUpToExponent } from "core/migrations/v1_to_v2";
+import { appendPriceEntry } from "core/priceHistory";
 import { subscriptionV2Schema } from "core/models/schema";
 import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
 
@@ -525,6 +526,42 @@ describe("Feature: subby, Property 40: the live v2 mutators are pure and surgica
         // The surviving subs keep their original relative order (and identity).
         const expectedSurvivors = subs.filter((_s, i) => i !== targetIndex);
         expect(result).toEqual(expectedSurvivors);
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("Feature: subby, Property 40 (Story 5.3): editSubscriptionV2 with a priceHistory patch stays append-only (never drops prior entries)", () => {
+    // Each generated sub starts with an empty priceHistory (EXAMPLE_FIELDS).
+    // Appending a NEW entry via the pure helper and patching it through
+    // editSubscriptionV2 must preserve every prior entry in order and only grow
+    // the history — mirroring how the modal records a price change.
+    const newAmountArb = fc.integer({ min: 0, max: 1_000_000 });
+    fc.assert(
+      fc.property(listAndTargetArb, newAmountArb, ({ subs, targetIndex }, newAmount) => {
+        const target = subs[targetIndex];
+        const priorHistory = target.priceHistory;
+
+        const nextHistory = appendPriceEntry(priorHistory, {
+          amountMinor: newAmount,
+          currency: target.currency,
+          date: "2026-10-15",
+        });
+        const result = editSubscriptionV2(
+          subs,
+          target.id,
+          { amountMinor: newAmount, priceHistory: nextHistory },
+          LATER,
+        );
+        const edited = result[targetIndex];
+
+        // Append-only: the result is never shorter than the prior history, and
+        // every prior entry is preserved verbatim at the front, in order.
+        expect(edited.priceHistory.length).toBeGreaterThanOrEqual(priorHistory.length);
+        expect(edited.priceHistory.slice(0, priorHistory.length)).toEqual(priorHistory);
+        // The patched amount landed and the record validates.
+        expect(edited.amountMinor).toBe(newAmount);
+        expect(subscriptionV2Schema.safeParse(edited).success).toBe(true);
       }),
       { numRuns: NUM_RUNS },
     );
