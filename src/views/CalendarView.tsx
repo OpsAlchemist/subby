@@ -17,20 +17,25 @@
  *   - `indexByRenewalDate` maps `YYYY-MM-DD` → renewing subscriptions; cells
  *     with ≥1 renewal show a count badge (Req 10.1).
  *   - Selecting a day opens a side panel listing that date's renewals — name,
- *     amount, billing cycle — or an empty state (Req 10.2).
+ *     amount, billing cycle — plus a "Renewing {phrase}" urgency line (text,
+ *     not color), or an empty state (Req 10.2, Story 6.2).
  *   - Prev/next navigation shifts the visible month and recomputes the grid +
  *     indicators (Req 10.3).
  *
  * Accessibility: the calendar is an ARIA `grid` with weekday `columnheader`s;
- * each day is a `button` with an aria-label naming the date and renewal count,
- * `aria-pressed` for the selected day, `aria-current="date"` for today, and a
- * visible focus ring. This file MUST keep a default export for `React.lazy`.
+ * each day is a `button` with an aria-label naming the date, renewal count, and
+ * (for days with renewals) the renewal urgency in TEXT (e.g. "in 3 days") so
+ * assistive tech conveys how soon a renewal is without relying on color
+ * (Story 6.2). It also carries `aria-pressed` for the selected day,
+ * `aria-current="date"` for today, and a visible focus ring. This file MUST
+ * keep a default export for `React.lazy`.
  */
 
 import { useMemo, useState } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight } from "lucide-react";
 import type { SubscriptionV2 } from "core/models/subscription";
 import { toMajor } from "core/money";
+import { renewalUrgency } from "core/renewal";
 import { subscriptionsStore } from "@/stores/subscriptionsStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
@@ -82,11 +87,26 @@ function formatLongDate(iso: string): string {
   });
 }
 
-/** Build the screen-reader label for a day cell (date + renewal count). */
-function dayAriaLabel(iso: string, count: number): string {
+/**
+ * Build the screen-reader label for a day cell (date + renewal count). For a
+ * day that has renewals, append the urgency phrase in TEXT with the same
+ * past/future sense the side panel carries — "due {phrase}" for upcoming
+ * renewals ("…, 2 renewals, due in 3 days", "…, due today") and
+ * "renewed {phrase}" for past ones ("…, 2 renewals, renewed 3 days ago") — so
+ * the cell and panel wording align and a past renewal is never ambiguous
+ * (happened vs due). Urgency is text, never color alone (Story 6.2, Req 10).
+ * The cell's own date IS the renewal date, so one `renewalUrgency(iso, today)`
+ * describes every renewal on that day. A malformed date yields an empty phrase,
+ * so the label gracefully omits the urgency clause.
+ */
+function dayAriaLabel(iso: string, count: number, today: string): string {
   const date = formatLongDate(iso);
   if (count === 0) return `${date}, no renewals`;
-  return `${date}, ${count} renewal${count === 1 ? "" : "s"}`;
+  const { phrase, days } = renewalUrgency(iso, today);
+  const base = `${date}, ${count} renewal${count === 1 ? "" : "s"}`;
+  if (phrase === "") return base;
+  const verb = days < 0 ? "renewed" : "due";
+  return `${base}, ${verb} ${phrase}`;
 }
 
 /**
@@ -97,10 +117,22 @@ function dayAriaLabel(iso: string, count: number): string {
 function DayDetailPanel({
   selectedDate,
   subs,
+  today,
 }: {
   selectedDate: string | null;
   subs: SubscriptionV2[];
+  today: string;
 }): JSX.Element {
+  // All rows in the panel share the selected date, so one urgency phrase
+  // ("renews today" / "renews in 3 days" / "renewed 2 days ago") describes the
+  // whole day. Text carries the urgency — color is never the sole signal.
+  // `phrase === ""` means a malformed date; omit the line rather than render
+  // an empty "Renewing".
+  const urgency =
+    selectedDate !== null && subs.length > 0
+      ? renewalUrgency(selectedDate, today)
+      : null;
+  const showUrgency = urgency !== null && urgency.phrase !== "";
   return (
     <aside
       aria-label="Selected day renewals"
@@ -113,6 +145,11 @@ function DayDetailPanel({
       ) : (
         <>
           <h3 className="text-sm font-semibold">{formatLongDate(selectedDate)}</h3>
+          {showUrgency && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {urgency!.days < 0 ? "Renewed" : "Renewing"} {urgency!.phrase}
+            </p>
+          )}
           {subs.length === 0 ? (
             <p className="mt-3 text-sm text-muted-foreground">
               No renewals on this date.
@@ -257,7 +294,7 @@ export default function CalendarView(): JSX.Element {
                       <button
                         type="button"
                         onClick={() => setSelectedDate(cell.date)}
-                        aria-label={dayAriaLabel(cell.date, count)}
+                        aria-label={dayAriaLabel(cell.date, count, today)}
                         aria-pressed={isSelected}
                         aria-current={isToday ? "date" : undefined}
                         className={cn(
@@ -295,7 +332,7 @@ export default function CalendarView(): JSX.Element {
         </section>
 
         {/* Selected-day side panel (Req 10.2). */}
-        <DayDetailPanel selectedDate={selectedDate} subs={selectedSubs} />
+        <DayDetailPanel selectedDate={selectedDate} subs={selectedSubs} today={today} />
       </div>
     </div>
   );

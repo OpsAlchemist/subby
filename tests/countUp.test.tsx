@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
@@ -38,7 +38,12 @@ function stubMatchMedia(initialMatches: boolean): {
       for (const cb of listeners) cb({ matches } as MediaQueryListEvent);
     },
     restore() {
-      window.matchMedia = original;
+      if (typeof original === "function") {
+        window.matchMedia = original;
+      } else {
+        // jsdom's true default is ABSENT — delete so we don't leak a stub.
+        delete (window as { matchMedia?: unknown }).matchMedia;
+      }
     },
   };
 }
@@ -52,7 +57,19 @@ function stubMatchMedia(initialMatches: boolean): {
  * is decorative (`aria-hidden`) and its pulse is suppressed under reduced motion.
  */
 
-afterEach(cleanup);
+// Another test FILE can leak a `window.matchMedia` stub into the shared jsdom
+// global (vitest does not reset it between files). Clear it before each test so
+// this file always starts from jsdom's documented "matchMedia absent" baseline —
+// the premise every test here relies on (and the reason the reduced default is
+// deterministic). Each test that needs matchMedia installs its own stub.
+beforeEach(() => {
+  delete (window as { matchMedia?: unknown }).matchMedia;
+});
+
+afterEach(() => {
+  cleanup();
+  delete (window as { matchMedia?: unknown }).matchMedia;
+});
 
 // --- useReducedMotion ---------------------------------------------------------
 

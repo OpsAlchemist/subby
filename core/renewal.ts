@@ -47,6 +47,24 @@ export function addDays(date: ISODate, days: number): ISODate {
 }
 
 /**
+ * Whole number of days from `from` to `to` using UTC arithmetic (positive when
+ * `to` is later than `from`, negative when earlier, zero when equal).
+ *
+ * Exported so other pure core helpers can reuse the single, UTC-correct day
+ * difference (e.g. {@link renewalUrgency} turns `(renewalDate, today)` into a
+ * signed day count). Both endpoints are reduced to UTC midnight, so the result
+ * is an exact whole-day multiple with no timezone drift.
+ */
+export function daysBetween(from: ISODate, to: ISODate): number {
+  const a = parseISODate(from);
+  const b = parseISODate(to);
+  const MS_PER_DAY = 86_400_000;
+  const fromMs = Date.UTC(a.year, a.month - 1, a.day);
+  const toMs = Date.UTC(b.year, b.month - 1, b.day);
+  return (toMs - fromMs) / MS_PER_DAY;
+}
+
+/**
  * Adds a whole number of months to an ISO date using UTC arithmetic.
  * Month-end days are clamped to the last valid day of the target month
  * (e.g., Jan 31 + 1 month → Feb 28, or Feb 29 in a leap year).
@@ -138,4 +156,48 @@ export function rollForward<T extends RenewalFields>(s: T, today: ISODate): T {
     next = advanceRenewal(next, s.billingCycle, s.customInterval);
   }
   return next === s.nextRenewal ? s : { ...s, nextRenewal: next };
+}
+
+/** A plain-text relative urgency phrase plus its signed day offset. */
+export interface RenewalUrgency {
+  /**
+   * Human-readable relative phrase describing how soon the renewal is:
+   * `"today"`, `"tomorrow"`, `"in N days"` (future), `"yesterday"`, or
+   * `"N days ago"` (past). Text carries the urgency — never color alone. An
+   * empty string (`""`) when either date is malformed, so callers render
+   * nothing rather than a nonsense "NaN days ago".
+   */
+  phrase: string;
+  /**
+   * Signed whole-day difference `today → renewalDate`: `0` today, positive for
+   * a future renewal (N days away), negative for a past one (N days ago), or
+   * `NaN` when either date is malformed (paired with an empty `phrase`).
+   */
+  days: number;
+}
+
+/**
+ * Compute the text urgency of a renewal relative to `today` (Req 10, Story 6.2).
+ *
+ * Pure (AD-1): `today` is injected as a `YYYY-MM-DD` string, so there is no
+ * wall-clock read and the result is deterministic and property-testable. The
+ * signed day difference reuses the single UTC-correct {@link daysBetween} day
+ * arithmetic (no timezone drift).
+ *
+ * The phrase is text-first by DESIGN rule — assistive tech and sighted users
+ * both hear/see how soon a renewal is from the words alone; any color tint is a
+ * decorative backup, never the sole carrier of urgency.
+ */
+export function renewalUrgency(renewalDate: ISODate, today: ISODate): RenewalUrgency {
+  const days = daysBetween(today, renewalDate);
+  // A malformed/empty date yields NaN from the arithmetic; surface an empty
+  // phrase (never the literal "NaN days ago") so callers render nothing.
+  if (!Number.isFinite(days)) return { phrase: "", days: NaN };
+  let phrase: string;
+  if (days === 0) phrase = "today";
+  else if (days === 1) phrase = "tomorrow";
+  else if (days > 1) phrase = `in ${days} days`;
+  else if (days === -1) phrase = "yesterday";
+  else phrase = `${-days} days ago`;
+  return { phrase, days };
 }
