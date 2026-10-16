@@ -1,48 +1,59 @@
 /**
- * Dashboard view (task 20.1, Req 8.1–8.6).
+ * Dashboard view (Req 8.1–8.6; Story 6.1).
  *
  * An at-a-glance overview of subscription spending. It reads the live
  * subscription list and settings from the client stores via
- * `useStoreData`/`useStore` (`useSyncExternalStore` adapters), so it
- * re-renders whenever subscription data changes after any mutation (Req 8.6) —
- * the stores are reloaded on the `onDataChanged` broadcast by `initStores`.
+ * `useStore`/`useStoreData` (`useSyncExternalStore` adapters), so it re-renders
+ * whenever subscription data changes after any mutation (Req 8.6) — the stores
+ * are reloaded on the `onDataChanged` broadcast by `initStores`.
  *
- * All derived figures come from the platform-independent `core/analytics`
- * module (recomputed via `useMemo` keyed on the current data):
- *   - Total monthly spend of active subscriptions (Req 8.1)
- *   - Total yearly spend of active subscriptions (Req 8.2)
- *   - Count of active subscriptions (Req 8.3)
- *   - Subscriptions renewing within the next seven days (Req 8.4)
- *   - The most recently changed subscriptions, `updatedAt` descending (Req 8.5)
+ * Story 6.1 kills the Story-3.3 naive minor-unit sum. The "This month" / "Per
+ * year" figures are now the ONE honest Home-Currency convert-before-sum totals
+ * from `core/totalsV2.homeMonthlyTotal`/`homeYearlyTotal` (which wrap the single
+ * `core/money.homeTotal`), fed the bundled FX `RateSnapshot` fetched over the
+ * read-only `fx:snapshot` IPC. The stale-rate guard (`core/money.rateConfidence`)
+ * decides whether a confident single total is honest: on stale rates the cards
+ * show a focusable "rates are ~N months old" affordance instead. Figures count
+ * up on load (snapping under `prefers-reduced-motion`) and a cold load shows
+ * `Skeleton` placeholders, not a spinner.
  *
- * For this build all amounts are a single currency (INR); totals are summed
- * directly with no conversion and formatted with `Intl.NumberFormat` using the
- * configured default currency.
+ *   - "This month" / "Per year": Active-spend subset only (Trials AND Paused
+ *     excluded — AD-17) in Home Currency (Req 8.1, 8.2).
+ *   - "Active" count: Active + Trial (both are live) via `activeCount` (Req 8.3).
+ *   - Trials-convert sub-line: the FX-correct Home monthly figure the Trial
+ *     subset would add once converted (Story 5.1 figure, now convert-before-sum).
+ *   - Renewing within 7 days (Req 8.4) and recently-changed (Req 8.5) sublists.
  */
 
-import { useMemo, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   CalendarClock,
   History,
-  IndianRupee,
+  Wallet,
   CalendarRange,
   ListChecks,
+  AlertTriangle,
   type LucideIcon,
 } from "lucide-react";
 import type { SubscriptionV2 } from "core/models/subscription";
-import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
 import {
-  activeCount,
-  recentlyChanged,
-  renewingWithin,
-  totalMonthly,
-  totalYearly,
-} from "core/analytics";
-import { trialsConvertFigure } from "core/trial";
-import { exponentOf } from "core/money";
+  activeSpendSubscriptionsV2,
+  trialSubscriptionsV2,
+} from "core/subscriptionsV2";
+import { activeCount, recentlyChanged, renewingWithin } from "core/analytics";
+import { homeMonthlyTotal, homeYearlyTotal } from "core/totalsV2";
+import {
+  exponentOf,
+  monthsStale,
+  rateConfidence,
+  type RateSnapshot,
+} from "core/money";
 import { subscriptionsStore, settingsStore } from "@/stores";
-import { useStoreData } from "@/stores/hooks";
+import { useStore, useStoreData } from "@/stores/hooks";
+import { getFxSnapshotSafe } from "@/api/subby";
 import CategoryColorDot from "@/components/CategoryColorDot";
+import CountUp from "@/components/CountUp";
+import Skeleton from "@/components/Skeleton";
 
 /** Number of upcoming days considered "renewing soon" on the dashboard (Req 8.4). */
 const RENEWAL_WINDOW_DAYS = 7;
@@ -50,16 +61,15 @@ const RENEWAL_WINDOW_DAYS = 7;
 /** How many "recently changed" subscriptions to surface (Req 8.5). */
 const RECENT_CHANGED_COUNT = 5;
 
-/** Today as an ISO date (`YYYY-MM-DD`); passed to the pure analytics helpers. */
+/** Today as an ISO date (`YYYY-MM-DD`); passed to the pure date helpers. */
 function todayISO(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
 /**
- * Convert a summed **minor-unit** total into a major-unit number for the
- * currency formatter. Story 3.3 keeps totals a direct same-currency minor-unit
- * sum (no FX; the convert-before-sum Home total is Epic 6), so a scale by the
- * Home Currency's exponent is the honest display of that sum. An unknown
+ * Convert integer Home **minor units** to a major-unit number for the currency
+ * formatter. The totals come from `homeTotal` (already Home minor units), so a
+ * scale by the Home Currency's exponent is the honest display. An unknown
  * currency falls back to a 2-decimal scale rather than throwing in the UI.
  */
 function minorToMajorNumber(minor: number, currency: string): number {
@@ -72,7 +82,7 @@ function minorToMajorNumber(minor: number, currency: string): number {
   return minor / 10 ** exponent;
 }
 
-/** Build a currency formatter for the configured default currency (INR here). */
+/** Build a currency formatter for the Home Currency. */
 function makeCurrencyFormatter(currency: string): Intl.NumberFormat {
   try {
     return new Intl.NumberFormat(undefined, {
@@ -98,6 +108,51 @@ function formatDate(iso: string): string {
 }
 
 /**
+ * The state of the FX-snapshot fetch for the current Home Currency. `loading`
+ * gates the skeletons; `errored` (snapshot resolved to `null`) drives the "rates
+ * unavailable" money state so the view never shows a wrong confident number.
+ */
+interface FxState {
+  snapshot: RateSnapshot | null;
+  loading: boolean;
+  errored: boolean;
+}
+
+/**
+ * Fetch the bundled FX {@link RateSnapshot} for `homeCurrency`, re-fetching when
+ * it changes. FX rates are a STATIC bundle in 1.0, so this loads once per
+ * Home-Currency value — NOT on every `onDataChanged` (Epic 8's opt-in live
+ * refresh swaps a fresher snapshot in later via the data-changed path). The
+ * fetch never throws (`getFxSnapshotSafe` swallows a missing/corrupt bundle as
+ * `null`); a `null` becomes `errored` so the cards degrade to "rates unavailable".
+ */
+function useFxSnapshot(homeCurrency: string): FxState {
+  const [state, setState] = useState<FxState>({
+    snapshot: null,
+    loading: true,
+    errored: false,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setState({ snapshot: null, loading: true, errored: false });
+    void getFxSnapshotSafe(homeCurrency).then((snapshot) => {
+      if (cancelled) return;
+      setState({
+        snapshot,
+        loading: false,
+        errored: snapshot === null,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [homeCurrency]);
+
+  return state;
+}
+
+/**
  * A single metric card: a label, a prominent value, and an icon. An optional
  * `secondary` node renders beneath the value as a muted supporting line (used by
  * the month card for the trials-convert figure).
@@ -107,14 +162,21 @@ function MetricCard({
   value,
   icon: Icon,
   secondary,
+  primary = false,
 }: {
   label: string;
-  value: string;
+  value: ReactNode;
   icon: LucideIcon;
   secondary?: ReactNode;
+  /** The primary (This month) card gets the accent left-keyline. */
+  primary?: boolean;
 }): JSX.Element {
   return (
-    <div className="rounded-lg border border-border bg-card p-4">
+    <div
+      className={`rounded-lg border border-border bg-card p-4${
+        primary ? " border-l-2 border-l-accent" : ""
+      }`}
+    >
       <div className="flex items-center justify-between gap-2">
         <span className="text-sm font-medium text-muted-foreground">
           {label}
@@ -125,6 +187,58 @@ function MetricCard({
       {secondary}
     </div>
   );
+}
+
+/** The skeleton placeholder shown in a metric card during a cold load. */
+function MetricCardSkeleton(): JSX.Element {
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <div className="flex items-center justify-between gap-2">
+        <Skeleton className="h-4 w-28" />
+        <Skeleton className="h-4 w-4" />
+      </div>
+      <Skeleton className="mt-3 h-8 w-32" />
+    </div>
+  );
+}
+
+/**
+ * The rendered VALUE for a converted money card (Monthly / Yearly), honoring the
+ * stale-rate guard (Story 2.4 / AD-12):
+ *   - errored  → "Rates unavailable" (never a wrong number);
+ *   - stale    → a MUTED, "~"-prefixed APPROXIMATE figure — the number stays
+ *                visible but is clearly NOT presented as a confident single
+ *                total (the authoritative meaning lives in the stale affordance
+ *                above the cards). No count-up on the unconfident figure.
+ *   - confident→ the bold `<CountUp>` figure.
+ */
+function MoneyCardValue({
+  errored,
+  stale,
+  value,
+  formatMoney,
+}: {
+  errored: boolean;
+  stale: boolean;
+  value: number;
+  formatMoney: (n: number) => string;
+}): JSX.Element {
+  if (errored) {
+    return (
+      <span className="text-base font-medium text-muted-foreground">
+        Rates unavailable
+      </span>
+    );
+  }
+  if (stale) {
+    // Muted + "~" to signal approximate — not an authoritative single total.
+    return (
+      <span className="font-normal text-muted-foreground tabular-nums">
+        ~{formatMoney(value)}
+      </span>
+    );
+  }
+  return <CountUp value={value} format={formatMoney} />;
 }
 
 /**
@@ -179,23 +293,141 @@ function SubscriptionPanel({
   );
 }
 
+/** The skeleton placeholder shown in a sublist panel during a cold load. */
+function SubscriptionPanelSkeleton(): JSX.Element {
+  return (
+    <section className="rounded-lg border border-border bg-card p-4">
+      <Skeleton className="h-4 w-36" />
+      <div className="mt-3 flex flex-col gap-3">
+        {[0, 1, 2].map((i) => (
+          <div key={i} className="flex items-center justify-between gap-3">
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-4 w-20" />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * The computed money figures for the three cards, plus the derived state the
+ * view branches on. Exactly one of `errored` / stale-affordance / confident
+ * display paths is taken for the money figures.
+ */
+interface MoneyFigures {
+  /** True when the snapshot is unavailable OR a total computation threw. */
+  errored: boolean;
+  /** The convert-before-sum monthly figure in Home major units (0 when errored). */
+  monthlyMajor: number;
+  /** The convert-before-sum yearly figure in Home major units (0 when errored). */
+  yearlyMajor: number;
+  /** The trials-convert monthly figure in Home major units (0 when errored). */
+  trialsMonthlyMajor: number;
+  /** `confident` | `stale` from `rateConfidence`; `confident` when errored. */
+  confidence: "confident" | "stale";
+  /** The snapshot's `asOf` date (empty when errored). */
+  asOf: string;
+  /** Whole months the snapshot is behind today (for the stale affordance copy). */
+  months: number;
+}
+
+/**
+ * Build synthetic subscriptions whose `amountMinor` is each Trial's POST-trial
+ * amount, so the trials-convert figure is the FX-correct convert-before-sum Home
+ * total (`homeMonthlyTotal`) over what those trials WILL cost once converted —
+ * aligning the Story-5.1 line with the one honest total (no native-minor sum).
+ */
+function trialPostTrialShadow(subs: readonly SubscriptionV2[]): SubscriptionV2[] {
+  return trialSubscriptionsV2([...subs]).map((s) => ({
+    ...s,
+    amountMinor: s.trial?.postAmountMinor ?? 0,
+  }));
+}
+
+/**
+ * Compute the three money figures over the fetched snapshot. Returns `errored`
+ * when the snapshot is unavailable OR any total computation throws (an unknown
+ * currency / missing rate) — the view then shows "rates unavailable", NEVER a
+ * wrong confident number. The totals route exclusively through the shared
+ * `homeMonthlyTotal`/`homeYearlyTotal` (which wrap `homeTotal`): the view never
+ * re-implements convert-and-sum.
+ */
+function computeFigures(
+  active: readonly SubscriptionV2[],
+  trialShadow: readonly SubscriptionV2[],
+  snapshot: RateSnapshot | null,
+  homeCurrency: string,
+  fxRefreshOn: boolean,
+  today: string,
+): MoneyFigures {
+  if (snapshot === null) {
+    return {
+      errored: true,
+      monthlyMajor: 0,
+      yearlyMajor: 0,
+      trialsMonthlyMajor: 0,
+      confidence: "confident",
+      asOf: "",
+      months: 0,
+    };
+  }
+  try {
+    const monthly = homeMonthlyTotal(active, snapshot, homeCurrency);
+    const yearly = homeYearlyTotal(active, snapshot, homeCurrency);
+    const trials = homeMonthlyTotal(trialShadow, snapshot, homeCurrency);
+    const confidence = rateConfidence(snapshot.asOf, today, fxRefreshOn);
+    return {
+      errored: false,
+      monthlyMajor: minorToMajorNumber(monthly.totalMinor, homeCurrency),
+      yearlyMajor: minorToMajorNumber(yearly.totalMinor, homeCurrency),
+      trialsMonthlyMajor: minorToMajorNumber(trials.totalMinor, homeCurrency),
+      confidence,
+      asOf: snapshot.asOf,
+      months: confidence === "stale" ? monthsStale(snapshot.asOf, today) : 0,
+    };
+  } catch {
+    // A currency without an exponent/rate, or an out-of-range total: degrade to
+    // "rates unavailable" rather than crash the view or show a wrong figure.
+    return {
+      errored: true,
+      monthlyMajor: 0,
+      yearlyMajor: 0,
+      trialsMonthlyMajor: 0,
+      confidence: "confident",
+      asOf: "",
+      months: 0,
+    };
+  }
+}
+
 /**
  * Dashboard overview (Req 8). Default export so the application shell can
  * eager-import it (`@/views/Dashboard`).
  */
 export default function Dashboard(): JSX.Element {
-  const subs = useStoreData(subscriptionsStore);
+  const subsState = useStore(subscriptionsStore);
+  const subs = subsState.data;
   const settings = useStoreData(settingsStore);
 
   const today = todayISO();
+  const homeCurrency = settings.homeCurrency;
 
-  // Recompute derived metrics only when the inputs change (Req 8.6). The month/
-  // year totals sum the plain-Active subset only (Trials excluded, Paused
-  // excluded — AD-17); the "Active count" is Active + Trial via `activeCount`.
+  const fx = useFxSnapshot(homeCurrency);
+
+  // The subscription data is cold until the store has loaded once; the FX
+  // snapshot is cold until its fetch resolves. Either keeps the skeletons up.
+  const coldLoad = !subsState.loaded || fx.loading;
+
+  // Derived subscription subsets (recompute only when inputs change). "This
+  // month"/"Per year" sum the Active-spend subset (Trials AND Paused excluded —
+  // AD-17); the "Active count" is Active + Trial via `activeCount`.
   const active = useMemo(() => activeSpendSubscriptionsV2(subs), [subs]);
-  const monthlyMinor = useMemo(() => totalMonthly(active), [active]);
-  const yearlyMinor = useMemo(() => totalYearly(active), [active]);
+  const trialShadow = useMemo(() => trialPostTrialShadow(subs), [subs]);
   const count = useMemo(() => activeCount(subs), [subs]);
+  // The shadow is a 1:1 map over the Trial subset, so its length IS the trial
+  // count — no second filter needed.
+  const trialCount = trialShadow.length;
   const renewingSoon = useMemo(
     () => renewingWithin(subs, RENEWAL_WINDOW_DAYS, today),
     [subs, today],
@@ -204,24 +436,27 @@ export default function Dashboard(): JSX.Element {
     () => recentlyChanged(subs, RECENT_CHANGED_COUNT),
     [subs],
   );
-  // The trial-aware "+ $X/mo when N trials convert" figure (Story 5.1): a
-  // native-minor sum over the Trial subset (Trials are excluded from "This
-  // month"). `count === 0` renders NOTHING (the line clears when no trials).
-  const trialsFigure = useMemo(() => trialsConvertFigure(subs), [subs]);
+
+  const figures = useMemo(
+    () =>
+      computeFigures(
+        active,
+        trialShadow,
+        fx.snapshot,
+        homeCurrency,
+        settings.online.fxRefresh,
+        today,
+      ),
+    [active, trialShadow, fx.snapshot, homeCurrency, settings.online.fxRefresh, today],
+  );
 
   const currency = useMemo(
-    () => makeCurrencyFormatter(settings.homeCurrency),
-    [settings.homeCurrency],
+    () => makeCurrencyFormatter(homeCurrency),
+    [homeCurrency],
   );
-  // Totals are minor-unit sums (Story 3.3, no FX); render in Home-Currency major.
-  const monthly = minorToMajorNumber(monthlyMinor, settings.homeCurrency);
-  const yearly = minorToMajorNumber(yearlyMinor, settings.homeCurrency);
-  // The trials-convert line's figure in Home-Currency major (same no-FX scaling
-  // as the month total — Story 5.1 Design: deliberately a native-minor sum).
-  const trialsMonthly = minorToMajorNumber(
-    trialsFigure.monthlyMinor,
-    settings.homeCurrency,
-  );
+  const formatMoney = (n: number): string => currency.format(n);
+
+  const isEmpty = subsState.loaded && subs.length === 0;
 
   return (
     <div className="space-y-6">
@@ -232,63 +467,186 @@ export default function Dashboard(): JSX.Element {
         </p>
       </header>
 
+      {/* The single live-region "loading" announcement for the cold load. The
+          Skeleton blocks themselves are aria-hidden decoration. */}
+      {coldLoad && (
+        <p className="sr-only" role="status" aria-live="polite">
+          Loading your dashboard…
+        </p>
+      )}
+
       {/* Metric cards (Req 8.1, 8.2, 8.3). */}
       <section aria-label="Spending summary">
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <MetricCard
-            label="Total Monthly Spend"
-            value={currency.format(monthly)}
-            icon={IndianRupee}
-            secondary={
-              // Muted trials-convert line with a small accent dot; rendered only
-              // when at least one Trial exists (clears at zero) (Story 5.1).
-              trialsFigure.count > 0 ? (
-                <p className="mt-2 flex items-center gap-1.5 text-sm text-muted-foreground">
-                  <span
+        {coldLoad ? (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <MetricCardSkeleton />
+            <MetricCardSkeleton />
+            <MetricCardSkeleton />
+          </div>
+        ) : (
+          <>
+            {/* Stale-rate guard (Story 2.4 / AD-12): when the snapshot is stale,
+                do NOT present a confident single total — surface a focusable,
+                text-labelled "N months old" NOTE above the cards (the cards
+                themselves show a muted "~approximate" figure). It is a
+                non-interactive note (there is no FX-refresh action until Epic 8),
+                so it is a focusable `role="note"`, NOT a button that does
+                nothing. Not shown when rates are unavailable (its own state). */}
+            {!figures.errored && figures.confidence === "stale" && (
+              <div className="mb-4">
+                <div
+                  role="note"
+                  tabIndex={0}
+                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card p-3 text-left text-sm"
+                >
+                  <AlertTriangle
+                    className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
                     aria-hidden="true"
-                    className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
                   />
                   <span>
-                    + {currency.format(trialsMonthly)}/mo when{" "}
-                    {trialsFigure.count}{" "}
-                    {trialsFigure.count === 1
-                      ? "trial converts"
-                      : "trials convert"}
+                    These exchange rates are about{" "}
+                    {figures.months === 1
+                      ? "1 month"
+                      : `${figures.months} months`}{" "}
+                    old (as of {formatDate(figures.asOf)}). Converted totals may
+                    be out of date.
                   </span>
-                </p>
-              ) : undefined
-            }
-          />
-          <MetricCard
-            label="Total Yearly Spend"
-            value={currency.format(yearly)}
-            icon={CalendarRange}
-          />
-          <MetricCard
-            label="Active Subscriptions"
-            value={String(count)}
-            icon={ListChecks}
-          />
-        </div>
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <MetricCard
+                label="Total Monthly Spend"
+                primary
+                icon={Wallet}
+                value={
+                  <MoneyCardValue
+                    errored={figures.errored}
+                    stale={figures.confidence === "stale"}
+                    value={figures.monthlyMajor}
+                    formatMoney={formatMoney}
+                  />
+                }
+                secondary={
+                  <MonthCardSecondary
+                    errored={figures.errored}
+                    asOf={figures.asOf}
+                    trialCount={trialCount}
+                    trialsMonthlyMajor={figures.trialsMonthlyMajor}
+                    formatMoney={formatMoney}
+                  />
+                }
+              />
+              <MetricCard
+                label="Total Yearly Spend"
+                icon={CalendarRange}
+                value={
+                  <MoneyCardValue
+                    errored={figures.errored}
+                    stale={figures.confidence === "stale"}
+                    value={figures.yearlyMajor}
+                    formatMoney={formatMoney}
+                  />
+                }
+                secondary={
+                  !figures.errored ? (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      Rates as of {formatDate(figures.asOf)}
+                    </p>
+                  ) : undefined
+                }
+              />
+              <MetricCard
+                label="Active Subscriptions"
+                icon={ListChecks}
+                value={
+                  <CountUp
+                    value={count}
+                    format={(n) => String(Math.round(n))}
+                  />
+                }
+              />
+            </div>
+          </>
+        )}
       </section>
+
+      {/* Empty state (no subscriptions tracked). Cards above already read 0. */}
+      {isEmpty && (
+        <p className="text-sm text-muted-foreground">
+          Nothing tracked yet. Add your first subscription.
+        </p>
+      )}
 
       {/* Renewing soon + recently changed (Req 8.4, 8.5). */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <SubscriptionPanel
-          title="Renewing in 7 days"
-          icon={CalendarClock}
-          emptyLabel="Nothing renewing in the next seven days."
-          items={renewingSoon}
-          renderMeta={(s) => formatDate(s.nextRenewal)}
-        />
-        <SubscriptionPanel
-          title="Recently changed"
-          icon={History}
-          emptyLabel="No subscriptions yet."
-          items={recent}
-          renderMeta={(s) => formatDate(s.updatedAt)}
-        />
+        {coldLoad ? (
+          <>
+            <SubscriptionPanelSkeleton />
+            <SubscriptionPanelSkeleton />
+          </>
+        ) : (
+          <>
+            <SubscriptionPanel
+              title="Renewing in 7 days"
+              icon={CalendarClock}
+              emptyLabel="Nothing renewing in the next seven days."
+              items={renewingSoon}
+              renderMeta={(s) => formatDate(s.nextRenewal)}
+            />
+            <SubscriptionPanel
+              title="Recently changed"
+              icon={History}
+              emptyLabel="No subscriptions yet."
+              items={recent}
+              renderMeta={(s) => formatDate(s.updatedAt)}
+            />
+          </>
+        )}
       </div>
     </div>
+  );
+}
+
+/**
+ * The month card's muted secondary line. When rates are available it carries
+ * the "+ {money}/mo when N trials convert" trials-convert figure (Story 5.1,
+ * rendered only for ≥1 Trial — it clears at zero) and the "rates as of {asOf}"
+ * date; when rates are unavailable it shows nothing (the card body already says
+ * "Rates unavailable").
+ */
+function MonthCardSecondary({
+  errored,
+  asOf,
+  trialCount,
+  trialsMonthlyMajor,
+  formatMoney,
+}: {
+  errored: boolean;
+  asOf: string;
+  trialCount: number;
+  trialsMonthlyMajor: number;
+  formatMoney: (n: number) => string;
+}): JSX.Element | null {
+  if (errored) return null;
+  return (
+    <>
+      {trialCount > 0 && (
+        <p className="mt-2 flex items-center gap-1.5 text-sm text-muted-foreground">
+          <span
+            aria-hidden="true"
+            className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+          />
+          <span>
+            + {formatMoney(trialsMonthlyMajor)}/mo when {trialCount}{" "}
+            {trialCount === 1 ? "trial converts" : "trials convert"}
+          </span>
+        </p>
+      )}
+      <p className="mt-2 text-xs text-muted-foreground">
+        Rates as of {formatDate(asOf)}
+      </p>
+    </>
   );
 }

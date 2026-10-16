@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { parsePriceSeed, type PriceSeed } from "core/priceSeed";
+import { parseBundledSnapshot, type BundledFxSnapshot } from "core/fxSnapshot";
 import { DEFAULT_SETTINGS, DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -302,6 +303,54 @@ describe("AppServices suggested-price lookup (FR-13, Story 5.4)", () => {
   });
 });
 
+describe("AppServices FX snapshot (Story 6.1)", () => {
+  /** A tiny valid EUR-based bundled snapshot (USD, EUR, INR). */
+  function makeSnapshot(): BundledFxSnapshot {
+    return parseBundledSnapshot({
+      schemaVersion: 1,
+      asOf: "2026-10-01",
+      base: "EUR",
+      attribution: "Test ECB reference rates, bundled offline, read-only.",
+      rates: { EUR: "1", USD: "1.0950", INR: "91.350" },
+    });
+  }
+
+  it("a Home currency returns the rebased snapshot (Home → 1), carrying asOf", () => {
+    const svc = buildAppServices(storage, null, makeSnapshot());
+    const snap = svc.getFxSnapshot("USD");
+    expect(snap).not.toBeNull();
+    // Home anchor: USD → exactly "1".
+    expect(snap!.rates.USD).toBe("1");
+    expect(snap!.asOf).toBe("2026-10-01");
+    // EUR in USD major units = eurRate[USD] / eurRate[EUR] = 1.0950 / 1 = 1.0950…
+    expect(Number(snap!.rates.EUR)).toBeCloseTo(1.095, 4);
+    // INR in USD = 1.0950 / 91.350 ≈ 0.011987…
+    expect(Number(snap!.rates.INR)).toBeCloseTo(1.095 / 91.35, 6);
+  });
+
+  it("an unknown/absent Home Currency returns null without throwing (degrade)", () => {
+    const svc = buildAppServices(storage, null, makeSnapshot());
+    // GBP is a known currency but absent from this snapshot's rates.
+    expect(svc.getFxSnapshot("GBP")).toBeNull();
+    // A currency not in the exponent table at all.
+    expect(() => svc.getFxSnapshot("ZZZ")).not.toThrow();
+    expect(svc.getFxSnapshot("ZZZ")).toBeNull();
+  });
+
+  it("a missing/corrupt bundle (null) returns null for ANY Home without throwing", () => {
+    // Simulate the main-process degrade-off: the loader yielded null.
+    const svc = buildAppServices(storage, null, null);
+    expect(svc.getFxSnapshot("USD")).toBeNull();
+    expect(svc.getFxSnapshot("INR")).toBeNull();
+    expect(() => svc.getFxSnapshot("anything")).not.toThrow();
+  });
+
+  it("`fx:snapshot` is a registered read-only channel constant", async () => {
+    const { CH } = await import("../electron/ipc/channels");
+    expect(CH.fx.snapshot).toBe("fx:snapshot");
+  });
+});
+
 describe("AppServices export / import round-trips (Req 2.3)", () => {
   it("exportData('json') returns an importer-compatible string", async () => {
     await services.createSubscription(makeInput({ name: "Disney+" }));
@@ -487,6 +536,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "updateSettings",
     "chooseDataFolder",
     "getPriceSuggestion",
+    "getFxSnapshot",
     "importData",
     "exportData",
     "listBackups",

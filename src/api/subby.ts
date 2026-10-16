@@ -161,6 +161,34 @@ export async function suggestPriceSafe(
   }
 }
 
+/**
+ * FX-snapshot operations (Story 6.1). READ-ONLY: `snapshot` returns the bundled
+ * {@link RateSnapshot} rebased to the queried Home Currency, or THROWS a
+ * {@link SubbyError} when the bundle is missing/corrupt / the Home Currency is
+ * unknown (the IPC `not_found` outcome). The Dashboard uses the never-throws
+ * {@link getFxSnapshotSafe} so an unavailable snapshot degrades to a clear
+ * "rates unavailable" state rather than a wrong confident number.
+ */
+export const fxApi = {
+  snapshot: (home: string) => unwrap(getSubby().getFxSnapshot(home)),
+} as const;
+
+/**
+ * Snapshot fetch that NEVER throws: resolves to the rebased {@link RateSnapshot}
+ * or `null`, swallowing any bridge/IPC failure (a missing/corrupt bundle, an
+ * unknown Home Currency, or an absent preload) as `null`. The Dashboard treats
+ * `null` as "rates unavailable" — it must NEVER crash or show a wrong total.
+ */
+export async function getFxSnapshotSafe(
+  home: string,
+): Promise<Awaited<ReturnType<typeof fxApi.snapshot>> | null> {
+  try {
+    return await fxApi.snapshot(home);
+  } catch {
+    return null;
+  }
+}
+
 /** Import / export / backup operations (Req 16, 17, 18). */
 export const dataApi = {
   importData: (req: Parameters<SubbyApi["importData"]>[0]) =>

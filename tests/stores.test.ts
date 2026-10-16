@@ -146,6 +146,10 @@ function createFakeApi(): FakeApi {
     // --- Suggested price (Story 5.4): default fake returns no suggestion ---
     getPriceSuggestion: (() => ok(null)) as SubbyApi["getPriceSuggestion"],
 
+    // --- FX snapshot (Story 6.1): not exercised here — a rebased INR snapshot ---
+    getFxSnapshot: ((_home: string) =>
+      ok({ asOf: new Date().toISOString().slice(0, 10), rates: { INR: "1" } })) as SubbyApi["getFxSnapshot"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),

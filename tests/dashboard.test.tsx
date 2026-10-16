@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import "@testing-library/jest-dom/vitest";
 
 import Dashboard from "@/views/Dashboard";
 import { setSubby } from "@/api/subby";
@@ -12,14 +13,11 @@ import {
   errorStore,
 } from "@/stores";
 
-import {
-  activeCount,
-  totalMonthly,
-  totalYearly,
-} from "core/analytics";
+import { activeCount } from "core/analytics";
+import { homeMonthlyTotal, homeYearlyTotal } from "core/totalsV2";
 import { trialsConvertFigure } from "core/trial";
-import { activeSpendSubscriptionsV2 } from "core/subscriptionsV2";
-import { exponentOf } from "core/money";
+import { activeSpendSubscriptionsV2, trialSubscriptionsV2 } from "core/subscriptionsV2";
+import { exponentOf, type RateSnapshot } from "core/money";
 import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -28,25 +26,51 @@ import type { AppError, IpcResult } from "shared/types";
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
 
 /**
- * Unit test for Dashboard reactivity (Task 20.2, Req 8.6).
+ * Dashboard tests (Story 6.1, Req 8.1–8.6).
  *
  * The Dashboard reads the live `subscriptionsStore`/`settingsStore` via the
- * `useStoreData` (`useSyncExternalStore`) adapters. `initStores()` subscribes
- * to `onDataChanged` and reloads every store, so when the (fake) main process
- * mutates subscription data and fires `onDataChanged`, the displayed metrics
- * must update to reflect the current data (Req 8.6).
+ * `useStore`/`useStoreData` adapters, and fetches the bundled FX `RateSnapshot`
+ * over the read-only `fx:snapshot` IPC. Its "This month"/"Per year" figures are
+ * now the ONE honest Home-Currency convert-before-sum totals (`homeMonthlyTotal`
+ * /`homeYearlyTotal`), guarded by `rateConfidence` for staleness. We install a
+ * fake {@link SubbyApi} whose `getFxSnapshot` returns a controllable snapshot
+ * (or an error), and compute expected figures with the real core math so the
+ * assertions track the production derivation (never hardcoded formatting).
  *
- * We install a fake {@link SubbyApi} via `setSubby(...)` whose `list`/`get`
- * methods return controllable {@link IpcResult} data from mutable state, and
- * whose `onDataChanged` callback is captured so the test can fire it. Expected
- * figures are computed with the real `core/analytics` math (not hardcoded
- * formatting) so the assertions track the production derivation.
+ * Note on count-up: jsdom has no `matchMedia`, so `useReducedMotion` returns
+ * `true` and `CountUp` renders the FINAL value SYNCHRONOUSLY — the figures are
+ * assertable immediately with no rAF timers to flush.
  */
 
 // --- IpcResult helpers --------------------------------------------------------
 
 function ok<T>(data: T): Promise<IpcResult<T>> {
   return Promise.resolve({ ok: true, data });
+}
+
+function errResult<T>(error: AppError): Promise<IpcResult<T>> {
+  return Promise.resolve({ ok: false, error });
+}
+
+// --- Snapshots ----------------------------------------------------------------
+
+/** An INR-based rebased snapshot (INR → 1); fresh relative to the test clock. */
+const INR_SNAPSHOT: RateSnapshot = {
+  asOf: todayMinusDays(10),
+  rates: { INR: "1", USD: "91.350", EUR: "100.00" },
+};
+
+/** A stale INR-based snapshot (older than the 90-day threshold). */
+const STALE_SNAPSHOT: RateSnapshot = {
+  asOf: todayMinusDays(200),
+  rates: { INR: "1", USD: "91.350", EUR: "100.00" },
+};
+
+/** `today` (UTC day) minus `n` days, as a `YYYY-MM-DD` string. */
+function todayMinusDays(n: number): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
 }
 
 // --- Fake SubbyApi facade -----------------------------------------------------
@@ -57,6 +81,9 @@ interface FakeApi extends SubbyApi {
     categories: Category[];
     settings: SettingsV2;
   };
+  fxSnapshot: RateSnapshot | null;
+  /** When true, `getFxSnapshot` resolves to an error outcome ("rates unavailable"). */
+  fxErrored: boolean;
   dataChangedListeners: Array<() => void>;
   errorListeners: Array<(error: AppError) => void>;
   emitDataChanged(): void;
@@ -99,6 +126,8 @@ function createFakeApi(initial: SubscriptionV2[]): FakeApi {
       categories: [makeCategory()],
       settings: { ...DEFAULT_SETTINGS_V2 },
     },
+    fxSnapshot: INR_SNAPSHOT,
+    fxErrored: false,
     dataChangedListeners: [],
     errorListeners: [],
 
@@ -129,6 +158,12 @@ function createFakeApi(initial: SubscriptionV2[]): FakeApi {
     // --- Suggested price (Story 5.4): default fake returns no suggestion ---
     getPriceSuggestion: (() => ok(null)) as SubbyApi["getPriceSuggestion"],
 
+    // --- FX snapshot (Story 6.1): controllable per-test ---
+    getFxSnapshot: (() =>
+      fake.fxErrored
+        ? errResult<RateSnapshot>({ code: "not_found", message: "unavailable" })
+        : ok(fake.fxSnapshot as RateSnapshot)) as SubbyApi["getFxSnapshot"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
@@ -152,7 +187,7 @@ function createFakeApi(initial: SubscriptionV2[]): FakeApi {
   return fake;
 }
 
-// --- Expected-value helpers (real core/analytics math, no hardcoding) --------
+// --- Expected-value helpers (real core math, no hardcoding) ------------------
 
 /** The currency formatter the Dashboard uses for the Home Currency (INR). */
 function formatCurrency(amount: number): string {
@@ -163,13 +198,23 @@ function formatCurrency(amount: number): string {
   }).format(amount);
 }
 
-/**
- * Mirror the Dashboard's `minorToMajorNumber`: the analytics totals are now
- * MINOR-unit sums, and the Dashboard renders them in Home-Currency major by
- * dividing by 10^exponent (INR exponent 2 → divide by 100).
- */
+/** Home minor units → Home major number (INR exponent 2 → divide by 100). */
 function minorToMajor(minor: number): number {
   return minor / 10 ** exponentOf(DEFAULT_SETTINGS_V2.homeCurrency);
+}
+
+/** The expected displayed "This month" figure for a set over the given snapshot. */
+function expectedMonthly(subs: SubscriptionV2[], snapshot: RateSnapshot): string {
+  const active = activeSpendSubscriptionsV2(subs);
+  const total = homeMonthlyTotal(active, snapshot, DEFAULT_SETTINGS_V2.homeCurrency);
+  return formatCurrency(minorToMajor(total.totalMinor));
+}
+
+/** The expected displayed "Per year" figure for a set over the given snapshot. */
+function expectedYearly(subs: SubscriptionV2[], snapshot: RateSnapshot): string {
+  const active = activeSpendSubscriptionsV2(subs);
+  const total = homeYearlyTotal(active, snapshot, DEFAULT_SETTINGS_V2.homeCurrency);
+  return formatCurrency(minorToMajor(total.totalMinor));
 }
 
 /** Read the prominent value (`<p>`) of a metric card identified by its label. */
@@ -201,79 +246,250 @@ afterEach(() => {
   errorStore.clear();
 });
 
-// --- Test ---------------------------------------------------------------------
+// --- Reactivity (Req 8.6) -----------------------------------------------------
 
 describe("Dashboard reactivity (Req 8.6)", () => {
-  it("updates the displayed metrics when subscription data changes", async () => {
+  it("updates the displayed converted metrics when subscription data changes", async () => {
     render(<Dashboard />);
-    // Subscribe stores to onDataChanged and kick off the initial load.
     teardown = initStores();
 
-    // --- Initial metrics derived from the fake's initial subscriptions. ---
-    // The analytics totals are MINOR-unit sums; the Dashboard renders them in
-    // Home-Currency major (divide by 10^exponent), so the expected display
-    // values are `formatCurrency(minorToMajor(minorTotal))`.
-    const initialActive = activeSpendSubscriptionsV2(fake.state.subscriptions);
-    const expectedInitialCount = activeCount(fake.state.subscriptions);
-    const expectedInitialMonthly = totalMonthly(initialActive);
-    const expectedInitialYearly = totalYearly(initialActive);
-
+    // Initial metrics: convert-before-sum totals over the INR snapshot.
     await waitFor(() => {
-      expect(metricCardValue("Active Subscriptions")).toBe(
-        String(expectedInitialCount),
-      );
+      expect(metricCardValue("Active Subscriptions")).toBe("1");
     });
-    expect(expectedInitialCount).toBe(1);
     expect(metricCardValue("Total Monthly Spend")).toBe(
-      formatCurrency(minorToMajor(expectedInitialMonthly)),
+      expectedMonthly(fake.state.subscriptions, INR_SNAPSHOT),
     );
     expect(metricCardValue("Total Yearly Spend")).toBe(
-      formatCurrency(minorToMajor(expectedInitialYearly)),
+      expectedYearly(fake.state.subscriptions, INR_SNAPSHOT),
     );
 
-    // --- Mutate the backing data: add a second active subscription, then ---
-    // --- broadcast the change (simulating a main → renderer event).     ---
+    // Mutate the backing data: add a second active subscription, then broadcast.
     fake.state.subscriptions = [
       makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900 }),
       makeSubscription({ id: "sub-2", name: "Spotify", amountMinor: 20000 }),
     ];
     fake.emitDataChanged();
 
-    const updatedActive = activeSpendSubscriptionsV2(fake.state.subscriptions);
     const expectedUpdatedCount = activeCount(fake.state.subscriptions);
-    const expectedUpdatedMonthly = totalMonthly(updatedActive);
-    const expectedUpdatedYearly = totalYearly(updatedActive);
-
-    // Active count incremented (Req 8.3, 8.6).
     await waitFor(() => {
       expect(metricCardValue("Active Subscriptions")).toBe(
         String(expectedUpdatedCount),
       );
     });
     expect(expectedUpdatedCount).toBe(2);
-
-    // Monthly/yearly totals changed to reflect the new data (Req 8.1, 8.2, 8.6).
-    expect(expectedUpdatedMonthly).toBeGreaterThan(expectedInitialMonthly);
     expect(metricCardValue("Total Monthly Spend")).toBe(
-      formatCurrency(minorToMajor(expectedUpdatedMonthly)),
+      expectedMonthly(fake.state.subscriptions, INR_SNAPSHOT),
     );
     expect(metricCardValue("Total Yearly Spend")).toBe(
-      formatCurrency(minorToMajor(expectedUpdatedYearly)),
+      expectedYearly(fake.state.subscriptions, INR_SNAPSHOT),
     );
   });
 });
 
-// --- Trials-convert line (Story 5.1) -----------------------------------------
+// --- Convert-before-sum, mixed currency (the naive-sum bug is gone) ----------
+
+describe("mixed-currency Home total (Story 6.1)", () => {
+  it("converts each line Native→Home before summing (NOT a naive minor-unit sum)", async () => {
+    // 1000.00 USD + 1000.00 INR, Home INR, snapshot USD=91.35 INR / unit.
+    const subs: SubscriptionV2[] = [
+      makeSubscription({ id: "u", name: "USD sub", currency: "USD", amountMinor: 100000 }),
+      makeSubscription({ id: "i", name: "INR sub", currency: "INR", amountMinor: 100000 }),
+    ];
+    fake = createFakeApi(subs);
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    const displayed = expectedMonthly(subs, INR_SNAPSHOT);
+    await waitFor(() => {
+      expect(metricCardValue("Total Monthly Spend")).toBe(displayed);
+    });
+
+    // The honest converted total is NOT the naive minor sum (2000.00 "INR").
+    const naive = formatCurrency(minorToMajor(100000 + 100000));
+    expect(displayed).not.toBe(naive);
+    // The USD line alone converts to 1000 × 91.35 = 91,350 INR, so the total is
+    // far larger than the naive 2,000 — proving conversion happened.
+    expect(metricCardValue("Total Monthly Spend")).not.toBe(naive);
+  });
+});
+
+// --- Stale-rate guard ---------------------------------------------------------
+
+describe("stale-rate guard (Story 2.4 / AD-12)", () => {
+  it("shows a focusable 'rates are N months old' affordance instead of a confident total", async () => {
+    fake = createFakeApi([makeSubscription({ id: "a", amountMinor: 49900 })]);
+    fake.fxSnapshot = STALE_SNAPSHOT;
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    // The stale affordance is a focusable text NOTE (role="note", NOT an action
+    // button that does nothing) conveying the age in TEXT.
+    const affordance = await screen.findByRole("note");
+    expect(affordance).toHaveTextContent(/exchange rates are about .* old/i);
+    affordance.focus();
+    expect(affordance).toHaveFocus();
+    expect(affordance.tagName).not.toBe("BUTTON");
+
+    // Frozen rule: on stale rates the cards show the affordance INSTEAD of a
+    // confident single total. The confident figure is SUPPRESSED: the card value
+    // is the muted "~approximate" form (`~<amount>`), NOT the plain confident
+    // string, and NOT wrapped in a bold count-up span.
+    const confidentMonthly = expectedMonthly(fake.state.subscriptions, STALE_SNAPSHOT);
+    const monthlyValue = metricCardValue("Total Monthly Spend");
+    expect(monthlyValue).toBe(`~${confidentMonthly}`);
+    expect(monthlyValue).not.toBe(confidentMonthly);
+    // The plain confident value does not appear verbatim anywhere.
+    expect(screen.queryByText(confidentMonthly)).toBeNull();
+  });
+
+  it("shows the confident total (with 'as of' date) on a fresh snapshot", async () => {
+    render(<Dashboard />);
+    teardown = initStores();
+
+    await waitFor(() => {
+      expect(metricCardValue("Total Monthly Spend")).toBe(
+        expectedMonthly(fake.state.subscriptions, INR_SNAPSHOT),
+      );
+    });
+    // No stale affordance when fresh.
+    expect(
+      screen.queryByRole("note", { name: /exchange rates are about/i }),
+    ).toBeNull();
+    // The "as of" date is shown.
+    expect(screen.getAllByText(/Rates as of/i).length).toBeGreaterThan(0);
+  });
+});
+
+// --- Rates unavailable (IPC error) -------------------------------------------
+
+describe("rates unavailable (IPC error degrade)", () => {
+  it("shows a 'rates unavailable' state (never a wrong number) and does not crash", async () => {
+    fake = createFakeApi([makeSubscription({ id: "a", amountMinor: 49900 })]);
+    fake.fxErrored = true;
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    // The money cards degrade to a clear "Rates unavailable" label — never a
+    // confident converted number.
+    await waitFor(() => {
+      expect(screen.getAllByText(/Rates unavailable/i).length).toBeGreaterThan(0);
+    });
+    // The Active count still renders (not money-dependent).
+    expect(metricCardValue("Active Subscriptions")).toBe("1");
+  });
+
+  it("degrades to 'Rates unavailable' when a NON-null snapshot lacks a rate for a sub's currency", async () => {
+    // A JPY subscription with an INR snapshot that has NO JPY rate: the snapshot
+    // IS present (fxErrored=false), but `homeMonthlyTotal` throws MissingRateError
+    // inside `computeFigures`, which catches it and degrades the money cards to
+    // "Rates unavailable" — a DIFFERENT branch from the null-snapshot IPC error.
+    const subs: SubscriptionV2[] = [
+      makeSubscription({ id: "jp", name: "Niconico", currency: "JPY", amountMinor: 500 }),
+    ];
+    fake = createFakeApi(subs);
+    fake.fxSnapshot = INR_SNAPSHOT; // present, but has no JPY rate
+    fake.fxErrored = false;
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Rates unavailable/i).length).toBeGreaterThan(0);
+    });
+    // Never a wrong confident number, and the Active count still renders.
+    expect(metricCardValue("Active Subscriptions")).toBe("1");
+  });
+});
+
+// --- Cold load skeletons ------------------------------------------------------
+
+describe("cold load (Story 6.1)", () => {
+  it("shows skeleton placeholders (not a spinner) before data+rates resolve", async () => {
+    // Hold the subscriptions load open so the Dashboard stays cold on first paint.
+    let release!: (subs: SubscriptionV2[]) => void;
+    const pending = new Promise<SubscriptionV2[]>((resolve) => {
+      release = resolve;
+    });
+    fake = createFakeApi([makeSubscription({ id: "a", amountMinor: 49900 })]);
+    fake.listSubscriptions = () =>
+      pending.then((subs) => ({ ok: true as const, data: subs }));
+    setSubby(fake);
+
+    const { container } = render(<Dashboard />);
+    teardown = initStores();
+
+    // Cold: the live-region announces loading, and skeleton blocks are present.
+    expect(screen.getByRole("status")).toHaveTextContent(/loading/i);
+    expect(container.querySelectorAll(".animate-pulse").length).toBeGreaterThan(0);
+    // No metric figure yet (cards are skeletons, not a value).
+    expect(screen.queryByText("Total Monthly Spend")).toBeNull();
+
+    // Resolve the data: skeletons give way to the real cards.
+    release([makeSubscription({ id: "a", amountMinor: 49900 })]);
+    await waitFor(() => {
+      expect(screen.getByText("Total Monthly Spend")).toBeInTheDocument();
+    });
+    expect(container.querySelectorAll(".animate-pulse").length).toBe(0);
+  });
+});
+
+// --- Count-up snaps under (test-default) reduced motion ----------------------
+
+describe("count-up (Story 6.1)", () => {
+  it("snaps to the FINAL value under reduced motion so the figure is assertable", async () => {
+    render(<Dashboard />);
+    teardown = initStores();
+
+    // jsdom has no matchMedia → useReducedMotion is true → CountUp renders the
+    // final value synchronously. The displayed figure equals the computed total.
+    await waitFor(() => {
+      expect(metricCardValue("Total Monthly Spend")).toBe(
+        expectedMonthly(fake.state.subscriptions, INR_SNAPSHOT),
+      );
+    });
+    // The figure carries tabular-nums.
+    const card = screen.getByText("Total Monthly Spend").closest("div.rounded-lg");
+    expect(card?.querySelector(".tabular-nums")).not.toBeNull();
+  });
+});
+
+// --- Empty state --------------------------------------------------------------
+
+describe("empty state (Story 6.1)", () => {
+  it("shows 'Nothing tracked yet' with cards reading 0 when there are no subs", async () => {
+    fake = createFakeApi([]);
+    setSubby(fake);
+
+    render(<Dashboard />);
+    teardown = initStores();
+
+    await screen.findByText(/Nothing tracked yet/i);
+    expect(metricCardValue("Active Subscriptions")).toBe("0");
+    // 0 formatted in Home currency for the money cards.
+    expect(metricCardValue("Total Monthly Spend")).toBe(formatCurrency(0));
+    expect(metricCardValue("Total Yearly Spend")).toBe(formatCurrency(0));
+  });
+});
+
+// --- Trials-convert line (Story 5.1, now convert-before-sum) -----------------
 
 describe("trials-convert line (Story 5.1)", () => {
-  it("renders '+ $X/mo when N trials convert' with the right figure/count when ≥1 Trial", async () => {
-    // One Active + two Trials (monthly post 1000 minor, yearly post 12000 minor).
+  it("renders '+ X/mo when N trials convert' with the FX-correct figure/count when ≥1 Trial", async () => {
     const subs: SubscriptionV2[] = [
       makeSubscription({ id: "a", name: "Netflix", state: "Active", amountMinor: 49900 }),
       makeSubscription({
         id: "t1",
         name: "Notion",
         state: "Trial",
+        amountMinor: 0,
         billingCycle: "Monthly",
         trial: { endDate: "2026-12-31", postAmountMinor: 1000 },
       }),
@@ -281,6 +497,7 @@ describe("trials-convert line (Story 5.1)", () => {
         id: "t2",
         name: "Figma",
         state: "Trial",
+        amountMinor: 0,
         billingCycle: "Yearly",
         trial: { endDate: "2026-12-31", postAmountMinor: 12000 },
       }),
@@ -291,33 +508,39 @@ describe("trials-convert line (Story 5.1)", () => {
     render(<Dashboard />);
     teardown = initStores();
 
-    const figure = trialsConvertFigure(subs);
-    expect(figure.count).toBe(2);
-    // 1000 + 12000/12 = 2000 minor worth of monthly.
-    expect(figure.monthlyMinor).toBe(2000);
-    const expectedMoney = formatCurrency(minorToMajor(figure.monthlyMinor));
+    // The FX-correct trials-convert figure: a convert-before-sum Home monthly
+    // total over the Trial subset's POST-trial amounts (all INR here, so it
+    // equals the native figure — but computed through homeMonthlyTotal).
+    const shadow = trialSubscriptionsV2(subs).map((s) => ({
+      ...s,
+      amountMinor: s.trial?.postAmountMinor ?? 0,
+    }));
+    const trialsTotal = homeMonthlyTotal(
+      shadow,
+      INR_SNAPSHOT,
+      DEFAULT_SETTINGS_V2.homeCurrency,
+    );
+    const expectedMoney = formatCurrency(minorToMajor(trialsTotal.totalMinor));
+    // Sanity vs the native figure (INR-only → equal).
+    expect(trialsTotal.totalMinor).toBe(trialsConvertFigure(subs).monthlyMinor);
 
-    // The muted secondary line names the figure and count (pluralized). The
-    // text sits in a single leaf <span> (the sibling accent dot is a separate
-    // node), so match the leaf whose own text content carries both the money
-    // and the copy. `findByText` throws if it is absent (no jest-dom needed).
     await screen.findByText((_content, node) => {
       if (!node || node.children.length > 0) return false;
       const text = node.textContent ?? "";
       return (
-        text.includes(expectedMoney) &&
-        /\/mo when 2 trials convert/.test(text)
+        text.includes(expectedMoney) && /\/mo when 2 trials convert/.test(text)
       );
     });
   });
 
-  it("reads 'when 1 trial converts' (singular verb) for exactly one Trial", async () => {
+  it("reads 'when 1 trial converts' (singular) for exactly one Trial", async () => {
     const subs: SubscriptionV2[] = [
       makeSubscription({ id: "a", name: "Netflix", state: "Active" }),
       makeSubscription({
         id: "t1",
         name: "Notion",
         state: "Trial",
+        amountMinor: 0,
         billingCycle: "Monthly",
         trial: { endDate: "2026-12-31", postAmountMinor: 1000 },
       }),
@@ -328,19 +551,11 @@ describe("trials-convert line (Story 5.1)", () => {
     render(<Dashboard />);
     teardown = initStores();
 
-    const figure = trialsConvertFigure(subs);
-    expect(figure.count).toBe(1);
-    const expectedMoney = formatCurrency(minorToMajor(figure.monthlyMinor));
-
-    // Singular: "trial converts" (noun + verb both singular), not "trials
-    // convert" and not the ungrammatical "trial convert".
     await screen.findByText((_content, node) => {
       if (!node || node.children.length > 0) return false;
       const text = node.textContent ?? "";
       return (
-        text.includes(expectedMoney) &&
-        /\/mo when 1 trial converts/.test(text) &&
-        !/trials convert/.test(text)
+        /\/mo when 1 trial converts/.test(text) && !/trials convert/.test(text)
       );
     });
   });
@@ -356,7 +571,6 @@ describe("trials-convert line (Story 5.1)", () => {
     render(<Dashboard />);
     teardown = initStores();
 
-    // Let the stores load so the Dashboard reflects the (trial-free) data.
     await screen.findByText("Dashboard");
     await waitFor(() =>
       expect(metricCardValue("Active Subscriptions")).toBe("1"),

@@ -24,6 +24,8 @@ import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
 import { lookupSuggestion, type PriceSeed, type PriceSuggestion } from "core/priceSeed";
+import { ratesForHome, type BundledFxSnapshot } from "core/fxSnapshot";
+import type { RateSnapshot } from "core/money";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
@@ -33,7 +35,7 @@ import type { ConflictMode, SubscriptionInputV2 } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
 import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
-import { readBundledPriceSeed } from "./storage/resourceReader";
+import { readBundledFxSnapshot, readBundledPriceSeed } from "./storage/resourceReader";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
@@ -200,6 +202,18 @@ export interface AppServices {
    */
   getPriceSuggestion(name: string): PriceSuggestion | null;
 
+  // --- FX snapshot (Story 6.1) ---
+  /**
+   * Return the bundled FX {@link RateSnapshot} rebased to `homeCurrency`
+   * (`rates[home] === "1"`, every other currency expressed in Home major
+   * units), or `null` when the bundled snapshot failed to load (missing/corrupt)
+   * or the Home Currency is unknown/absent from it. READ-ONLY, lock-free, never
+   * throws: the snapshot is an immutable shipped bundle, never the StoragePort.
+   * Staleness is NOT decided here (core takes no clock); the renderer applies
+   * `rateConfidence` with its own local `today` to the returned `asOf`.
+   */
+  getFxSnapshot(homeCurrency: string): RateSnapshot | null;
+
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
   getSettings(): Promise<SettingsV2>;
@@ -321,6 +335,31 @@ export const defaultPriceSeedLoader: PriceSeedLoader = () => {
 };
 
 /**
+ * Load the bundled EUR-based FX snapshot, or `null` on any failure (Story 6.1).
+ *
+ * The default production loader reads the asar-aware bundle via
+ * {@link readBundledFxSnapshot} and returns `null` on a `ResourceReadError`
+ * (missing/unreadable) OR an `FxSnapshotError`/`UnknownCurrencyError` (bad
+ * shape/currency/rate) — the Dashboard then surfaces "rates unavailable" rather
+ * than a wrong confident total. Injectable so tests can supply a fixed
+ * {@link BundledFxSnapshot} (or a null-returning loader to simulate an
+ * absent/corrupt bundle) WITHOUT booting Electron (the default would touch the
+ * `electron` `app` globals).
+ */
+export type FxSnapshotLoader = () => BundledFxSnapshot | null;
+
+/** The production FX loader: read the bundle, degrade to `null` on any error. */
+export const defaultFxSnapshotLoader: FxSnapshotLoader = () => {
+  try {
+    return readBundledFxSnapshot();
+  } catch {
+    // ResourceReadError (missing/malformed) OR FxSnapshotError/UnknownCurrencyError
+    // (bad shape/currency/rate): surface as "rates unavailable" by holding null.
+    return null;
+  }
+};
+
+/**
  * Build the application services over an injected {@link StoragePort}.
  *
  * Used directly in tests with an in-memory/temp-dir storage implementation, and
@@ -331,10 +370,15 @@ export const defaultPriceSeedLoader: PriceSeedLoader = () => {
  * @param priceSeed    the loaded suggested-price seed (or `null` when it failed
  *                     to load / the feature is off). Defaults to the production
  *                     {@link defaultPriceSeedLoader}; tests inject a fixed seed.
+ * @param fxSnapshot   the loaded bundled FX snapshot (or `null` when it failed
+ *                     to load — rates then surface as "unavailable"). Defaults to
+ *                     the production {@link defaultFxSnapshotLoader}; tests inject
+ *                     a fixed snapshot.
  */
 export function buildAppServices(
   storage: StoragePort,
   priceSeed: PriceSeed | null = defaultPriceSeedLoader(),
+  fxSnapshot: BundledFxSnapshot | null = defaultFxSnapshotLoader(),
 ): AppServices {
   // Per-file write authority (AD-29). Every mutating method below runs its whole
   // `read → core → write` (and, for a destructive op, its pre-op backup) inside
@@ -493,6 +537,22 @@ export function buildAppServices(
       // real local `today` to the returned `asOf`.
       if (priceSeed === null) return null;
       return lookupSuggestion(priceSeed, name);
+    },
+
+    // --- FX snapshot (Story 6.1) ---------------------------------------------
+    getFxSnapshot(homeCurrency) {
+      // Lock-free, read-only rebase over the immutable in-memory EUR-based
+      // bundle. When the snapshot failed to load, rates are unavailable → null.
+      // `ratesForHome` can throw for an unknown Home Currency or one absent from
+      // the snapshot (UnknownCurrencyError / FxSnapshotError); catch here so a
+      // bad query degrades to null rather than crossing the bridge as a throw —
+      // the renderer treats null as "rates unavailable", never a wrong total.
+      if (fxSnapshot === null) return null;
+      try {
+        return ratesForHome(fxSnapshot, homeCurrency);
+      } catch {
+        return null;
+      }
     },
 
     // --- Settings ------------------------------------------------------------

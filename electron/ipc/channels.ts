@@ -35,6 +35,12 @@ export const CH = {
     // Read-only suggested-price lookup for the Add modal (FR-13, Story 5.4).
     suggest: "price:suggest",
   },
+  fx: {
+    // Read-only bundled FX-snapshot lookup, rebased to the queried Home
+    // Currency (Story 6.1). Mirrors `price:suggest`: no `evt:dataChanged`,
+    // returns an `IpcResult`, degrades to an error outcome on a bad bundle.
+    snapshot: "fx:snapshot",
+  },
   data: {
     importFile: "data:import", // {format, conflictMode, path}
     exportFile: "data:export", // {format, path}

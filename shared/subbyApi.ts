@@ -18,6 +18,7 @@ import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription";
 import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { PriceSuggestion } from "core/priceSeed";
+import type { RateSnapshot } from "core/money";
 import type { ImportOutcome } from "core/import";
 import type {
   AppError,
@@ -104,6 +105,18 @@ export interface SubbyApi {
    * no mutation, no `evt:dataChanged`; any failure is treated as "no suggestion".
    */
   getPriceSuggestion(name: string): Promise<IpcResult<PriceSuggestion | null>>;
+
+  // --- FX snapshot (Story 6.1) ---
+  /**
+   * Fetch the bundled FX {@link RateSnapshot} rebased to `homeCurrency`
+   * (`rates[home] === "1"`, every other currency in Home major units) plus the
+   * snapshot's `asOf` date (so the renderer applies the stale-rate guard with
+   * its own local `today`). READ-ONLY: no mutation, no `evt:dataChanged`. A
+   * missing/corrupt bundle (or an unknown/absent Home Currency) resolves to a
+   * `not_found` error outcome the renderer treats as "rates unavailable" — never
+   * a wrong confident total.
+   */
+  getFxSnapshot(homeCurrency: string): Promise<IpcResult<RateSnapshot>>;
 
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;

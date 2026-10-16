@@ -51,6 +51,7 @@ import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { CreateCategoryResult } from "core/categories";
 import type { ImportOutcome } from "core/import";
 import type { PriceSuggestion } from "core/priceSeed";
+import type { RateSnapshot } from "core/money";
 import type {
   AppError,
   ExportRequest,
@@ -83,6 +84,23 @@ export interface CreateCategoryData {
   created: Category;
 }
 
+// --- FX snapshot unavailable (Story 6.1) -------------------------------------
+
+/**
+ * Thrown inside the `fx:snapshot` handler when the bundled snapshot is
+ * unavailable (missing/corrupt bundle, or an unknown/absent Home Currency). It
+ * maps to an INLINE `not_found` {@link AppError} — NOT a system `io`/`corrupt`
+ * code — so the read never triggers the global `evt:error` toast (reads do not
+ * broadcast); the renderer catches the failure and shows its own quiet "rates
+ * unavailable" card state, never a wrong confident number.
+ */
+class FxSnapshotUnavailableError extends Error {
+  constructor() {
+    super("FX rate snapshot is unavailable.");
+    this.name = "FxSnapshotUnavailableError";
+  }
+}
+
 // --- Error mapping -----------------------------------------------------------
 
 /**
@@ -90,6 +108,10 @@ export interface CreateCategoryData {
  * returned as an `IpcResult` failure instead of crashing the bridge (Req 19.4).
  */
 function toAppError(err: unknown): AppError {
+  if (err instanceof FxSnapshotUnavailableError) {
+    // Inline (non-system) code so the FX read never broadcasts a global toast.
+    return { code: "not_found", message: err.message };
+  }
   if (isStorageCorruptError(err)) {
     return {
       code: "corrupt",
@@ -365,6 +387,29 @@ export function registerIpcHandlers(
     (_event, name: string) => query(() => services.getPriceSuggestion(name)),
   );
 
+  // --- FX snapshot (Story 6.1) -----------------------------------------------
+  // READ-ONLY: never broadcasts `evt:dataChanged`, returns the result inline.
+  // The service returns the rebased RateSnapshot or `null` when the bundle is
+  // missing/corrupt or the Home Currency is unknown/absent. A `null` is mapped
+  // to an INLINE `not_found` error OUTCOME (not `ok: true, data: null`, and not
+  // a system `io` code that would broadcast a global toast) so the renderer
+  // treats it as "rates unavailable" and never shows a wrong confident total.
+  // The service never throws, but `query` still wraps it defensively — a crash
+  // never crosses the bridge.
+  handle<IpcResult<RateSnapshot>>(
+    CH.fx.snapshot,
+    (_event, homeCurrency: string): Promise<IpcResult<RateSnapshot>> =>
+      query(() => {
+        const snapshot = services.getFxSnapshot(homeCurrency);
+        if (snapshot === null) {
+          // A loud, named error the renderer surfaces as "rates unavailable".
+          // Thrown here so `query`'s catch maps it to an IpcResult failure.
+          throw new FxSnapshotUnavailableError();
+        }
+        return snapshot;
+      }),
+  );
+
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
 
   handle<IpcResult<ImportOutcome>>(
@@ -424,6 +469,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.settings.get,
   CH.settings.update,
   CH.price.suggest,
+  CH.fx.snapshot,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,
