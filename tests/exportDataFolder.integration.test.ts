@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
+import type { ExportFile } from "core/export";
 import { planImport } from "core/import";
 import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
@@ -102,33 +103,44 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
     expect(await isFile(exportPath)).toBe(true);
 
     // Its parsed contents carry every subscription and the settings (Req 17.1).
-    const parsed = JSON.parse(await readFile(exportPath, "utf8")) as {
-      subscriptions: SubscriptionV2[];
-      settings: SettingsV2;
-    };
+    const parsed = JSON.parse(await readFile(exportPath, "utf8")) as ExportFile;
     expect(parsed.subscriptions.map((s) => s.id).sort()).toEqual(["sub-1", "sub-2"]);
     expect(parsed.subscriptions.map((s) => s.name).sort()).toEqual(["Netflix", "Spotify"]);
     expect(parsed.settings).toMatchObject(DEFAULT_SETTINGS_V2);
   });
 
-  it("round-trips a written JSON export back through planImport to reproduce the set (Req 17.3)", async () => {
+  it("the written JSON export round-trips value-exact through the REAL planImport (Req 17.3 / FR-17)", async () => {
     const subs = [
-      makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
+      makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900, currency: "INR" }),
     ];
     await storage.writeSubscriptions(subs);
 
     const exportPath = join(chosenDir, "subby-export.json");
     await writeFile(exportPath, await services.exportData("json"), "utf8");
 
-    // Read the file back from disk and feed it into the importer against an
-    // empty set: the original subscriptions are reproduced exactly.
-    const fromDisk = await readFile(exportPath, "utf8");
-    const outcome = planImport([], fromDisk, "json", "Replace");
+    // The written file is still a MAJOR-decimal v3 export (e.g. 49900 INR →
+    // "499.00") — assert that before proving the end-to-end round-trip.
+    const file = JSON.parse(await readFile(exportPath, "utf8")) as ExportFile;
+    const byId = new Map(file.subscriptions.map((r) => [r.id, r]));
+    for (const sub of subs) {
+      const r = byId.get(sub.id)!;
+      expect(typeof r.amount).toBe("string");
+      expect(r.amount).toContain(".");
+    }
 
+    // Story 7.2 restores the REAL end-to-end proof: read the written file back
+    // through `planImport` (into an empty set, Replace). The importer
+    // reconstructs integer minor units via `core/money.minorUnits`, so the
+    // reconstructed set equals the originals value-exact.
+    const raw = await readFile(exportPath, "utf8");
+    const outcome = planImport([], raw, "json", "Replace");
     expect(outcome.rejected).toEqual([]);
-    expect(outcome.imported).toBe(2);
-    expect(outcome.applied).toEqual(subs);
+    expect(outcome.imported).toBe(subs.length);
+    const reconById = new Map(outcome.applied.map((s) => [s.id, s]));
+    for (const sub of subs) {
+      expect(reconById.get(sub.id)).toEqual(sub);
+    }
   });
 
   it("writes CSV export with a header row plus one row per subscription to the chosen path", async () => {
@@ -159,10 +171,10 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
     }
   });
 
-  it("round-trips a written CSV export back through planImport to reproduce the set (Req 17.3)", async () => {
+  it("the written CSV export round-trips value-exact through the REAL planImport (Req 17.3 / FR-17)", async () => {
     const subs = [
-      makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900 }),
+      makeSubscription({ id: "sub-1", name: "Netflix", amountMinor: 49900, currency: "INR" }),
+      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music", amountMinor: 11900, currency: "INR" }),
     ];
     await storage.writeSubscriptions(subs);
 
@@ -170,12 +182,32 @@ describe("Export to a chosen path (Req 17.1, 17.2)", () => {
     await writeFile(exportPath, await services.exportData("csv"), "utf8");
 
     const fromDisk = await readFile(exportPath, "utf8");
-    const outcome = planImport([], fromDisk, "csv", "Replace");
+    const lines = fromDisk.split("\r\n");
+    const header = lines[0].split(",");
+    const amountCol = header.indexOf("amount");
 
+    // The money column header is the human `amount` (renamed in place), and each
+    // cell is a MAJOR decimal (49900 INR → "499.00", 11900 → "119.00").
+    expect(amountCol).toBeGreaterThanOrEqual(0);
+    expect(header).not.toContain("amountMinor");
+    const idCol = header.indexOf("id");
+    const byId = new Map(lines.slice(1).map((line) => {
+      const cells = line.split(",");
+      return [cells[idCol], cells] as const;
+    }));
+    expect(byId.get("sub-1")![amountCol]).toBe("499.00");
+    expect(byId.get("sub-2")![amountCol]).toBe("119.00");
+
+    // Story 7.2 restores the REAL end-to-end proof: read the written CSV back
+    // through `planImport`, which reconstructs integer minor units via
+    // `core/money.minorUnits`, so the reconstructed set equals the originals.
+    const outcome = planImport([], fromDisk, "csv", "Replace");
     expect(outcome.rejected).toEqual([]);
-    expect(outcome.imported).toBe(2);
-    expect(outcome.applied.map((s) => s.id).sort()).toEqual(["sub-1", "sub-2"]);
-    expect(outcome.applied.map((s) => s.name).sort()).toEqual(["Netflix", "Spotify"]);
+    expect(outcome.imported).toBe(subs.length);
+    const reconById = new Map(outcome.applied.map((s) => [s.id, s]));
+    for (const sub of subs) {
+      expect(reconById.get(sub.id)).toEqual(sub);
+    }
   });
 });
 

@@ -1,8 +1,18 @@
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
 
-import { exportJson, exportCsv } from "core/export";
+import {
+  exportJson,
+  exportCsv,
+  EXPORT_VERSION,
+  CSV_COLUMNS,
+  CSV_HEADERS,
+  type ExportFile,
+  type ExportSubscription,
+  type ExportPriceEntry,
+} from "core/export";
 import { planImport } from "core/import";
+import { minorUnits, MINOR_UNIT_EXPONENT } from "core/money";
 import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SubscriptionV2 } from "core/models/subscription";
 import type { ConflictMode } from "shared/types";
@@ -11,13 +21,35 @@ import type { ConflictMode } from "shared/types";
  * Properties 19–21: export/import round-trip, per-record validation, and
  * conflict-mode resolution.
  *
- * Property 19 — Export then import reproduces the subscription set (Req 17.3).
+ * Property 19 — Export emits value-exact MAJOR-decimal money (Req 17.3 / FR-17):
+ *               every monetary value serializes through `core/money.toMajor` and
+ *               parses back via `core/money.minorUnits` to the ORIGINAL integer
+ *               minor units, for the top-level amount AND the nested trial +
+ *               price-history amounts, across every supported currency. This is
+ *               the WRITE-side exactness, proven by parsing the written major back
+ *               via `minorUnits` directly.
+ * Property 19b — The full export→import round-trip is value-exact through the REAL
+ *               `planImport` (Story 7.2): `exportJson/Csv(subs)` → `planImport([],
+ *               …, "Replace")` reconstructs the SAME subs value-exact (top-level,
+ *               nested trial, and each price-history entry) across every supported
+ *               currency. This is the end-to-end contract — a regression on either
+ *               the export or the import side fails here. It also proves the
+ *               importer reconstructs integer minor units via `core/money` (never a
+ *               hand-rolled `*100`) and that a bad/unknown-currency amount is
+ *               rejected-with-reason while valid records still import, and a newer
+ *               `version` gives a clear whole-file reason.
  * Property 20 — Import validates per record and preserves existing valid data
  *               (Req 16.1, 16.2, 16.5).
  * Property 21 — Conflict modes resolve duplicates correctly (Req 16.3).
  */
 
 const NUM_RUNS = 200;
+
+/** The supported currencies the money seam knows an exponent for (the single
+ * exponent table) — export's `toMajor` throws on anything else, so every exported
+ * amount must be in one of these. Spans the 0/2/3-decimal exponents. */
+const SUPPORTED_CURRENCIES: readonly string[] = Object.keys(MINOR_UNIT_EXPONENT);
+const currencyArb = fc.constantFrom(...SUPPORTED_CURRENCIES);
 
 const MODES: readonly ConflictMode[] = ["Replace", "Merge", "Skip"];
 const modeArb = fc.constantFrom<ConflictMode>(...MODES);
@@ -78,7 +110,11 @@ const amountMinorArb = fc.integer({ min: 0, max: 1_000_000_000 });
  * when the billing cycle is `Custom` (mirrors the schema's requirement). String
  * fields use the full unicode space to exercise CSV escaping (commas, quotes,
  * CR/LF). Only `Active`/`Paused` states are generated and `trial` is omitted so
- * the "trial required iff state === 'Trial'" invariant holds trivially.
+ * the "trial required iff state === 'Trial'" invariant holds trivially. The
+ * currency is drawn from the supported exponent table so a value fed through
+ * export's `toMajor` seam never hits the unknown-currency path (Properties 20/21
+ * build raw records directly and never export, so their currency is unconstrained
+ * there).
  */
 const subscriptionArb: fc.Arbitrary<SubscriptionV2> = fc
   .record({
@@ -87,7 +123,7 @@ const subscriptionArb: fc.Arbitrary<SubscriptionV2> = fc
     provider: fc.string(),
     category: fc.string(),
     amountMinor: amountMinorArb,
-    currency: fc.string({ minLength: 1 }),
+    currency: currencyArb,
     billingCycle: cycleArb,
     customInterval: customIntervalArb,
     nextRenewal: isoDateArb,
@@ -113,6 +149,36 @@ const subscriptionArb: fc.Arbitrary<SubscriptionV2> = fc
     return sub;
   });
 
+/** An append-only price-history entry in a supported currency (its own currency,
+ * possibly different from the subscription's — export majors each independently). */
+const priceEntryArb = fc.record({
+  amountMinor: amountMinorArb,
+  currency: currencyArb,
+  date: isoDateArb,
+});
+
+/**
+ * A schema-valid Trial subscription with an embedded trial and a non-empty price
+ * history — the generator that exercises Property 19's NESTED money round-trip
+ * (`trial.postAmountMinor` and each `priceHistory[].amountMinor`). The trial uses
+ * the `startDate + lengthDays` form (months unrepresentable, AD-18). The post
+ * amount is in the subscription's own currency; price entries carry their own.
+ */
+const trialSubscriptionArb: fc.Arbitrary<SubscriptionV2> = fc
+  .record({
+    base: subscriptionArb,
+    postAmountMinor: amountMinorArb,
+    lengthDays: fc.integer({ min: 1, max: 365 }),
+    trialStart: isoDateArb,
+    priceHistory: fc.array(priceEntryArb, { minLength: 1, maxLength: 4 }),
+  })
+  .map(({ base, postAmountMinor, lengthDays, trialStart, priceHistory }) => ({
+    ...base,
+    state: "Trial" as const,
+    trial: { startDate: trialStart, lengthDays, postAmountMinor },
+    priceHistory,
+  }));
+
 /**
  * Stamp a subscription with a tag so its `id` AND its `name + provider` key are
  * globally unique. Import dedupes by `id`, then by `name + provider` (Req 16.3),
@@ -127,9 +193,13 @@ function stamp(sub: SubscriptionV2, tag: string): SubscriptionV2 {
   };
 }
 
-/** An array of subscriptions made unique on both id and name+provider. */
-const uniqueSubsArb: fc.Arbitrary<SubscriptionV2[]> = fc
-  .array(subscriptionArb, { maxLength: 12 })
+/**
+ * A mix of plain (Active/Paused) and Trial-with-price-history subscriptions, each
+ * made id-unique — the input to Property 19's money round-trip so BOTH the simple
+ * top-level amount AND the nested trial/price amounts are exercised.
+ */
+const moneySubsArb: fc.Arbitrary<SubscriptionV2[]> = fc
+  .array(fc.oneof(subscriptionArb, trialSubscriptionArb), { minLength: 1, maxLength: 10 })
   .map((subs) => subs.map((s, i) => stamp(s, String(i))));
 
 /** Compare two subscription sets ignoring order (sort by unique id). */
@@ -144,29 +214,208 @@ function expectSameSet(
 
 // --- Property 19 -------------------------------------------------------------
 
-describe("Feature: subby, Property 19: Export then import reproduces the subscription set", () => {
-  it("Feature: subby, Property 19: JSON export feeds back into import unchanged (Req 17.3)", () => {
-    fc.assert(
-      fc.property(uniqueSubsArb, modeArb, (subs, mode) => {
-        const raw = exportJson(subs, DEFAULT_SETTINGS_V2);
-        const outcome = planImport([], raw, "json", mode);
+/**
+ * Parse a `core/export` CSV string into header + rows of cells, honoring RFC 4180
+ * quoting (doubled quotes, embedded commas / CR / LF) and CRLF separators. A tiny
+ * local tokenizer so Property 19 does not depend on the (Story-7.2-owned)
+ * importer to read the file back.
+ */
+function parseExportedCsv(text: string): { header: string[]; rows: string[][] } {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  let i = 0;
+  const endField = () => {
+    row.push(field);
+    field = "";
+  };
+  const endRow = () => {
+    endField();
+    rows.push(row);
+    row = [];
+  };
+  while (i < text.length) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 2;
+          continue;
+        }
+        inQuotes = false;
+        i += 1;
+        continue;
+      }
+      field += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = true;
+      i += 1;
+    } else if (ch === ",") {
+      endField();
+      i += 1;
+    } else if (ch === "\r") {
+      if (text[i + 1] === "\n") i += 1;
+      endRow();
+      i += 1;
+    } else if (ch === "\n") {
+      endRow();
+      i += 1;
+    } else {
+      field += ch;
+      i += 1;
+    }
+  }
+  endRow();
+  const nonBlank = rows.filter((r) => !(r.length === 1 && r[0] === ""));
+  return { header: nonBlank[0] ?? [], rows: nonBlank.slice(1) };
+}
 
+/**
+ * Property 19 (Req 17.3 / FR-17): export emits value-exact MAJOR-decimal money.
+ *
+ * Story 7.1 only WRITES the major representation; the importer that READS it is
+ * Story 7.2, so this proves exactness by parsing the written major back through
+ * `core/money.minorUnits` DIRECTLY (never through `planImport`, which still reads
+ * raw `amountMinor` until 7.2). It covers the top-level amount AND the nested
+ * `trial.postAmount` + each `priceHistory[].amount`, across supported currencies.
+ */
+describe("Feature: subby, Property 19: Export emits value-exact major-decimal money", () => {
+  it("Feature: subby, Property 19: JSON export majors every amount and round-trips value-exact via minorUnits (Req 17.3)", () => {
+    fc.assert(
+      fc.property(moneySubsArb, (subs) => {
+        const parsed = JSON.parse(exportJson(subs, DEFAULT_SETTINGS_V2)) as ExportFile;
+
+        // JSON shape + version identify the (major-decimal) money representation.
+        expect(parsed.version).toBe(EXPORT_VERSION);
+        expect(parsed.settings).toEqual(DEFAULT_SETTINGS_V2);
+        expect(parsed.subscriptions).toHaveLength(subs.length);
+
+        const byId = new Map<string, ExportSubscription>(
+          parsed.subscriptions.map((r) => [r.id, r]),
+        );
+        for (const sub of subs) {
+          const rec = byId.get(sub.id);
+          expect(rec).toBeDefined();
+          const r = rec as ExportSubscription;
+
+          // Non-money fields reproduce verbatim.
+          expect(r.name).toBe(sub.name);
+          expect(r.provider).toBe(sub.provider);
+          expect(r.currency).toBe(sub.currency);
+          expect(r.state).toBe(sub.state);
+          expect(r.tags).toEqual(sub.tags);
+
+          // Money is a MAJOR decimal (not the raw minor int) that parses back to
+          // the ORIGINAL integer minor units, value-exact.
+          expect(typeof r.amount).toBe("string");
+          expect(minorUnits(r.amount, r.currency)).toBe(sub.amountMinor);
+
+          // Nested trial post amount: major, value-exact in the sub's currency.
+          if (sub.trial !== undefined) {
+            expect(r.trial).toBeDefined();
+            const t = r.trial as NonNullable<ExportSubscription["trial"]>;
+            expect(minorUnits(t.postAmount, r.currency)).toBe(sub.trial.postAmountMinor);
+          }
+
+          // Each price-history entry: major, value-exact in the entry's OWN currency.
+          expect(r.priceHistory).toHaveLength(sub.priceHistory.length);
+          sub.priceHistory.forEach((orig, idx) => {
+            const e = r.priceHistory[idx] as ExportPriceEntry;
+            expect(e.currency).toBe(orig.currency);
+            expect(minorUnits(e.amount, e.currency)).toBe(orig.amountMinor);
+          });
+        }
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+
+  it("Feature: subby, Property 19: CSV export majors the money column + nested cells and round-trips value-exact (Req 17.3)", () => {
+    fc.assert(
+      fc.property(moneySubsArb, (subs) => {
+        const { header, rows } = parseExportedCsv(exportCsv(subs));
+
+        // Column parity: the header set+order equals CSV_HEADERS; the money column
+        // keeps its position with the human `amount` header (never `amountMinor`).
+        expect(header).toEqual([...CSV_HEADERS]);
+        const amountIdx = CSV_COLUMNS.indexOf("amountMinor");
+        expect(header[amountIdx]).toBe("amount");
+        expect(header).not.toContain("amountMinor");
+
+        const col = (name: string) => header.indexOf(name);
+        expect(rows).toHaveLength(subs.length);
+
+        const byId = new Map<string, string[]>(rows.map((cells) => [cells[col("id")], cells]));
+        for (const sub of subs) {
+          const cells = byId.get(sub.id);
+          expect(cells).toBeDefined();
+          const c = cells as string[];
+
+          // Money column is a major decimal that parses back value-exact.
+          expect(minorUnits(c[amountIdx], sub.currency)).toBe(sub.amountMinor);
+
+          // Trial JSON cell carries a major `postAmount`.
+          if (sub.trial !== undefined) {
+            const t = JSON.parse(c[col("trial")]) as { postAmount: string };
+            expect(minorUnits(t.postAmount, sub.currency)).toBe(sub.trial.postAmountMinor);
+          }
+
+          // Price-history JSON cell carries a major `amount` per entry in its currency.
+          const entries = JSON.parse(c[col("priceHistory")]) as ExportPriceEntry[];
+          expect(entries).toHaveLength(sub.priceHistory.length);
+          sub.priceHistory.forEach((orig, idx) => {
+            expect(entries[idx].currency).toBe(orig.currency);
+            expect(minorUnits(entries[idx].amount, entries[idx].currency)).toBe(orig.amountMinor);
+          });
+        }
+      }),
+      { numRuns: NUM_RUNS },
+    );
+  });
+});
+
+// --- Property 19b: real export → import round-trip (Story 7.2) ----------------
+
+/**
+ * The expected v2 record after a round-trip: identical to the original EXCEPT the
+ * importer's merge/validation never changes money, so every `amountMinor` (top,
+ * trial, each price entry) must survive EXACTLY. We compare the whole object — a
+ * value-exact round-trip must reproduce the record verbatim.
+ */
+describe("Feature: subby, Property 19b: export → import round-trip is value-exact through planImport (Req 17.3 / FR-17)", () => {
+  it("Feature: subby, Property 19b: JSON exportJson → planImport reconstructs the SAME subs value-exact (Replace into empty)", () => {
+    fc.assert(
+      fc.property(moneySubsArb, (subs) => {
+        const json = exportJson(subs, DEFAULT_SETTINGS_V2);
+        const outcome = planImport([], json, "json", "Replace");
+
+        // Every record imports; none rejected or skipped (all new into empty).
         expect(outcome.rejected).toEqual([]);
         expect(outcome.imported).toBe(subs.length);
+        expect(outcome.skipped).toBe(0);
+
+        // The reconstructed set equals the originals — money (incl. nested trial
+        // and each price-history entry) is reconstructed to the exact minor units.
         expectSameSet(outcome.applied, subs);
       }),
       { numRuns: NUM_RUNS },
     );
   });
 
-  it("Feature: subby, Property 19: CSV export feeds back into import unchanged (Req 17.3)", () => {
+  it("Feature: subby, Property 19b: CSV exportCsv → planImport reconstructs the SAME subs value-exact (Replace into empty)", () => {
     fc.assert(
-      fc.property(uniqueSubsArb, modeArb, (subs, mode) => {
-        const raw = exportCsv(subs);
-        const outcome = planImport([], raw, "csv", mode);
+      fc.property(moneySubsArb, (subs) => {
+        const csv = exportCsv(subs);
+        const outcome = planImport([], csv, "csv", "Replace");
 
         expect(outcome.rejected).toEqual([]);
         expect(outcome.imported).toBe(subs.length);
+        expect(outcome.skipped).toBe(0);
         expectSameSet(outcome.applied, subs);
       }),
       { numRuns: NUM_RUNS },
