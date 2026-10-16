@@ -62,6 +62,16 @@ export interface SettingsV2 {
   trayMode: boolean;
   dataFolder: string | null; // null = default App_Data_Directory
   online: OnlineSettingsV2; // AD-22
+  /**
+   * The last ROUTINE (scheduled-or-manual) backup instant, as a UTC ISO string,
+   * or `null`/absent = never backed up (Story 7.3). ADDITIVE + OPTIONAL (mirrors
+   * the `online`/`colorsSeeded` pattern): an older v2 settings file without the
+   * key validates and reads as "never". The scheduled-backup cadence cap and the
+   * "Last backup" Settings line both key off this; it is NEVER stamped by the
+   * incidental pre-destructive backups (`pre-delete`/`pre-import`/`pre-restore`/
+   * pre-migration) — only the scheduled + manual `backupNow` paths advance it.
+   */
+  lastBackupAt?: string | null;
 }
 
 /** Root file shape for `settings.json` under schema v2 (`version: 2`). */

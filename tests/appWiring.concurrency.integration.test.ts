@@ -503,6 +503,70 @@ describe("backup-before-destructive is atomic UNDER the lock (AD-29)", () => {
   });
 });
 
+describe("backupNow takes a backup + stamps lastBackupAt atomically under lock('settings') (Story 7.3)", () => {
+  it("creates a backup AND stamps lastBackupAt in one unit; a concurrent updateSettings does not clobber the stamp", async () => {
+    const storage = new InstrumentedStorage();
+    const services = buildAppServices(storage);
+
+    // Precondition: never backed up.
+    expect((await services.getSettings()).lastBackupAt ?? null).toBeNull();
+
+    // Fire backupNow concurrently with an unrelated settings patch. Both run under
+    // lock("settings"), so they serialize: whichever runs second re-reads the
+    // first's write, so NEITHER stamp nor patch is clobbered (AD-29).
+    await Promise.all([
+      services.backupNow("manual"),
+      services.updateSettings({ theme: "light" }),
+    ]);
+
+    const final = await services.getSettings();
+    // The backup ran: a backup payload was captured by the stub.
+    expect(storage.backups).toHaveLength(1);
+    // Both landed: the stamp is set AND the unrelated patch survived.
+    expect(final.lastBackupAt).toBeTruthy();
+    expect(typeof final.lastBackupAt).toBe("string");
+    expect(final.theme).toBe("light");
+
+    // The settings sections never interleaved: between backupNow's backup:start
+    // and its settings write-end, no OTHER settings write occurs.
+    const backupStart = storage.log.indexOf("backup:start");
+    expect(backupStart).toBeGreaterThanOrEqual(0);
+    const stampWriteEnd = storage.log.indexOf("write:settings:end", backupStart);
+    const span = storage.log.slice(backupStart, stampWriteEnd + 1);
+    expect(span.filter((e) => e === "write:settings:start")).toHaveLength(1);
+  });
+
+  it("returns the backup name and advances lastBackupAt against a real temp-dir JsonFileStorage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "subby-backupnow-"));
+    try {
+      const realStorage = new JsonFileStorage(dir);
+      const services = buildAppServices(realStorage);
+
+      const before = await services.getSettings();
+      expect(before.lastBackupAt ?? null).toBeNull();
+
+      const name = await services.backupNow("manual");
+      // A collision-proof `.json` name was returned.
+      expect(name).toMatch(/\.json$/);
+
+      // The backup is listed and lastBackupAt is now a valid ISO instant.
+      const backups = await services.listBackups();
+      expect(backups).toContain(name);
+      const after = await services.getSettings();
+      expect(after.lastBackupAt).toBeTruthy();
+      expect(Number.isNaN(Date.parse(after.lastBackupAt as string))).toBe(false);
+
+      // A second manual backup ALWAYS backs up (the cap is scheduled-only) and
+      // re-stamps a distinct, collision-proof name.
+      const name2 = await services.backupNow("manual");
+      expect(name2).not.toBe(name);
+      expect((await services.listBackups())).toContain(name2);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("a failing mutation rejects only itself; others still apply (AD-29)", () => {
   it("one mutation faults at the write, a concurrent same-file create still persists", async () => {
     const storage = new InstrumentedStorage();

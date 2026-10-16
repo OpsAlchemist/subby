@@ -450,6 +450,13 @@ export function registerIpcHandlers(
     // Backup-current-then-restore is sequenced inside the service (Req 18.3).
     (_event, name: string) => mutate(() => services.restoreBackup(name)),
   );
+
+  // Manual "Back up now" (Story 7.3): backupNow("manual") takes a backup + stamps
+  // lastBackupAt atomically. Rides `mutate` so it broadcasts `evt:dataChanged`
+  // and returns an IpcResult<string> (the new backup's name).
+  handle<IpcResult<string>>(CH.data.createBackup, () =>
+    mutate(() => services.backupNow("manual")),
+  );
 }
 
 /**
@@ -474,6 +481,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.data.exportFile,
   CH.data.listBackups,
   CH.data.restoreBackup,
+  CH.data.createBackup,
 ];
 
 /** Remove all handlers registered by {@link registerIpcHandlers}. */

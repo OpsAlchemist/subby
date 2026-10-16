@@ -169,6 +169,7 @@ function createFakeApi(initial: SubscriptionV2[]): FakeApi {
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
     listBackups: () => ok<string[]>([]),
     restoreBackup: () => ok(fake.state.subscriptions),
+    createBackup: () => ok("2026-01-01-00-00-00-000.json"),
 
     // --- Events: capture the callbacks so the test can fire them ---
     onDataChanged(cb: () => void): Unsubscribe {

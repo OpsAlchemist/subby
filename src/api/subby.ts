@@ -197,6 +197,7 @@ export const dataApi = {
     unwrap(getSubby().exportData(req)),
   listBackups: () => unwrap(getSubby().listBackups()),
   restoreBackup: (name: string) => unwrap(getSubby().restoreBackup(name)),
+  createBackup: () => unwrap(getSubby().createBackup()),
 } as const;
 
 // --- Event subscriptions (re-exported) ---------------------------------------

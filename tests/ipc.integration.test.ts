@@ -4,6 +4,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+/**
+ * A fake `ipcMain` whose `handle`/`removeHandler` back a plain Map so the real
+ * `registerIpcHandlers` can be driven and a channel invoked directly (Story 7.3
+ * `backup:create` round-trip). `webContents.send` on the fake window records
+ * broadcasts so `evt:dataChanged` emission can be asserted. The rest of this
+ * suite imports `buildAppServices`/`JsonFileStorage` which only touch `electron`
+ * via a degrade-to-null `app` path, so this mock keeps every existing test green.
+ */
+const ipcHandlers = new Map<string, (...args: unknown[]) => unknown>();
+const sentChannels: string[] = [];
+vi.mock("electron", () => ({
+  app: { isPackaged: false, getAppPath: () => process.cwd() },
+  ipcMain: {
+    handle: (channel: string, listener: (...args: unknown[]) => unknown) => {
+      ipcHandlers.set(channel, listener);
+    },
+    removeHandler: (channel: string) => {
+      ipcHandlers.delete(channel);
+    },
+  },
+  BrowserWindow: class {},
+}));
+
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { parsePriceSeed, type PriceSeed } from "core/priceSeed";
@@ -100,7 +123,15 @@ let services: AppServices;
 beforeEach(async () => {
   userData = await mkdtemp(join(tmpdir(), "subby-ipc-"));
   storage = new JsonFileStorage(userData);
-  services = buildAppServices(storage);
+  // Pin BOTH bundled loaders to null (no price seed, no FX snapshot). Before
+  // Story 7.3 this file didn't mock `electron`, so the default loaders threw on
+  // an undefined `app` and silently yielded null. The new `vi.mock("electron")`
+  // (needed to drive `registerIpcHandlers` for the backup:create round-trip)
+  // supplies a working `app`, which would otherwise re-point the DEFAULT loaders
+  // at the real shipped resources/ files — a hidden coupling for this suite,
+  // whose price/FX tests always pass explicit seeds. Keep the default-param
+  // services seed-free so this suite stays isolated from resources/ contents.
+  services = buildAppServices(storage, null, null);
 });
 
 afterEach(async () => {
@@ -442,6 +473,13 @@ describe("backup-before-destructive sequencing (Req 3.3, 16.4, 18.1, 18.3)", () 
     const backupsAfter = await storage.listBackups();
     expect(backupsAfter.length).toBe(backupsBefore.length + 1);
 
+    // Pre-destructive backups do NOT stamp `lastBackupAt` — it tracks ONLY
+    // routine (scheduled/manual) backups via `backupNow` (Story 7.3 "Never"
+    // boundary). A delete going through `storage.createBackup` directly must
+    // leave it untouched, so an unrelated delete can never defer the scheduled
+    // cadence.
+    expect((await services.getSettings()).lastBackupAt ?? null).toBeNull();
+
     // The newest backup captured the PRE-delete state ([a, b]).
     const newest = backupsAfter[0];
     const captured = await storage.readBackup(newest);
@@ -474,6 +512,9 @@ describe("backup-before-destructive sequencing (Req 3.3, 16.4, 18.1, 18.3)", () 
 
     const backupsAfter = await storage.listBackups();
     expect(backupsAfter.length).toBe(backupsBefore.length + 1);
+
+    // Pre-import backup does NOT stamp `lastBackupAt` (routine-only; Story 7.3).
+    expect((await services.getSettings()).lastBackupAt ?? null).toBeNull();
 
     const captured = await storage.readBackup(backupsAfter[0]);
     vi.useRealTimers();
@@ -514,8 +555,76 @@ describe("backup-before-destructive sequencing (Req 3.3, 16.4, 18.1, 18.3)", () 
     expect(backupsAfter.length).toBe(backupsBefore.length + 1);
     const preRestore = backupsAfter[0]; // newest = pre-restore backup (12-10)
     const captured = await storage.readBackup(preRestore);
+    // Pre-restore backup does NOT stamp `lastBackupAt` (routine-only; Story 7.3).
+    expect((await services.getSettings()).lastBackupAt ?? null).toBeNull();
     vi.useRealTimers();
     expect(captured.subscriptions.map((s) => s.id)).toEqual(["current"]);
+  });
+});
+
+describe("backup:create IPC round-trip (Story 7.3)", () => {
+  it("backup:create → backupNow('manual'): writes a backup, stamps lastBackupAt, broadcasts evt:dataChanged, returns IpcResult<string>", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    sentChannels.length = 0;
+
+    // A fake window whose webContents.send records the broadcast channel.
+    const fakeWin = {
+      isDestroyed: () => false,
+      webContents: { send: (channel: string) => sentChannels.push(channel) },
+    };
+    // Spy so we can assert the handler invokes the ROUTINE path with the
+    // "manual" reason (not "scheduled" / a pre-destructive reason) — the reason
+    // string is what distinguishes routine from incidental backups.
+    const backupNowSpy = vi.spyOn(services, "backupNow");
+    registerIpcHandlers(services, () => fakeWin as never);
+
+    // The channel is registered.
+    const listener = ipcHandlers.get(CH.data.createBackup);
+    expect(CH.data.createBackup).toBe("backup:create");
+    expect(listener).toBeTypeOf("function");
+
+    const before = await services.getSettings();
+    expect(before.lastBackupAt ?? null).toBeNull();
+
+    // Invoke the handler exactly as ipcMain would (event, ...args).
+    const result = (await listener!({} as never)) as {
+      ok: boolean;
+      data?: string;
+    };
+
+    // IpcResult<string>: ok with the new backup's name.
+    expect(result.ok).toBe(true);
+    expect(typeof result.data).toBe("string");
+    expect(result.data).toMatch(/\.json$/);
+
+    // The handler took the ROUTINE manual path (reason "manual"), not scheduled.
+    expect(backupNowSpy).toHaveBeenCalledWith("manual");
+
+    // The mutation broadcast fired so every view refreshes (Req 8.6 wiring).
+    expect(sentChannels).toContain(CH.events.dataChanged);
+
+    // The backup was taken and lastBackupAt stamped (via backupNow("manual")).
+    const backups = await services.listBackups();
+    expect(backups).toContain(result.data);
+    const after = await services.getSettings();
+    expect(after.lastBackupAt).toBeTruthy();
+  });
+
+  it("backup:create is in the unregister list (torn down cleanly)", async () => {
+    const { registerIpcHandlers, unregisterIpcHandlers } = await import(
+      "../electron/ipc/handlers"
+    );
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    registerIpcHandlers(services, () => null);
+    expect(ipcHandlers.has(CH.data.createBackup)).toBe(true);
+
+    unregisterIpcHandlers();
+    expect(ipcHandlers.has(CH.data.createBackup)).toBe(false);
   });
 });
 

@@ -56,6 +56,7 @@ const api: SubbyApi = {
   exportData: (req) => ipcRenderer.invoke(CH.data.exportFile, req),
   listBackups: () => ipcRenderer.invoke(CH.data.listBackups),
   restoreBackup: (name) => ipcRenderer.invoke(CH.data.restoreBackup, name),
+  createBackup: () => ipcRenderer.invoke(CH.data.createBackup),
 
   // --- Events (main → renderer) ---
   onDataChanged: (cb) => {

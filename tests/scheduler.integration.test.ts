@@ -77,20 +77,30 @@ function makeSubscription(overrides: Partial<SubscriptionV2> = {}): Subscription
   };
 }
 
-/** v2 settings with notifications enabled and an arbitrary set of lead times. */
+/**
+ * v2 settings with notifications enabled and an arbitrary set of lead times.
+ *
+ * `backupFrequency` DEFAULTS to `"off"` (Story 7.3) so the existing reminder
+ * assertions are unaffected by the new scheduled-backup evaluation — the backup
+ * step is a no-op for every reminder-focused test. The scheduled-backup tests
+ * override it explicitly.
+ */
 function makeSettings(
   leadTimes: ReminderLeadTime[],
   enabled = true,
+  overrides: Partial<SettingsV2> = {},
 ): SettingsV2 {
   return {
     homeCurrency: "INR",
     notification: { enabled, leadTimes },
-    backupFrequency: "weekly",
+    backupFrequency: "off",
     theme: "dark",
     accentColor: "#92400e",
     trayMode: false,
     dataFolder: null,
     online: { liveLogoFetch: false, fxRefresh: false },
+    lastBackupAt: null,
+    ...overrides,
   };
 }
 
@@ -136,20 +146,40 @@ function makeServices(
   initialSubs: SubscriptionV2[],
   ledger = makeLedgerStore(),
 ) {
-  const state = { settings: initialSettings, subs: initialSubs };
+  const state: {
+    settings: SettingsV2;
+    subs: SubscriptionV2[];
+    backupNowError?: boolean;
+    now?: string;
+  } = { settings: initialSettings, subs: initialSubs };
   const getSettings = vi.fn(async () => state.settings);
   const listSubscriptions = vi.fn(async () => state.subs);
+  // `backupNow` (Story 7.3): stamps a monotonic `lastBackupAt` on `state.settings`
+  // (so the at-most-once CAP self-applies on the next cycle, exactly as the real
+  // service does) and returns a backup name. The spy records every call so the
+  // scheduled-backup tests can assert fire/no-fire. Set `backupNowError` to inject
+  // a scheduled-backup fault for the degrade case.
+  const backupNowCalls: string[] = [];
+  const backupNow = vi.fn(async (reason: string): Promise<string> => {
+    backupNowCalls.push(reason);
+    if (state.backupNowError) throw new Error("injected backup fault");
+    state.settings = { ...state.settings, lastBackupAt: state.now ?? new Date().toISOString() };
+    return `backup-${backupNowCalls.length}.json`;
+  });
   const services: SchedulerServices = {
     getSettings,
     listSubscriptions,
     readReminderLedger: ledger.readReminderLedger,
     writeReminderLedger: ledger.writeReminderLedger,
+    backupNow,
   };
   return {
     services,
     state,
     getSettings,
     listSubscriptions,
+    backupNow,
+    backupNowCalls,
     ledger: ledger.store,
     readReminderLedger: ledger.readReminderLedger,
     writeReminderLedger: ledger.writeReminderLedger,
@@ -1271,5 +1301,138 @@ describe("Trial-End reminders (Story 5.2) — tick, seam, catch-up, eligibility"
       { kind: "renewal", subscriptionId: "both", leadTime: "same-day", localDay: TODAY },
       { kind: "trial-end", subscriptionId: "both", leadTime: "same-day", localDay: TODAY },
     ]);
+  });
+});
+
+describe("Scheduled backups (Story 7.3) — independent of reminders, capped per period", () => {
+  /** The cycle's fixed `now` as an ISO instant, used to stamp recent backups. */
+  const NOW_ISO = FIXED_NOW().toISOString();
+
+  it("fires backupNow('scheduled') once when due (weekly, never backed up); reminders also run", async () => {
+    // weekly + lastBackupAt null => due. A same-day due sub also fires a reminder,
+    // proving the backup step does NOT disturb the reminder path.
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const { services, backupNow, backupNowCalls } = makeServices(
+      makeSettings(["same-day"], true, { backupFrequency: "weekly", lastBackupAt: null }),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(backupNow).toHaveBeenCalledTimes(1);
+    expect(backupNowCalls).toEqual(["scheduled"]);
+    // The reminder still fired — the backup eval is independent of the reminder path.
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("takes a scheduled backup even when reminders are OFF (backup eval precedes the gate); zero reminders", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const { services, backupNow } = makeServices(
+      makeSettings(["same-day"], /* enabled */ false, {
+        backupFrequency: "weekly",
+        lastBackupAt: null,
+      }),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    // Backup STILL taken even though notifications are disabled (precedes the gate).
+    expect(backupNow).toHaveBeenCalledTimes(1);
+    // No reminder fires — the notification gate short-circuited the reminder path.
+    expect(notifier.notify).not.toHaveBeenCalled();
+  });
+
+  it("caps at-most-once-per-period: a second same-period cycle re-reads the stamp and does NOT re-backup", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: "2099-01-01" });
+    const svc = makeServices(
+      makeSettings(["same-day"], true, { backupFrequency: "weekly", lastBackupAt: null }),
+      [sub],
+    );
+    // The stub stamps `lastBackupAt` to this recent instant, so the NEXT cycle's
+    // `backupDue` sees <7d elapsed and returns false (the persisted-stamp cap).
+    svc.state.now = NOW_ISO;
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({
+      services: svc.services,
+      notifier,
+      now: FIXED_NOW,
+      offsetMinutes: OFFSET_UTC,
+    });
+
+    await scheduler.evaluateNow();
+    expect(svc.backupNow).toHaveBeenCalledTimes(1);
+
+    // Second cycle in the same period: the fresh (stamped) settings make backupDue
+    // false, so no second scheduled backup is taken.
+    await scheduler.evaluateNow();
+    expect(svc.backupNow).toHaveBeenCalledTimes(1);
+    expect(svc.state.settings.lastBackupAt).toBe(NOW_ISO);
+  });
+
+  it("off → never: no scheduled backup is taken for backupFrequency 'off'", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const { services, backupNow } = makeServices(
+      makeSettings(["same-day"], true, { backupFrequency: "off", lastBackupAt: null }),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+    await scheduler.evaluateNow();
+
+    expect(backupNow).not.toHaveBeenCalled();
+    // The reminder path is entirely unaffected (same-day still fires once).
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+  });
+
+  it("degrades on a scheduled-backup failure: caught + logged, cycle continues, reminders still evaluate", async () => {
+    const sub = makeSubscription({ id: "a", nextRenewal: TODAY });
+    const svc = makeServices(
+      makeSettings(["same-day"], true, { backupFrequency: "weekly", lastBackupAt: null }),
+      [sub],
+    );
+    svc.state.backupNowError = true; // the scheduled backup throws
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({
+      services: svc.services,
+      notifier,
+      now: FIXED_NOW,
+      offsetMinutes: OFFSET_UTC,
+    });
+
+    // Must not throw into the event loop (AD-28).
+    await expect(scheduler.evaluateNow()).resolves.toBeUndefined();
+
+    expect(svc.backupNow).toHaveBeenCalledTimes(1);
+    // lastBackupAt NOT advanced (the stub threw before stamping).
+    expect(svc.state.settings.lastBackupAt).toBeNull();
+    // Reminder evaluation still proceeded after the degraded backup.
+    expect(notifier.notify).toHaveBeenCalledTimes(1);
+    expect(svc.ledger.ledger.fired).toHaveLength(1);
+  });
+
+  it("daily, <24h since last backup: not due → no scheduled backup", async () => {
+    // last backup 1h before now → <24h elapsed → daily not due.
+    const oneHourBefore = new Date(FIXED_NOW().getTime() - 60 * 60 * 1000).toISOString();
+    const sub = makeSubscription({ id: "a", nextRenewal: "2099-01-01" });
+    const { services, backupNow } = makeServices(
+      makeSettings(["same-day"], true, {
+        backupFrequency: "daily",
+        lastBackupAt: oneHourBefore,
+      }),
+      [sub],
+    );
+    const notifier = makeNotifier();
+    const scheduler = new Scheduler({ services, notifier, now: FIXED_NOW, offsetMinutes: OFFSET_UTC });
+
+    await scheduler.evaluateNow();
+
+    expect(backupNow).not.toHaveBeenCalled();
   });
 });

@@ -123,6 +123,13 @@ export interface SubbyApi {
   exportData(req: ExportRequest): Promise<IpcResult<ExportResult>>;
   listBackups(): Promise<IpcResult<string[]>>;
   restoreBackup(name: string): Promise<IpcResult<SubscriptionV2[]>>;
+  /**
+   * Take a routine backup immediately ("Back up now", Story 7.3) and stamp
+   * `settings.lastBackupAt`. Resolves with the new backup's file name; broadcasts
+   * `evt:dataChanged`. Always backs up (the at-most-once cap applies only to the
+   * SCHEDULED path).
+   */
+  createBackup(): Promise<IpcResult<string>>;
 
   // --- Events (main → renderer) ---
   /** Fires after any successful mutation so views can refresh (Req 8.6). Returns an unsubscribe. */

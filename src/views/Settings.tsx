@@ -39,13 +39,13 @@
  */
 
 import { useState } from "react";
-import { FolderOpen } from "lucide-react";
+import { FolderOpen, Save } from "lucide-react";
 
 import type {
   ReminderLeadTime,
   SettingsV2 as SettingsModel,
 } from "core/models/settings";
-import { settingsApi, toAppError } from "@/api/subby";
+import { dataApi, settingsApi, toAppError } from "@/api/subby";
 import { settingsStore } from "@/stores/settingsStore";
 import { errorStore } from "@/stores/errorStore";
 import { useStore } from "@/stores/hooks";
@@ -117,6 +117,7 @@ const SELECT_CLASS =
 export default function Settings(): JSX.Element {
   const { data: settings } = useStore(settingsStore);
   const [choosingFolder, setChoosingFolder] = useState(false);
+  const [backingUp, setBackingUp] = useState(false);
 
   // The appearance currently painted (dark/light), so the accent swatch for the
   // active theme can be marked current — matching the token applyAccent paints.
@@ -143,6 +144,23 @@ export default function Settings(): JSX.Element {
     void persist({
       notification: { ...settings.notification, leadTimes: next },
     });
+  }
+
+  /**
+   * Take a routine backup immediately ("Back up now", Story 7.3). Non-destructive
+   * (no confirm dialog). Any IPC failure is normalized to an {@link AppError} and
+   * recorded for the global toast; the "Last backup" line refreshes via the
+   * `onDataChanged` broadcast the handler emits (so no manual state update here).
+   */
+  async function backUpNow(): Promise<void> {
+    setBackingUp(true);
+    try {
+      await dataApi.createBackup();
+    } catch (err) {
+      errorStore.set(toAppError(err));
+    } finally {
+      setBackingUp(false);
+    }
   }
 
   /** Open the native folder dialog and switch the data folder (Req 15.3). */
@@ -263,6 +281,35 @@ export default function Settings(): JSX.Element {
             ))}
           </select>
         </Field>
+
+        {/*
+          Last backup + manual "Back up now" (Story 7.3). The line reads
+          settings.lastBackupAt (an explicit "Never" when null/absent); the button
+          takes a routine backup every press (the at-most-once cap is scheduled-
+          only). Non-destructive → no confirm dialog; errors go to the global
+          toast; disabled while in flight. Styled like the "Choose folder…" button.
+        */}
+        <div className="space-y-2">
+          <span className="text-sm font-medium text-foreground">
+            Last backup
+          </span>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => void backUpNow()}
+              disabled={backingUp}
+              className={`inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-50 ${FOCUS_RING}`}
+            >
+              <Save className="h-4 w-4" aria-hidden="true" />
+              Back up now
+            </button>
+            <span className="text-sm text-muted-foreground">
+              {settings.lastBackupAt
+                ? new Date(settings.lastBackupAt).toLocaleString()
+                : "Never"}
+            </span>
+          </div>
+        </div>
       </SettingsSection>
 
       {/* Categories (Story 3.4) — inserted via the section-insert slot pattern. */}

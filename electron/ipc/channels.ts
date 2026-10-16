@@ -46,6 +46,7 @@ export const CH = {
     exportFile: "data:export", // {format, path}
     listBackups: "backup:list",
     restoreBackup: "backup:restore",
+    createBackup: "backup:create", // manual "Back up now" → backupNow("manual")
   },
   events: {
     dataChanged: "evt:dataChanged", // main → renderer broadcast

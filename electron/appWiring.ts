@@ -255,6 +255,16 @@ export interface AppServices {
   // --- Shared destructive helper ---
   /** Create a timestamped backup of the current subscriptions (Req 18.1). */
   createBackup(reason: string): Promise<string>;
+
+  /**
+   * Take a ROUTINE backup and stamp `settings.lastBackupAt` as ONE atomic unit
+   * under `lock("settings")` (Story 7.3). Re-reads settings inside the lock
+   * (never trusts a stale caller copy), calls `storage.createBackup(reason)`,
+   * then persists `{...settings, lastBackupAt: nowIso()}`, returning the backup
+   * name. Reused verbatim by BOTH the scheduled path (Scheduler, `reason:
+   * "scheduled"`) and the manual "Back up now" path (IPC, `reason: "manual"`).
+   */
+  backupNow(reason: string): Promise<string>;
 }
 
 /** The assembled application context: the storage port plus the services. */
@@ -641,6 +651,20 @@ export function buildAppServices(
     // --- Shared destructive helper -------------------------------------------
     createBackup(reason) {
       return storage.createBackup(reason);
+    },
+
+    backupNow(reason) {
+      // Serialize on `settings` so the backup + the `lastBackupAt` stamp are ONE
+      // atomic unit: a concurrent `updateSettings` can neither interleave between
+      // them nor clobber the stamp (AD-29). Re-read settings INSIDE the lock —
+      // never trust a stale caller copy — so the merge writes the freshest state.
+      return lock("settings", async () => {
+        const settings = await storage.readSettings();
+        const name = await storage.createBackup(reason);
+        const merged = catCore.mergeSettings(settings, { lastBackupAt: nowIso() });
+        await storage.writeSettings(merged);
+        return name;
+      });
     },
   };
 }

@@ -66,6 +66,7 @@
  * until {@link Scheduler.stop} is called.
  */
 
+import { backupDue } from "core/backup";
 import {
   catchUp,
   catchUpTrialEnds,
@@ -103,6 +104,11 @@ export interface SchedulerServices {
   readReminderLedger(): Promise<ReminderLedger>;
   /** Write the reminder ledger back (serialized under `lock("reminderLedger")`). */
   writeReminderLedger(ledger: ReminderLedger): Promise<void>;
+  /**
+   * Take a routine backup + stamp `lastBackupAt` atomically (Story 7.3). Called
+   * with `"scheduled"` when `backupDue` fires. Returns the backup name.
+   */
+  backupNow(reason: string): Promise<string>;
 }
 
 /** Default periodic evaluation interval: every 30 minutes. */
@@ -159,6 +165,16 @@ export interface SchedulerOptions {
  * call {@link start} (runs the launch catch-up pass, then begins ticking with an
  * immediate launch evaluation) or {@link evaluateNow} to run a single cycle
  * directly (used by the deferred launch tick and by tests).
+ *
+ * Scheduled backups (Story 7.3): each cycle ALSO evaluates `backupFrequency`
+ * independently of reminders — the backup step runs BEFORE the
+ * `notification.enabled` early-return, so a scheduled backup is still taken when
+ * reminders are off. The decision is the pure `core/backup.backupDue` elapsed-
+ * time predicate, capped at-most-once-per-period by the persisted
+ * `settings.lastBackupAt` stamp. A scheduled-backup failure DEGRADES (caught +
+ * logged, cycle continues, never thrown — AD-28), exactly like the ledger write.
+ * No new timer: this reuses the existing periodic loop; a backup missed while the
+ * app was closed is taken on the first launch tick (the predicate self-heals).
  */
 export class Scheduler {
   private readonly services: SchedulerServices;
@@ -258,13 +274,21 @@ export class Scheduler {
     try {
       // (1) Re-read settings each cycle so timing changes apply (Req 13.5).
       const settings = await this.services.getSettings();
+
+      // Capture the clock ONCE so the local-day `today` (dueness AND the stored
+      // dedupe bucket), the advanced `lastRunAt`, AND the scheduled-backup
+      // decision all derive from the SAME instant.
+      const now = this.now();
+      const nowIso = now.toISOString();
+
+      // (1a) Scheduled backup (Story 7.3) — evaluated BEFORE the notification
+      //      gate so it runs even with reminders off. Independent of the reminder
+      //      path; degrades on failure, never throws into the event loop.
+      await this.evaluateBackup(settings, nowIso);
+
       if (!settings.notification.enabled) return;
 
       const enabled = settings.notification.leadTimes;
-      // Capture the clock ONCE so the local-day `today` (dueness AND the stored
-      // dedupe bucket) and the advanced `lastRunAt` derive from the SAME instant.
-      const now = this.now();
-      const nowIso = now.toISOString();
 
       // (2) Current subscription set + the persisted ledger (the dedupe source).
       //     A ledger READ failure degrades the whole cycle (emit nothing, write
@@ -368,6 +392,39 @@ export class Scheduler {
       );
     } finally {
       this.evaluating = false;
+    }
+  }
+
+  /**
+   * Scheduled-backup evaluation (Story 7.3). Independent of reminders and run
+   * BEFORE the `notification.enabled` gate, so a scheduled backup is still taken
+   * when reminders are off.
+   *
+   * When `backupFrequency` is `"off"` it is a no-op. Otherwise the pure
+   * `core/backup.backupDue` elapsed-time predicate — reading `nowIso` and the
+   * persisted `settings.lastBackupAt` only — decides due-ness; when due, it calls
+   * `services.backupNow("scheduled")` (which takes the backup AND atomically
+   * stamps `lastBackupAt`, capping the next period). A failure DEGRADES: caught +
+   * logged, the cycle continues (reminders still evaluate), never thrown into the
+   * event loop (AD-28) — identical to the ledger-write degrade. On failure
+   * `lastBackupAt` is NOT advanced, so the next cycle re-attempts.
+   */
+  private async evaluateBackup(
+    settings: SettingsV2,
+    nowIso: string,
+  ): Promise<void> {
+    if (settings.backupFrequency === "off") return;
+    if (!backupDue(settings.backupFrequency, settings.lastBackupAt ?? null, nowIso)) {
+      return;
+    }
+    try {
+      await this.services.backupNow("scheduled");
+    } catch (err) {
+      console.error(
+        `[subby] scheduler scheduled-backup failed (caught, not thrown): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
     }
   }
 

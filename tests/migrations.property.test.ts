@@ -340,6 +340,9 @@ describe("Feature: subby, Property 30: v1 settings migrate to a valid v2 setting
         expect(settingsV2Schema.safeParse(v2).success).toBe(true);
         expect(v2.homeCurrency).toBe(v1.defaultCurrency);
         expect(v2.online).toEqual({ liveLogoFetch: false, fxRefresh: false });
+        // Story 7.3: the migrator stamps lastBackupAt null (no routine-backup
+        // history yet), mirroring the all-false `online` addition.
+        expect(v2.lastBackupAt).toBeNull();
 
         // Everything else carried over.
         expect(v2.notification).toEqual(v1.notification);
@@ -521,11 +524,35 @@ describe("v1 -> v2 migration (example matrix — real-beta-shaped records)", () 
     const v2 = migrateSettingsV1toV2(v1Settings);
     expect(v2.homeCurrency).toBe("INR");
     expect(v2.online).toEqual({ liveLogoFetch: false, fxRefresh: false });
+    expect(v2.lastBackupAt).toBeNull(); // Story 7.3
     expect(settingsV2Schema.safeParse(v2).success).toBe(true);
 
     const fileV2 = migrateSettingsFileV1toV2({ ...v1Settings, version: 1 });
     expect(fileV2.version).toBe(2);
+    expect(fileV2.lastBackupAt).toBeNull();
     expect(settingsFileV2Schema.safeParse(fileV2).success).toBe(true);
+  });
+
+  it("Story 7.3: an old v2 settings file WITHOUT lastBackupAt still validates (additive + optional)", () => {
+    // An older v2 settings file (shipped before 7.3) has no `lastBackupAt` key.
+    // Because the schema field is `.nullable().optional()`, it validates and reads
+    // as "never backed up" (undefined), so the first eligible cycle backs up.
+    const olderV2 = {
+      version: 2 as const,
+      homeCurrency: "INR",
+      notification: { enabled: true, leadTimes: ["same-day"] },
+      backupFrequency: "weekly" as const,
+      theme: "dark" as const,
+      accentColor: "#92400e",
+      trayMode: false,
+      dataFolder: null,
+      online: { liveLogoFetch: false, fxRefresh: false },
+    };
+    const parsed = settingsFileV2Schema.safeParse(olderV2);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.lastBackupAt).toBeUndefined();
+    }
   });
 
   it("custom interval: billingCycle 'Custom' + customInterval carries over; v2 validates", () => {

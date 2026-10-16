@@ -54,6 +54,10 @@ function ok<T>(data: T): Promise<IpcResult<T>> {
   return Promise.resolve({ ok: true, data });
 }
 
+function fail<T>(message: string): Promise<IpcResult<T>> {
+  return Promise.resolve({ ok: false, error: { code: "unknown", message } });
+}
+
 // --- Known settings the fake serves -------------------------------------------
 
 /** A known, fully-specified settings object so control state is deterministic. */
@@ -76,6 +80,7 @@ const KNOWN_SETTINGS: SettingsModel = {
 interface FakeApi extends SubbyApi {
   updateSpy: ReturnType<typeof vi.fn>;
   chooseFolderSpy: ReturnType<typeof vi.fn>;
+  createBackupSpy: ReturnType<typeof vi.fn>;
   state: {
     subscriptions: SubscriptionV2[];
     categories: Category[];
@@ -95,10 +100,14 @@ function createFakeApi(): FakeApi {
   const chooseFolderSpy = vi.fn(() =>
     ok<SettingsModel | null>(fake.state.settings),
   );
+  // "Back up now" (Story 7.3): resolves with a backup name by default; a test
+  // overrides it to a rejected IpcResult to exercise the error→toast path.
+  const createBackupSpy = vi.fn(() => ok<string>("2026-01-01-00-00-00-000.json"));
 
   const fake: FakeApi = {
     updateSpy,
     chooseFolderSpy,
+    createBackupSpy,
     state: {
       subscriptions: [],
       categories: [makeCategory()],
@@ -140,6 +149,7 @@ function createFakeApi(): FakeApi {
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
     listBackups: () => ok<string[]>([]),
     restoreBackup: () => ok(fake.state.subscriptions),
+    createBackup: createBackupSpy as SubbyApi["createBackup"],
 
     // --- Events (no-op subscriptions for these tests) ---
     onDataChanged: (): Unsubscribe => () => {},
@@ -269,6 +279,94 @@ describe("Settings persistence calls updateSettings (Req 15.2)", () => {
     await waitFor(() => expect(fake.chooseFolderSpy).toHaveBeenCalledTimes(1));
     // Selecting a folder is not a settings patch, so updateSettings is untouched.
     expect(fake.updateSpy).not.toHaveBeenCalled();
+  });
+});
+
+// --- Scheduled & manual backups (Story 7.3) -----------------------------------
+
+describe("Backups section: 'Back up now' + 'Last backup' (Story 7.3)", () => {
+  it("'Back up now' calls dataApi.createBackup and is keyboard-operable", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+
+    const button = await screen.findByRole("button", { name: /back up now/i });
+    // Keyboard-operable: focus + Enter activates it (no mouse needed).
+    button.focus();
+    expect(button).toHaveFocus();
+    await user.keyboard("{Enter}");
+
+    await waitFor(() =>
+      expect(fake.createBackupSpy).toHaveBeenCalledTimes(1),
+    );
+    // Non-destructive: the manual action is NOT a settings patch.
+    expect(fake.updateSpy).not.toHaveBeenCalled();
+    // No native confirm dialog (window.confirm) is used.
+    expect(errorStore.getSnapshot().latest).toBeNull();
+  });
+
+  it("disables the button while the backup is in flight, then re-enables it", async () => {
+    const user = userEvent.setup();
+
+    // A deferred createBackup lets us observe the in-flight disabled state.
+    let resolveBackup: (r: IpcResult<string>) => void = () => {};
+    fake.createBackupSpy.mockImplementationOnce(
+      () =>
+        new Promise<IpcResult<string>>((resolve) => {
+          resolveBackup = resolve;
+        }),
+    );
+
+    render(<Settings />);
+    const button = await screen.findByRole("button", { name: /back up now/i });
+    expect(button).not.toBeDisabled();
+
+    await user.click(button);
+    // In flight → disabled.
+    await waitFor(() => expect(button).toBeDisabled());
+
+    // Resolve the backup → the button re-enables.
+    resolveBackup({ ok: true, data: "2026-01-01-00-00-00-000.json" });
+    await waitFor(() => expect(button).not.toBeDisabled());
+  });
+
+  it("records a toast error when the backup fails (no crash)", async () => {
+    const user = userEvent.setup();
+    fake.createBackupSpy.mockImplementationOnce(() =>
+      fail<string>("disk full"),
+    );
+
+    render(<Settings />);
+    const button = await screen.findByRole("button", { name: /back up now/i });
+    await user.click(button);
+
+    await waitFor(() => {
+      expect(errorStore.getSnapshot().latest?.message).toBe("disk full");
+    });
+  });
+
+  it("shows 'Never' when lastBackupAt is null/absent", async () => {
+    render(<Settings />); // KNOWN_SETTINGS.lastBackupAt is undefined
+    const region = await screen.findByRole("region", { name: "Backups" });
+    expect(within(region).getByText("Never")).toBeInTheDocument();
+  });
+
+  it("shows the last-backup time when lastBackupAt is set", async () => {
+    const stamp = "2026-03-07T09:05:00.000Z";
+    fake.state.settings = { ...fake.state.settings, lastBackupAt: stamp };
+    settingsStore.reset();
+    teardown?.();
+    teardown = initStores();
+    await waitFor(() =>
+      expect(settingsStore.getSnapshot().loaded).toBe(true),
+    );
+
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Backups" });
+    // Not "Never" — the formatted locale instant is shown instead.
+    expect(within(region).queryByText("Never")).toBeNull();
+    expect(
+      within(region).getByText(new Date(stamp).toLocaleString()),
+    ).toBeInTheDocument();
   });
 });
 

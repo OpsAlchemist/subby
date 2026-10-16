@@ -185,6 +185,8 @@ export function migrateSubscriptionV1toV2(v1: Subscription): SubscriptionV2 {
  * Transform v1 `Settings` into v2 `SettingsV2`:
  *   - `defaultCurrency` -> `homeCurrency`
  *   - adds `online: { liveLogoFetch: false, fxRefresh: false }` (all-false)
+ *   - adds `lastBackupAt: null` (Story 7.3 — a migrated user has no routine
+ *     backup history yet; mirrors the all-false `online` addition)
  *   - all other fields carry over unchanged
  */
 export function migrateSettingsV1toV2(v1: Settings): SettingsV2 {
@@ -201,6 +203,7 @@ export function migrateSettingsV1toV2(v1: Settings): SettingsV2 {
     trayMode: rest.trayMode,
     dataFolder: rest.dataFolder,
     online: { liveLogoFetch: false, fxRefresh: false },
+    lastBackupAt: null,
   };
 }
 

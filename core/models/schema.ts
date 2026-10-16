@@ -343,6 +343,9 @@ export const settingsV2Schema = z.object({
   trayMode: z.boolean(),
   dataFolder: z.string().nullable(),
   online: onlineSettingsV2Schema,
+  // Last routine (scheduled-or-manual) backup instant (Story 7.3). Additive +
+  // optional, so an older v2 file without the key validates and reads as "never".
+  lastBackupAt: isoDateTime.nullable().optional(),
 });
 
 /** Root file shape for `settings.json` under schema v2 (`version: 2`). */
@@ -441,6 +444,7 @@ export const DEFAULT_SETTINGS_V2: SettingsV2 = {
   trayMode: DEFAULT_SETTINGS.trayMode,
   dataFolder: DEFAULT_SETTINGS.dataFolder,
   online: { liveLogoFetch: false, fxRefresh: false }, // AD-22 (all-default-false)
+  lastBackupAt: null, // Story 7.3: never backed up on first run.
 };
 
 // --- Compile-time alignment checks (no runtime cost) -------------------------

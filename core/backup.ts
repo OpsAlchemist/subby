@@ -10,11 +10,63 @@
  * task 12.1), keeping `core/` free of platform dependencies.
  */
 
+import type { SettingsV2 } from "./models/settings";
 import type {
   Subscription,
   SubscriptionsFile,
   SubscriptionV2,
 } from "./models/subscription";
+
+// --- Scheduled-backup cadence (Story 7.3) ------------------------------------
+
+/** Milliseconds in a day — the `"daily"` scheduled-backup period. */
+export const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Milliseconds in a week — the `"weekly"` scheduled-backup period. */
+export const WEEK_MS = 7 * DAY_MS;
+
+/**
+ * Decide whether a routine (SCHEDULED) backup is DUE (Story 7.3). PURE — reads
+ * NO ambient clock: it parses only the injected `nowIso`/`lastBackupAt` ISO
+ * instants (never `Date.now()` / argless `new Date()`), so it is deterministic
+ * and offset-independent (an elapsed-instant comparison, not a local-day bucket).
+ *
+ * This is the SCHEDULED cadence cap only — the manual "Back up now" action
+ * ALWAYS backs up and bypasses this predicate. The decision table:
+ *   - `"off"`                       → `false` (routine backups disabled)
+ *   - `lastBackupAt === null`       → `true`  (never backed up → due)
+ *   - `elapsed` is `NaN`
+ *     (unparseable `lastBackupAt`)  → `true`  (safe over-backup; re-stamped valid
+ *                                              on the next backup. NOTE: the only
+ *                                              callers pass a schema-validated
+ *                                              `lastBackupAt` — a valid ISO instant
+ *                                              or null — and a `nowIso` from
+ *                                              `new Date().toISOString()`, so this
+ *                                              branch is a defensive backstop, not
+ *                                              a path the live app reaches.)
+ *   - `elapsed < 0`
+ *     (future `lastBackupAt`, skew) → `false` (no spurious backup on clock skew)
+ *   - `"daily"`                     → `true` when `elapsed >= DAY_MS`
+ *   - `"weekly"`                    → `true` when `elapsed >= WEEK_MS`
+ *
+ * where `elapsed = parse(nowIso) - parse(lastBackupAt)`.
+ */
+export function backupDue(
+  frequency: SettingsV2["backupFrequency"],
+  lastBackupAt: string | null,
+  nowIso: string,
+): boolean {
+  if (frequency === "off") return false;
+  if (lastBackupAt === null) return true;
+
+  const elapsed = Date.parse(nowIso) - Date.parse(lastBackupAt);
+  // Unparseable last-backup (or now) → NaN elapsed: over-backup (self-heals on
+  // the next stamp). A future last-backup (negative elapsed, clock skew) → not due.
+  if (Number.isNaN(elapsed)) return true;
+  if (elapsed < 0) return false;
+
+  return frequency === "daily" ? elapsed >= DAY_MS : elapsed >= WEEK_MS;
+}
 
 /**
  * Current on-disk schema version for the subscriptions backup payload when
