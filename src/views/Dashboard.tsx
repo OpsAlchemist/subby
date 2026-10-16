@@ -32,7 +32,6 @@ import {
   Wallet,
   CalendarRange,
   ListChecks,
-  AlertTriangle,
   type LucideIcon,
 } from "lucide-react";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -54,6 +53,7 @@ import { getFxSnapshotSafe } from "@/api/subby";
 import CategoryColorDot from "@/components/CategoryColorDot";
 import CountUp from "@/components/CountUp";
 import Skeleton from "@/components/Skeleton";
+import StaleRateNote from "@/components/StaleRateNote";
 
 /** Number of upcoming days considered "renewing soon" on the dashboard (Req 8.4). */
 const RENEWAL_WINDOW_DAYS = 7;
@@ -494,24 +494,10 @@ export default function Dashboard(): JSX.Element {
                 nothing. Not shown when rates are unavailable (its own state). */}
             {!figures.errored && figures.confidence === "stale" && (
               <div className="mb-4">
-                <div
-                  role="note"
-                  tabIndex={0}
-                  className="flex w-full items-start gap-2 rounded-lg border border-border bg-card p-3 text-left text-sm"
-                >
-                  <AlertTriangle
-                    className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
-                    aria-hidden="true"
-                  />
-                  <span>
-                    These exchange rates are about{" "}
-                    {figures.months === 1
-                      ? "1 month"
-                      : `${figures.months} months`}{" "}
-                    old (as of {formatDate(figures.asOf)}). Converted totals may
-                    be out of date.
-                  </span>
-                </div>
+                <StaleRateNote
+                  months={figures.months}
+                  asOf={formatDate(figures.asOf)}
+                />
               </div>
             )}
 
