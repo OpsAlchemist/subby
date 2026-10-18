@@ -901,6 +901,11 @@ export function createAppContext(
       // never sees a torn file; the service itself is a single serial FX job.
       readFxOverride: () => storage.readFxOverride(),
       writeFxOverride: (override) => assembled.writeFxOverride(override),
+      // Story 9.1: the backfill-on-enable reads ALL subscriptions (lock-free
+      // snapshot) and maps each `website` → registrable domain to feed the
+      // existing serial queue. Forwarded to the assembled services like the
+      // other seams above.
+      listSubscriptions: () => assembled.listSubscriptions(),
     },
     blobCache,
     getWindow,

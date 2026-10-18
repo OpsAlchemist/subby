@@ -29,6 +29,7 @@
  */
 
 import type { BundledFxSnapshot, FxOverride } from "core/fxSnapshot";
+import { domainFromWebsite } from "core/logo";
 import type { OnlineSettingsV2, SettingsV2 } from "core/models/settings";
 
 import { NetworkGateError } from "../net/gateway";
@@ -62,6 +63,13 @@ export interface EnrichmentServices {
    * EnrichmentService is the SOLE writer. OPTIONAL (see {@link readFxOverride}).
    */
   writeFxOverride?(override: FxOverride): Promise<void>;
+  /**
+   * Read all subscriptions as a lock-free snapshot (Story 9.1) — the source for
+   * {@link EnrichmentService.backfillAllLogos}, which maps each `website` to a
+   * registrable domain and enqueues it. OPTIONAL so a logo-only test stub need
+   * not implement it; {@link EnrichmentService.backfillAllLogos} no-ops without it.
+   */
+  listSubscriptions?(): Promise<{ website: string }[]>;
 }
 
 /**
@@ -238,6 +246,46 @@ export class EnrichmentService {
     if (this.queue.includes(normalized)) return;
     this.queue.push(normalized);
     if (this.started) void this.drain();
+  }
+
+  /**
+   * Backfill logos for ALL currently-tracked subscriptions (Story 9.1). Reads the
+   * full subscription list, maps each free-text `website` to a registrable domain
+   * via {@link domainFromWebsite} (a `null`/unparseable domain is skipped), and
+   * feeds each non-null one through the EXISTING {@link enqueue} path — which
+   * de-dups, shape-gates via `normalizeDomainKey`, and leaves the worker's
+   * never-refetch `has()` + the gateway gate as the authorities (so a bundled or
+   * already-cached domain fetches nothing). It adds NO fetch/throttle/queue of its
+   * own; it just populates the single serial queue (AD-8).
+   *
+   * Called fire-and-forget from the `main.ts` `onSettingsMutated` hook when
+   * `liveLogoFetch` is on (the caller is the gate; the worker/gateway are the
+   * backstop). Safe before OR after {@link start} — {@link enqueue} already defers
+   * the drain until started (AD-28). A missing `listSubscriptions` dep (a logo-only
+   * test stub) makes this a no-op. Degrade-on-fault (AD-28): a `listSubscriptions`
+   * read throw is caught and swallowed — the backfill never crashes the event loop.
+   */
+  async backfillAllLogos(): Promise<void> {
+    if (this.stopped) return;
+    const listSubscriptions = this.services.listSubscriptions?.bind(
+      this.services,
+    );
+    if (listSubscriptions === undefined) return; // no subs source → no-op
+    try {
+      const subs = await listSubscriptions();
+      for (const sub of subs) {
+        const domain = domainFromWebsite(sub.website);
+        if (domain !== null) this.enqueue(domain); // de-dup + has() do the rest
+      }
+    } catch (err) {
+      // DEGRADE, never propagate (AD-28). A failed subs read must not crash the
+      // event loop; a local non-telemetry diagnostic is enough.
+      console.error(
+        `[subby] logo backfill degraded (caught, not thrown): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   /**

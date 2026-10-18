@@ -188,6 +188,16 @@ async function onSettingsMutated(): Promise<void> {
   if (onlineSettingsCache.fxRefresh && appContext !== null) {
     appContext.services.enqueueFxRefresh();
   }
+  // Story 9.1: when `liveLogoFetch` is on, backfill logos for EVERY existing
+  // subscription (not just rendered rows). Fire-and-forget off the hot path
+  // (AD-9) — the backfill reads all subs, maps each to a registrable domain, and
+  // feeds the SAME serial queue (de-dup + never-refetch `has()` do the rest), with
+  // results swapping in via the existing coalesced `evt:dataChanged`. The backfill
+  // is idempotent, so re-running on an unrelated settings change is harmless, but
+  // we gate on the toggle to skip a pointless `listSubscriptions` read.
+  if (onlineSettingsCache.liveLogoFetch && appContext !== null && enrichment !== null) {
+    void enrichment.backfillAllLogos();
+  }
 }
 
 /** Begin a genuine quit: stop intercepting window close, then quit the app. */

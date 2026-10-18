@@ -634,3 +634,214 @@ describe("FX refresh job (Story 8.6): gate, ≤24h cap, write + one broadcast, d
     expect(send).not.toHaveBeenCalled();
   });
 });
+
+// --- Story 9.1: backfill all existing subscriptions on enable ----------------
+
+/**
+ * `backfillAllLogos` reads EVERY subscription (not just rendered rows), maps each
+ * `website` → registrable domain via `domainFromWebsite`, and feeds the EXISTING
+ * `enqueue` path. It adds no fetch/queue of its own: the per-domain de-dup,
+ * `normalizeDomainKey` shape gate, and the worker's never-refetch `has()` + the
+ * gateway gate stay the authorities. These tests exercise the mapping/skip/de-dup
+ * behavior and the degrade-on-fault path through the real queue.
+ */
+describe("backfillAllLogos: enqueue every subscription's domain (Story 9.1)", () => {
+  /** EnrichmentServices with a mutable subs list + a mutable online toggle. */
+  function makeBackfillServices(
+    online: OnlineSettingsV2,
+    websites: string[],
+  ) {
+    const state = { online, websites };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    const listSubscriptions = vi.fn(async () =>
+      state.websites.map((website) => ({ website })),
+    );
+    const services: EnrichmentServices = { getSettings, listSubscriptions };
+    return { services, state, getSettings, listSubscriptions };
+  }
+
+  it("enqueues each distinct registrable domain once and fetches genuine misses", async () => {
+    const { services, listSubscriptions } = makeBackfillServices(LOGO_ON, [
+      "https://www.netflix.com/browse",
+      "music.youtube.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(listSubscriptions).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(3);
+    const fetched = writes.map((w) => w.domain).sort();
+    expect(fetched).toEqual(["netflix.com", "spotify.com", "youtube.com"]);
+    // Backfilled rows swap in through ONE coalesced broadcast (the final flush).
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips an empty/unparseable website (domainFromWebsite → null)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "", // empty
+      "not a url", // junk → no dot host
+      "acme", // dotless → null
+      "https://netflix.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // Only the one parseable website enqueued; the three nulls were skipped.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["netflix.com"]);
+  });
+
+  it("de-dups duplicate registrable domains across subs (fetched at most once)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://music.youtube.com",
+      "https://www.youtube.com/watch",
+      "youtube.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // All three map to youtube.com → the queue de-dup fetches it exactly once.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["youtube.com"]);
+  });
+
+  it("a bundled/cached domain is enqueued but the never-refetch has() fetches nothing", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://netflix.com", // already cached
+      "https://spotify.com", // a genuine miss
+    ]);
+    const { blobCache, writes, write } = makeBlobCache(["netflix.com"]);
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // netflix.com is already present → has() short-circuits, no fetch/write for it.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["spotify.com"]);
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+
+  it("an empty subscription list is a no-op (nothing enqueued, nothing fetched)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, []);
+    const { blobCache, has, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(has).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("a listSubscriptions read failure degrades silently (no throw, no fetch)", async () => {
+    const getSettings = vi.fn(async () => makeSettings(LOGO_ON));
+    const listSubscriptions = vi.fn(async () => {
+      throw new Error("storage read failed");
+    });
+    const services: EnrichmentServices = { getSettings, listSubscriptions };
+    const { blobCache, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    // Swallow the local non-telemetry diagnostic the degrade path logs.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    // Does not throw into the caller (fire-and-forget safe).
+    await expect(svc.backfillAllLogos()).resolves.toBeUndefined();
+    await svc.drain();
+
+    expect(write).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("no listSubscriptions dep (logo-only stub): backfill is a no-op", async () => {
+    const { services } = makeServices(LOGO_ON); // no listSubscriptions seam
+    const { blobCache, has, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await expect(svc.backfillAllLogos()).resolves.toBeUndefined();
+    await svc.drain();
+
+    expect(has).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("gate off at the worker (liveLogoFetch off): enqueued but gateway refuses, nothing cached", async () => {
+    // The main.ts caller gates on liveLogoFetch; the worker/gateway are the
+    // backstop. If backfill runs with the toggle off, the provider's NetworkGateError
+    // is an ordinary silent miss — nothing cached, no broadcast.
+    const { services } = makeBackfillServices(ALL_OFF, [
+      "https://netflix.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider: LogoProvider = vi.fn(async () => {
+      throw new NetworkGateError("blocked: t2.gstatic.com");
+    });
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(write).not.toHaveBeenCalled(); // gateway refused every job
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("safe to call before start(): enqueues defer, drain happens after start", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://netflix.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+
+    // Called BEFORE start() — enqueue defers the drain (AD-28); nothing fetched yet.
+    await svc.backfillAllLogos();
+    expect(provider).not.toHaveBeenCalled();
+
+    svc.start();
+    await svc.drain();
+
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(writes.map((w) => w.domain).sort()).toEqual(["netflix.com", "spotify.com"]);
+  });
+});
