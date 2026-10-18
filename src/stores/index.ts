@@ -18,17 +18,29 @@ import { onDataChanged, onError, toAppError } from "@/api/subby";
 import { subscriptionsStore } from "./subscriptionsStore";
 import { categoriesStore } from "./categoriesStore";
 import { settingsStore } from "./settingsStore";
+import { backupsStore } from "./backupsStore";
 import { errorStore } from "./errorStore";
 
 export { subscriptionsStore } from "./subscriptionsStore";
 export { categoriesStore } from "./categoriesStore";
 export { settingsStore } from "./settingsStore";
+export { backupsStore } from "./backupsStore";
 export { errorStore } from "./errorStore";
 export type { Store, StoreState } from "./createStore";
 export { createStore } from "./createStore";
 
-/** All data-backed stores reloaded together on a `onDataChanged` broadcast. */
-const allStores = [subscriptionsStore, categoriesStore, settingsStore] as const;
+/**
+ * All data-backed stores reloaded together on a `onDataChanged` broadcast. The
+ * `backupsStore` (Story 7.4) is included so the backup history refreshes
+ * automatically after a restore AND after the Story 7.3 "Back up now" action
+ * (both broadcast `evt:dataChanged`).
+ */
+const allStores = [
+  subscriptionsStore,
+  categoriesStore,
+  settingsStore,
+  backupsStore,
+] as const;
 
 /** Reload every data store. Errors are captured per-store (never thrown). */
 export function reloadAll(): Promise<void[]> {

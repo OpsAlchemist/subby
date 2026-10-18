@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -175,8 +175,13 @@ describe("collision-proof backups: pre-migration survives a same-minute backup (
     expect(afterMigration.length).toBe(1);
     const preMigrationName = afterMigration[0];
 
-    // The pre-migration backup is a faithful v1 snapshot.
-    const preMigrationBackup = await migrator.readBackup(preMigrationName);
+    // The pre-migration backup is a faithful v1 snapshot. Inspect the backup
+    // FILE ON DISK, not via `readBackup`: since Story 7.4, `readBackup`
+    // migrates-on-restore a `< current` backup, so it would return a v2 file —
+    // the raw bytes are the faithful v1 snapshot this assertion is about.
+    const preMigrationBackup = JSON.parse(
+      await readFile(join(userData, fileNames.backupDir, preMigrationName), "utf8"),
+    ) as { version: number; subscriptions: unknown[] };
     expect(preMigrationBackup.version).toBe(1);
     expect(preMigrationBackup.subscriptions).toEqual(v1Subs);
 
@@ -189,8 +194,11 @@ describe("collision-proof backups: pre-migration survives a same-minute backup (
     expect(all).toContain(preMigrationName);
     expect(all).toContain(scheduledName);
 
-    // The pre-migration backup still reads back as the untouched v1 snapshot.
-    const stillThere = await migrator.readBackup(preMigrationName);
+    // The pre-migration backup still reads back as the untouched v1 snapshot
+    // (inspected on disk — `readBackup` would migrate it, per the note above).
+    const stillThere = JSON.parse(
+      await readFile(join(userData, fileNames.backupDir, preMigrationName), "utf8"),
+    ) as { version: number; subscriptions: unknown[] };
     expect(stillThere.version).toBe(1);
     expect(stillThere.subscriptions).toEqual(v1Subs);
   });
@@ -232,7 +240,13 @@ describe("collision-proof backups: mixed old/new ordering + legacy restore (Req 
       v1Subscription({ id: "legacy-a", name: "Spotify" }),
       v1Subscription({ id: "legacy-b", name: "Disney+" }),
     ];
-    const payload = assembleBackupPayload(subs);
+    // A legacy backup written by a `current = 1`-era build is a genuine v1 file
+    // (`version: 1` + v1-shaped records). Seed it that way so the `current = 1`
+    // adapter's version-gated `readBackup` (Story 7.4) validates it with the v1
+    // schema and returns it unchanged — the `== current` branch. (The bare-array
+    // `assembleBackupPayload` helper always stamps the LIVE BACKUP_SCHEMA_VERSION
+    // (2), which would mismatch a v1-shaped record under a v1 adapter.)
+    const payload = { version: 1 as const, subscriptions: subs };
     await writeFile(
       join(userData, fileNames.backupDir, legacyName),
       JSON.stringify(payload, null, 2),
@@ -241,7 +255,7 @@ describe("collision-proof backups: mixed old/new ordering + legacy restore (Req 
 
     // It lists.
     expect(await storage.listBackups()).toContain(legacyName);
-    // It restores value-exact.
+    // It restores value-exact (validated at == current = 1, returned unchanged).
     const restored = await storage.readBackup(legacyName);
     expect(restored.version).toBe(payload.version);
     expect(restored.subscriptions).toEqual(subs);

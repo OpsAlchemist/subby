@@ -172,9 +172,12 @@ describe("migration barrier at injected current = 2 (load-bearing; migrates befo
     expect(settings.online).toEqual({ liveLogoFetch: false, fxRefresh: false });
 
     // A pre-migration backup of the RAW v1 subscriptions survives (AD-16).
+    // Inspect the backup FILE ON DISK: `readBackup` migrates-on-restore since
+    // Story 7.4, so it would hand back a v2 file — the raw bytes are the faithful
+    // v1 snapshot this assertion verifies.
     const backups = await migrator.listBackups();
     expect(backups.length).toBeGreaterThan(0);
-    const backup = await migrator.readBackup(backups[0]);
+    const backup = await readJson(join(userData, fileNames.backupDir, backups[0]));
     expect(backup.version).toBe(1);
     expect(backup.subscriptions).toEqual(v1Subs);
   });

@@ -1099,35 +1099,100 @@ export class JsonFileStorage implements StoragePort {
   }
 
   /**
-   * Read and validate a backup file, returning its {@link SubscriptionsFile}
-   * (Req 18.2). The name is reduced to its base name to prevent path traversal
-   * outside the `backup/` directory.
+   * Read and validate a backup file, returning a current-version
+   * {@link SubscriptionsFileV2} ready to be written back (Req 18.2, AD-16). The
+   * name is reduced to its base name to prevent path traversal outside the
+   * `backup/` directory.
+   *
+   * **Migrate-on-restore (AD-16, the data-corruption fix).** This is version-
+   * gated EXACTLY like the main read path ({@link readVersioned}): it detects the
+   * backup's own on-disk `version` and branches —
+   *
+   *   - `== current` → validate against the current-version schema
+   *     (`subscriptionsFileV2Schema` when `current >= 2`, else the v1 schema for
+   *     a `current = 1` adapter) and return it unchanged.
+   *   - `< current`  → validate the RAW file against the shape for ITS OWN
+   *     version (`subscriptionsFileSchema` for v1), run the pure
+   *     `core/migrations.migrate(raw, fromVersion)` to produce a genuine
+   *     `SubscriptionsFileV2` (so a v1 backup's major `amount` becomes integer
+   *     `amountMinor` via the EXISTING `migrateSubscriptionsFileV1toV2` — never a
+   *     hand-rolled conversion), then validate the MIGRATED result against the v2
+   *     schema and return THAT. The value handed back to `restoreBackup` is
+   *     therefore ALWAYS a v2-schema-valid set, so the post-restore
+   *     `readSubscriptions` can never classify the live file corrupt.
+   *   - `> current`  → REFUSE with {@link StorageNewerVersionError}, mirroring
+   *     the read path's newer-than-current refusal (never downgraded, never
+   *     mis-read); the handler maps it to a restore failure → toast.
+   *
+   * The missing ("Backup not found") and corrupt/malformed
+   * ({@link StorageCorruptError}) loud failures are preserved: a corrupt backup
+   * is NOT silently skipped. Version detection goes through
+   * {@link safeReadVersionedJson} so a missing/malformed classification is kept
+   * (schema validation at the chosen version is done here and raises a
+   * `corrupt` {@link StorageCorruptError}). `restoreBackup` needs NO change — the
+   * method still returns a `SubscriptionsFileV2`.
    */
   async readBackup(name: string): Promise<SubscriptionsFileV2> {
     await this.ensureTree();
     const safeName = basename(name);
     const file = join(this.backupDir, safeName);
-    // A backup may be a v2 snapshot (the live format) OR a v1 snapshot — the
-    // pre-migration backup is a faithful RAW v1 file (AD-16), and legacy backups
-    // predate the cutover. Accept EITHER shape so a round-trip stays valid and a
-    // pre-migration v1 backup still reads back as its untouched v1 version; the
-    // caller's write-back re-stamps at the current version. The parsed value is
-    // typed as the port's `SubscriptionsFileV2` (its structural subset is enough
-    // for `restoreBackup`, which reads only `version` + `subscriptions`).
-    const result = await safeReadJson(file, (data) => {
-      const v2 = subscriptionsFileV2Schema.safeParse(data);
-      if (v2.success) return v2.data as unknown as SubscriptionsFileV2;
-      return subscriptionsFileSchema.parse(data) as unknown as SubscriptionsFileV2;
-    });
 
-    if (result.ok) {
-      return result.value;
+    const detected = await safeReadVersionedJson(file);
+
+    if (!detected.ok) {
+      if (detected.reason === "missing") {
+        throw new Error(`Backup not found: ${safeName}`);
+      }
+      // Not valid JSON / not an object / no usable version → corrupt. A corrupt
+      // backup cannot itself be restored from another backup.
+      throw new StorageCorruptError(safeName, detected.reason, false);
     }
-    if (result.reason === "missing") {
-      throw new Error(`Backup not found: ${safeName}`);
+
+    const { value, version } = detected;
+
+    // `> current`: refuse a newer-than-this-build backup, exactly like the main
+    // read path — never downgrade, never mis-read.
+    if (version > this.current) {
+      throw new StorageNewerVersionError(safeName, version, this.current);
     }
-    // A corrupt backup cannot itself be restored from another backup.
-    throw new StorageCorruptError(safeName, result.reason, false);
+
+    // `== current`: validate at the current version and return unchanged. A
+    // `current = 1` adapter validates with the v1 schema (and the method's
+    // structural `SubscriptionsFileV2` return type is a benign superset for the
+    // read-only `version` + `subscriptions` the caller uses); `current >= 2`
+    // validates with the v2 schema.
+    if (version === this.current) {
+      try {
+        return this.current >= 2
+          ? subscriptionsFileV2Schema.parse(value)
+          : (subscriptionsFileSchema.parse(value) as unknown as SubscriptionsFileV2);
+      } catch {
+        throw new StorageCorruptError(safeName, "corrupt", false);
+      }
+    }
+
+    // `< current`: migrate-on-restore. Validate the RAW file against its OWN
+    // version's shape (v1), run the pure migrator to the current version, then
+    // re-validate the migrated result against the v2 schema before returning it.
+    try {
+      // Validate the raw backup against its own-version shape first (a v1 file
+      // against the v1 schema) so a corrupt v1 backup fails loudly here rather
+      // than inside the migrator.
+      subscriptionsFileSchema.parse(value);
+      const migrated = migrate(
+        value as unknown as Parameters<typeof migrate>[0],
+        version,
+      ) as unknown as SubscriptionsFileV2;
+      // Re-assert the migrated result is a schema-valid v2 set — the adapter's
+      // "only ever hand back a schema-valid file" guarantee, independent of the
+      // migrator's own internal validation.
+      return subscriptionsFileV2Schema.parse(migrated);
+    } catch {
+      // A raw-shape mismatch, a migration failure, or a post-migration validation
+      // failure all mean the backup cannot be safely restored: surface the same
+      // loud corrupt failure (never a silent/partial restore).
+      throw new StorageCorruptError(safeName, "corrupt", false);
+    }
   }
 
   // --- Data folder (Req 15.3) ------------------------------------------------

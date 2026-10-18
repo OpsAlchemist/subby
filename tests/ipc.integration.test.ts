@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,6 +29,7 @@ vi.mock("electron", () => ({
 
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
+import { fileNames } from "../electron/storage/paths";
 import { parsePriceSeed, type PriceSeed } from "core/priceSeed";
 import { parseBundledSnapshot, type BundledFxSnapshot } from "core/fxSnapshot";
 import { DEFAULT_SETTINGS, DEFAULT_SETTINGS_V2 } from "core/models/schema";
@@ -443,6 +444,81 @@ describe("AppServices backup list / restore round-trips (Req 18.2)", () => {
     expect(restored.map((s) => s.id).sort()).toEqual(["a", "b"]);
     const listed = await services.listSubscriptions();
     expect(listed.map((s) => s.id).sort()).toEqual(["a", "b"]);
+  });
+
+  it("restoreBackup of a v1 backup migrates it to v2 end-to-end — follow-up read is clean, no corruption (Story 7.4)", async () => {
+    // Seed CURRENT (v2) data so a pre-restore backup is distinguishable, then
+    // seed a genuine RAW v1 backup on disk (major `amount`) — the exact file the
+    // old `readBackup` would have restored un-migrated, corrupting the live file.
+    await storage.writeSubscriptions([makeSubscription({ id: "current", name: "Current" })]);
+    await storage.ensureTree();
+
+    const v1BackupName = "2025-03-07-09-05-42-137-0000.json";
+    await writeFile(
+      join(userData, fileNames.backupDir, v1BackupName),
+      JSON.stringify({
+        version: 1,
+        subscriptions: [
+          {
+            id: "legacy",
+            name: "Spotify",
+            provider: "Spotify AB",
+            category: "Music",
+            amount: 9.99, // v1 MAJOR float — must become amountMinor: 999
+            currency: "USD",
+            billingCycle: "Monthly",
+            nextRenewal: "2025-02-01",
+            startDate: "2024-01-01",
+            paymentMethod: "Card",
+            website: "https://spotify.com",
+            notes: "",
+            color: "#1DB954",
+            icon: "spotify",
+            isActive: true,
+            autoRenew: true,
+            createdAt: "2024-01-01T00:00:00.000Z",
+            updatedAt: "2024-01-01T00:00:00.000Z",
+          },
+        ],
+      }),
+      "utf8",
+    );
+
+    const backupsBefore = await services.listBackups();
+
+    // Restore the v1 backup: it is migrated v1→v2 (amount 9.99 USD → 999 minor)
+    // and written back as a valid v2 set.
+    const restored = await services.restoreBackup(v1BackupName);
+    expect(restored).toHaveLength(1);
+    expect(restored[0]).toMatchObject({
+      id: "legacy",
+      amountMinor: 999,
+      currency: "USD",
+      state: "Active",
+    });
+
+    // THE no-corruption proof: a follow-up read succeeds (does NOT throw a
+    // corrupt error) and reflects the migrated set exactly.
+    const listed = await services.listSubscriptions();
+    expect(listed).toEqual(restored);
+
+    // The on-disk live file is a genuine v2 file (version 2 + integer amountMinor).
+    const liveRaw = JSON.parse(
+      await readFile(join(userData, fileNames.subscriptions), "utf8"),
+    ) as { version: number; subscriptions: Array<Record<string, unknown>> };
+    expect(liveRaw.version).toBe(2);
+    expect(liveRaw.subscriptions[0]).toMatchObject({ amountMinor: 999 });
+
+    // A pre-restore backup of CURRENT data was taken FIRST (reversible) and now
+    // appears in the history (one more backup than before, capturing "current").
+    const backupsAfter = await services.listBackups();
+    expect(backupsAfter.length).toBe(backupsBefore.length + 1);
+    const newest = backupsAfter[0]; // newest = the pre-restore backup
+    expect(newest).not.toBe(v1BackupName);
+    const preRestore = JSON.parse(
+      await readFile(join(userData, fileNames.backupDir, newest), "utf8"),
+    ) as { subscriptions: Array<Record<string, unknown>> };
+    expect(preRestore.subscriptions.map((s) => s.id)).toEqual(["current"]);
   });
 });
 

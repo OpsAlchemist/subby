@@ -21,6 +21,7 @@ import {
   subscriptionsStore,
   categoriesStore,
   settingsStore,
+  backupsStore,
   errorStore,
 } from "@/stores";
 
@@ -59,6 +60,7 @@ interface FakeApi extends SubbyApi {
     subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsModel;
+    backups: string[];
   };
   dataChangedListeners: Array<() => void>;
 }
@@ -112,6 +114,9 @@ function createFakeApi(): FakeApi {
         makeCategory({ id: "cat-2", name: "Music" }),
       ],
       settings: { ...DEFAULT_SETTINGS_V2 },
+      // A populated backup history so the Settings axe scan covers the Story 7.4
+      // history list (one well-formed name + one foreign/raw-fallback name).
+      backups: ["2026-03-07-09-05-42-137-0000.json", "legacy-export.json"],
     },
     dataChangedListeners: [],
 
@@ -142,7 +147,7 @@ function createFakeApi(): FakeApi {
 
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
-    listBackups: () => ok<string[]>([]),
+    listBackups: () => ok<string[]>(fake.state.backups),
     restoreBackup: () => ok(fake.state.subscriptions),
     createBackup: () => ok("2026-01-01-00-00-00-000.json"),
 
@@ -197,6 +202,7 @@ async function seedStores(): Promise<void> {
   await waitFor(() => {
     expect(settingsStore.getSnapshot().loaded).toBe(true);
     expect(subscriptionsStore.getSnapshot().loaded).toBe(true);
+    expect(backupsStore.getSnapshot().loaded).toBe(true);
   });
 }
 
@@ -229,6 +235,7 @@ afterEach(() => {
   subscriptionsStore.reset();
   categoriesStore.reset();
   settingsStore.reset();
+  backupsStore.reset();
   errorStore.clear();
 });
 
@@ -251,6 +258,23 @@ describe("Accessibility: automated axe scans (Req 22.1, 22.3)", () => {
   it("Settings has no serious/critical violations", async () => {
     const { container } = render(<Settings />);
     await screen.findByLabelText("Theme");
+    const violations = await seriousViolations(container);
+    expect(violations, describeViolations(violations)).toEqual([]);
+  });
+
+  it("the Backups history + open restore dialog is axe-clean (Story 7.4)", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<Settings />);
+    // The populated history renders (seeded with two backups above).
+    const list = await screen.findByRole("list", { name: "Backup history" });
+    expect(within(list).getAllByRole("listitem").length).toBe(2);
+
+    // Open the branded restore confirm dialog and scan with it mounted.
+    await user.click(
+      within(list).getAllByRole("button", { name: /restore backup from/i })[0],
+    );
+    await screen.findByRole("alertdialog");
+
     const violations = await seriousViolations(container);
     expect(violations, describeViolations(violations)).toEqual([]);
   });

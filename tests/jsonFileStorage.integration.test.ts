@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   JsonFileStorage,
   StorageCorruptError,
+  StorageNewerVersionError,
   isStorageCorruptError,
 } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
@@ -67,6 +68,35 @@ function makeSubscription(overrides: Partial<Subscription> = {}): Subscription {
     color: "#E50914",
     icon: "netflix",
     isActive: true,
+    autoRenew: true,
+    createdAt: "2024-01-01T00:00:00.000Z",
+    updatedAt: "2024-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+/** Build a complete, schema-valid v2 subscription (Story 7.4 round-trip). */
+function makeV2Subscription(
+  overrides: Partial<SubscriptionV2> = {},
+): SubscriptionV2 {
+  return {
+    id: "sub-1",
+    name: "Netflix",
+    provider: "Netflix Inc.",
+    category: "Streaming",
+    amountMinor: 49900,
+    currency: "INR",
+    billingCycle: "Monthly",
+    nextRenewal: "2025-02-01",
+    startDate: "2024-01-01",
+    paymentMethod: "Card",
+    website: "https://netflix.com",
+    notes: "",
+    color: "#E50914",
+    icon: "netflix",
+    state: "Active",
+    priceHistory: [],
+    tags: [],
     autoRenew: true,
     createdAt: "2024-01-01T00:00:00.000Z",
     updatedAt: "2024-01-01T00:00:00.000Z",
@@ -339,19 +369,107 @@ describe("JsonFileStorage corrupt-file recovery (Req 19.2)", () => {
 
 describe("JsonFileStorage backup round-trip (Req 18.1, 18.2)", () => {
   it("writeSubscriptions -> createBackup -> listBackups -> readBackup reproduces the data", async () => {
-    const subs = [
-      makeSubscription({ id: "sub-1", name: "Netflix" }),
-      makeSubscription({ id: "sub-2", name: "Spotify", category: "Music" }),
+    // Round-trip at the LIVE schema version (`current = 2`, as production runs):
+    // genuine v2 records → `createBackup` stamps `version: 2` → the version-gated
+    // `readBackup` (Story 7.4) takes the `== current` branch, validates with the
+    // v2 schema, and returns the set unchanged. (A `current = 1` round-trip is
+    // internally inconsistent — the bare-array `assembleBackupPayload` always
+    // stamps the LIVE BACKUP_SCHEMA_VERSION (2) over the v1-shaped records — which
+    // is exactly the mixed-shape the fixed `readBackup` now refuses to mis-read.)
+    const v2Storage = new JsonFileStorage(userData, null, 2);
+    const subs: SubscriptionV2[] = [
+      makeV2Subscription({ id: "sub-1", name: "Netflix" }),
+      makeV2Subscription({ id: "sub-2", name: "Spotify", category: "Music" }),
     ];
-    await storage.writeSubscriptions(subs as unknown as SubscriptionV2[]);
+    await v2Storage.writeSubscriptions(subs);
 
-    const backupName = await storage.createBackup("test-backup");
+    const backupName = await v2Storage.createBackup("test-backup");
     expect(backupName).toMatch(/\.json$/);
 
-    const backups = await storage.listBackups();
+    const backups = await v2Storage.listBackups();
     expect(backups).toContain(backupName);
 
-    const restored = await storage.readBackup(backupName);
+    const restored = await v2Storage.readBackup(backupName);
+    expect(restored.version).toBe(2);
     expect(restored.subscriptions).toEqual(subs);
+  });
+
+  it("readBackup MIGRATES a v1 backup to v2 (migrate-on-restore) — no corruption (Story 7.4)", async () => {
+    // Seed a genuine RAW v1 backup on disk (`version: 1` + a major `amount`) —
+    // the data-corruption bug's trigger. Written directly rather than via
+    // `createBackup`, whose bare-array `assembleBackupPayload` always stamps the
+    // LIVE BACKUP_SCHEMA_VERSION (2); a true v1 pre-migration backup is a
+    // version-preserving snapshot of a `{ version: 1, ... }` file.
+    const migrator = new JsonFileStorage(userData, null, 2);
+    await migrator.ensureTree();
+    const v1BackupName = "2025-03-07-09-05-42-137-0000.json";
+    await writeFile(
+      join(userData, fileNames.backupDir, v1BackupName),
+      JSON.stringify({
+        version: 1,
+        subscriptions: [
+          makeSubscription({ id: "a", name: "Netflix", amount: 9.99, currency: "USD" }),
+        ],
+      }),
+      "utf8",
+    );
+    // Confirm the on-disk backup is genuinely v1-shaped before reading it back.
+    const rawBackup = JSON.parse(
+      await readFile(join(userData, fileNames.backupDir, v1BackupName), "utf8"),
+    ) as { version: number; subscriptions: Array<Record<string, unknown>> };
+    expect(rawBackup.version).toBe(1);
+    expect(rawBackup.subscriptions[0]).toMatchObject({ amount: 9.99 });
+
+    // Read it through a `current = 2` adapter: `readBackup` runs it through the
+    // REAL `core/migrations` path (v1 `amount: 9.99` USD → integer
+    // `amountMinor: 999`) and returns a validated v2 file.
+    const restored = await migrator.readBackup(v1BackupName);
+    expect(restored.version).toBe(2);
+    expect(restored.subscriptions).toHaveLength(1);
+    expect(restored.subscriptions[0]).toMatchObject({
+      id: "a",
+      amountMinor: 999, // 9.99 USD (exp 2), via migrateSubscriptionsFileV1toV2
+      currency: "USD",
+      state: "Active",
+    });
+
+    // The migrated set is v2-schema-valid, so writing it back and re-reading it
+    // succeeds (NOT corrupt) — the end-to-end no-corruption proof.
+    await migrator.writeSubscriptions(restored.subscriptions);
+    const reread = await migrator.readSubscriptions();
+    expect(reread).toEqual(restored.subscriptions);
+  });
+
+  it("readBackup REFUSES a backup newer than current (Story 7.4)", async () => {
+    const storage2 = new JsonFileStorage(userData, null, 2);
+    await storage2.ensureTree();
+    const name = "2030-01-01-00-00-00-000-0000.json";
+    await writeFile(
+      join(userData, fileNames.backupDir, name),
+      JSON.stringify({ version: 3, subscriptions: [] }),
+      "utf8",
+    );
+    await expect(storage2.readBackup(name)).rejects.toBeInstanceOf(
+      StorageNewerVersionError,
+    );
+  });
+
+  it("readBackup preserves the loud missing + corrupt failures (Story 7.4)", async () => {
+    const storage2 = new JsonFileStorage(userData, null, 2);
+    await storage2.ensureTree();
+    // Missing → "Backup not found".
+    await expect(storage2.readBackup("nope.json")).rejects.toThrow(
+      /Backup not found/,
+    );
+    // Corrupt (malformed JSON) → StorageCorruptError.
+    const corruptName = "2029-01-01-00-00-00-000-0000.json";
+    await writeFile(
+      join(userData, fileNames.backupDir, corruptName),
+      "{not json",
+      "utf8",
+    );
+    await expect(storage2.readBackup(corruptName)).rejects.toBeInstanceOf(
+      StorageCorruptError,
+    );
   });
 });

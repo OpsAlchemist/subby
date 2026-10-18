@@ -11,6 +11,7 @@ import {
   subscriptionsStore,
   categoriesStore,
   settingsStore,
+  backupsStore,
   errorStore,
 } from "@/stores";
 
@@ -52,6 +53,7 @@ interface FakeApi extends SubbyApi {
     subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsV2;
+    backups: string[];
   };
   /** When set, the corresponding `list`/`get` resolves to a failure result. */
   failures: {
@@ -103,6 +105,7 @@ function createFakeApi(): FakeApi {
       subscriptions: [makeSubscription({ id: "sub-1", name: "Netflix" })],
       categories: [makeCategory({ id: "cat-1", name: "Streaming" })],
       settings: { ...DEFAULT_SETTINGS_V2 },
+      backups: [],
     },
     failures: { subscriptions: null, categories: null, settings: null },
     dataChangedListeners: [],
@@ -153,7 +156,7 @@ function createFakeApi(): FakeApi {
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
-    listBackups: () => ok<string[]>([]),
+    listBackups: () => ok<string[]>(fake.state.backups),
     restoreBackup: () => ok(fake.state.subscriptions),
     createBackup: () => ok("2026-01-01-00-00-00-000.json"),
 
@@ -202,6 +205,7 @@ afterEach(() => {
   subscriptionsStore.reset();
   categoriesStore.reset();
   settingsStore.reset();
+  backupsStore.reset();
   errorStore.clear();
 });
 
@@ -272,6 +276,24 @@ describe("onDataChanged reactivity (Req 8.6)", () => {
     unsubscribe();
     // load() emits at least once (loading=true) then again on completion.
     expect(notifications).toBeGreaterThan(0);
+  });
+
+  it("reloads the backupsStore on onDataChanged (restore/back-up refreshes history, Story 7.4)", async () => {
+    teardown = initStores();
+    await waitUntil(() => backupsStore.getSnapshot().loaded);
+
+    // Initial: empty history.
+    expect(backupsStore.getSnapshot().data).toEqual([]);
+
+    // A restore / "Back up now" wrote a backup, then broadcasts the change.
+    fake.state.backups = [
+      "2026-03-07-09-05-42-137-0000.json",
+      "2026-03-06-08-00-00-000-0000.json",
+    ];
+    fake.emitDataChanged();
+
+    await waitUntil(() => backupsStore.getSnapshot().data.length === 2);
+    expect(backupsStore.getSnapshot().data).toEqual(fake.state.backups);
   });
 });
 

@@ -179,6 +179,91 @@ export function backupFileName(
 }
 
 /**
+ * Parse a backup file name back to the ISO instant it was stamped with (Story
+ * 7.4). This is the **display inverse** of {@link backupFileName}: that function
+ * formats UTC components into the collision-proof name; this one reads the
+ * leading UTC components back out so the renderer can show a human,
+ * locale-formatted time instead of a raw file name.
+ *
+ * Format accepted (strip `.json` first), matched from the start of the name:
+ *   - the required minute-granularity prefix `YYYY-MM-DD-HH-MM`, and
+ *   - optionally `-SS-mmm` (seconds + milliseconds) and then an optional
+ *     trailing `-SSSS` sequence counter — BOTH ignored for the instant beyond
+ *     the seconds/millis they carry (the `seq` tie-breaker contributes nothing
+ *     to the time and is discarded).
+ *
+ * A legacy minute-granularity name (`YYYY-MM-DD-HH-MM.json`, from before the
+ * collision-proof format shipped) still parses — its seconds and millis default
+ * to `0`. A name that does not match the required prefix (a foreign/truncated
+ * name) returns `null`, so the caller can fall back to showing the raw name.
+ *
+ * Purity (AD-1): this reads **no** clock. The instant is built from the parsed
+ * integer components via {@link Date.UTC} (NOT an argless `new Date()`), so it is
+ * deterministic and host-time-zone-independent — the exact mirror of
+ * `backupFileName`'s `getUTC*` accessors. Returns `null` when a required
+ * component is missing/NaN or the assembled date is Invalid (`NaN` time).
+ *
+ * @param name A backup file name (with or without a leading directory stripped;
+ *             the caller passes the bare name from `listBackups`).
+ * @returns The ISO instant string (e.g. `2025-03-07T09:05:42.137Z`), or `null`
+ *          for a name this parser cannot interpret.
+ */
+export function backupTimestamp(name: string): string | null {
+  // Strip a single trailing `.json` (case-insensitive) if present.
+  const base = name.replace(/\.json$/i, "");
+  // Required leading `YYYY-MM-DD-HH-MM`; optional `-SS-mmm`; optional `-SSSS`.
+  // Anchored at the start AND end so only a well-formed name matches (a foreign
+  // name with extra, non-conforming trailing segments returns null rather than
+  // silently parsing a wrong instant).
+  const match = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})(?:-(\d{2})-(\d{3})(?:-(\d{4}))?)?$/.exec(
+    base,
+  );
+  if (match === null) {
+    return null;
+  }
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  // Seconds + millis default to 0 for a legacy minute-granularity name. The
+  // trailing `seq` (match[8]) is intentionally ignored — it is a filename
+  // tie-breaker, not part of the instant.
+  const second = match[6] !== undefined ? Number(match[6]) : 0;
+  const millis = match[7] !== undefined ? Number(match[7]) : 0;
+
+  // Build the instant from the integer components in UTC (never an argless
+  // `new Date()`), mirroring `backupFileName`'s `getUTC*` accessors.
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute, second, millis);
+  if (Number.isNaN(utcMs)) {
+    return null;
+  }
+
+  // Reject an OUT-OF-RANGE but width-correct component (month 13, day 32, hour
+  // 25, minute 61, …). `Date.UTC` SILENTLY ROLLS such a value over to a valid
+  // instant (month 13 → the next January, hour 25 → the next day), which would
+  // surface a confidently-WRONG date in the history row AND the destructive
+  // restore-confirm dialog. A wrong instant is worse than `null` (which falls
+  // back to showing the raw name), so verify the assembled instant round-trips:
+  // if any UTC component differs from the parsed input, a rollover happened →
+  // the name is not a well-formed timestamp → return null.
+  const d = new Date(utcMs);
+  const roundTrips =
+    d.getUTCFullYear() === year &&
+    d.getUTCMonth() === month - 1 &&
+    d.getUTCDate() === day &&
+    d.getUTCHours() === hour &&
+    d.getUTCMinutes() === minute &&
+    d.getUTCSeconds() === second &&
+    d.getUTCMilliseconds() === millis;
+  if (!roundTrips) {
+    return null;
+  }
+  return d.toISOString();
+}
+
+/**
  * Assemble the restore/backup payload to be written to disk (Req 18.1).
  *
  * Pure helper: given the current subscriptions (or an existing

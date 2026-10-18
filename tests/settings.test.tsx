@@ -24,9 +24,11 @@ import {
   subscriptionsStore,
   categoriesStore,
   settingsStore,
+  backupsStore,
   errorStore,
 } from "@/stores";
 
+import { backupTimestamp } from "core/backup";
 import type { SettingsV2 as SettingsModel } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
 import type { Category } from "core/models/category";
@@ -81,11 +83,15 @@ interface FakeApi extends SubbyApi {
   updateSpy: ReturnType<typeof vi.fn>;
   chooseFolderSpy: ReturnType<typeof vi.fn>;
   createBackupSpy: ReturnType<typeof vi.fn>;
+  restoreBackupSpy: ReturnType<typeof vi.fn>;
   state: {
     subscriptions: SubscriptionV2[];
     categories: Category[];
     settings: SettingsModel;
+    backups: string[];
   };
+  dataChangedListeners: Array<() => void>;
+  emitDataChanged(): void;
 }
 
 function makeCategory(overrides: Partial<Category> = {}): Category {
@@ -103,15 +109,24 @@ function createFakeApi(): FakeApi {
   // "Back up now" (Story 7.3): resolves with a backup name by default; a test
   // overrides it to a rejected IpcResult to exercise the error→toast path.
   const createBackupSpy = vi.fn(() => ok<string>("2026-01-01-00-00-00-000.json"));
+  // Restore (Story 7.4): resolves with the restored subscriptions by default; a
+  // test overrides it to a rejected IpcResult to exercise the error→toast path.
+  const restoreBackupSpy = vi.fn(() => ok<SubscriptionV2[]>(fake.state.subscriptions));
 
   const fake: FakeApi = {
     updateSpy,
     chooseFolderSpy,
     createBackupSpy,
+    restoreBackupSpy,
     state: {
       subscriptions: [],
       categories: [makeCategory()],
       settings: { ...KNOWN_SETTINGS },
+      backups: [],
+    },
+    dataChangedListeners: [],
+    emitDataChanged() {
+      for (const cb of fake.dataChangedListeners) cb();
     },
 
     // --- Subscriptions ---
@@ -147,12 +162,19 @@ function createFakeApi(): FakeApi {
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
-    listBackups: () => ok<string[]>([]),
-    restoreBackup: () => ok(fake.state.subscriptions),
+    listBackups: () => ok<string[]>(fake.state.backups),
+    restoreBackup: restoreBackupSpy as SubbyApi["restoreBackup"],
     createBackup: createBackupSpy as SubbyApi["createBackup"],
 
-    // --- Events (no-op subscriptions for these tests) ---
-    onDataChanged: (): Unsubscribe => () => {},
+    // --- Events: capture onDataChanged so a test can refresh the stores ---
+    onDataChanged(cb: () => void): Unsubscribe {
+      fake.dataChangedListeners.push(cb);
+      return () => {
+        fake.dataChangedListeners = fake.dataChangedListeners.filter(
+          (c) => c !== cb,
+        );
+      };
+    },
     onError: (): Unsubscribe => () => {},
   };
 
@@ -164,13 +186,19 @@ function createFakeApi(): FakeApi {
 let fake: FakeApi;
 let teardown: () => void;
 
-/** Install the fake, populate the stores, and wait until settings load. */
-async function seedStores(): Promise<void> {
+/**
+ * Install the fake, populate the stores, and wait until settings + backups load.
+ * `backups` optionally pre-seeds the fake's backup history BEFORE the stores load
+ * so the Backups history list renders with content on first paint.
+ */
+async function seedStores(backups: string[] = []): Promise<void> {
   fake = createFakeApi();
+  fake.state.backups = backups;
   setSubby(fake);
   teardown = initStores();
   await waitFor(() => {
     expect(settingsStore.getSnapshot().loaded).toBe(true);
+    expect(backupsStore.getSnapshot().loaded).toBe(true);
   });
 }
 
@@ -185,6 +213,7 @@ afterEach(() => {
   subscriptionsStore.reset();
   categoriesStore.reset();
   settingsStore.reset();
+  backupsStore.reset();
   errorStore.clear();
 });
 
@@ -367,6 +396,142 @@ describe("Backups section: 'Back up now' + 'Last backup' (Story 7.3)", () => {
     expect(
       within(region).getByText(new Date(stamp).toLocaleString()),
     ).toBeInTheDocument();
+  });
+});
+
+// --- Backup history list + branded restore (Story 7.4) ------------------------
+
+describe("Backups section: history list + branded restore (Story 7.4)", () => {
+  // Two well-formed names (newest-first as the adapter returns them) + one
+  // foreign name that `backupTimestamp` cannot parse (must fall back to raw).
+  const NEWER = "2026-03-07-09-05-42-137-0000.json";
+  const OLDER = "2026-03-06-08-00-00-000-0000.json";
+  const FOREIGN = "legacy-export.json";
+
+  async function seedWithBackups(names: string[]): Promise<void> {
+    cleanup();
+    teardown?.();
+    subscriptionsStore.reset();
+    categoriesStore.reset();
+    settingsStore.reset();
+    backupsStore.reset();
+    errorStore.clear();
+    await seedStores(names);
+  }
+
+  it("shows 'No backups yet' when the history is empty", async () => {
+    render(<Settings />); // default seed = no backups
+    const region = await screen.findByRole("region", { name: "Backups" });
+    expect(within(region).getByText("No backups yet")).toBeInTheDocument();
+    expect(within(region).queryByRole("button", { name: /restore/i })).toBeNull();
+  });
+
+  it("renders the history newest-first with formatted times; a foreign name falls back to raw", async () => {
+    await seedWithBackups([NEWER, OLDER, FOREIGN]);
+    render(<Settings />);
+    const list = await screen.findByRole("list", { name: "Backup history" });
+
+    const items = within(list).getAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    // Newest-first order is preserved from the adapter's sort.
+    expect(within(items[0]).getByText(new Date(backupTimestamp(NEWER)!).toLocaleString())).toBeInTheDocument();
+    expect(within(items[1]).getByText(new Date(backupTimestamp(OLDER)!).toLocaleString())).toBeInTheDocument();
+    // A foreign name shows its raw name (still restorable).
+    expect(within(items[2]).getByText(FOREIGN)).toBeInTheDocument();
+  });
+
+  it("clicking Restore opens the branded dialog (cancel is the focus default); Cancel runs NO restore", async () => {
+    const user = userEvent.setup();
+    await seedWithBackups([NEWER]);
+    render(<Settings />);
+
+    const restoreBtn = await screen.findByRole("button", {
+      name: /restore backup from/i,
+    });
+    await user.click(restoreBtn);
+
+    // A branded alertdialog (NOT window.confirm) names the impact + the safety.
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText(/Replace all current subscriptions/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/backed up first so you can undo this/i)).toBeInTheDocument();
+
+    // Cancel is the focus default (an accidental Enter cancels, never restores).
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+
+    await user.click(cancel);
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(fake.restoreBackupSpy).not.toHaveBeenCalled();
+  });
+
+  it("Escape cancels the dialog and runs NO restore", async () => {
+    const user = userEvent.setup();
+    await seedWithBackups([NEWER]);
+    render(<Settings />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /restore backup from/i }),
+    );
+    await screen.findByRole("alertdialog");
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(fake.restoreBackupSpy).not.toHaveBeenCalled();
+  });
+
+  it("confirming calls dataApi.restoreBackup(name) with the chosen backup", async () => {
+    const user = userEvent.setup();
+    await seedWithBackups([NEWER]);
+    render(<Settings />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /restore backup from/i }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+
+    await waitFor(() => expect(fake.restoreBackupSpy).toHaveBeenCalledTimes(1));
+    expect(fake.restoreBackupSpy).toHaveBeenCalledWith(NEWER);
+    // The dialog closes after a successful restore.
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  });
+
+  it("routes a restore failure to the global toast (no crash)", async () => {
+    const user = userEvent.setup();
+    await seedWithBackups([NEWER]);
+    fake.restoreBackupSpy.mockImplementationOnce(() =>
+      fail<SubscriptionV2[]>("restore failed"),
+    );
+    render(<Settings />);
+
+    await user.click(
+      await screen.findByRole("button", { name: /restore backup from/i }),
+    );
+    const dialog = await screen.findByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+
+    await waitFor(() =>
+      expect(errorStore.getSnapshot().latest?.message).toBe("restore failed"),
+    );
+  });
+
+  it("refreshes the history after a new backup via the onDataChanged broadcast", async () => {
+    await seedWithBackups([OLDER]);
+    render(<Settings />);
+    const list = await screen.findByRole("list", { name: "Backup history" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(1);
+
+    // A "Back up now" wrote a new backup, then the handler broadcasts the change.
+    fake.state.backups = [NEWER, OLDER];
+    fake.emitDataChanged();
+
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("list", { name: "Backup history" })).getAllByRole(
+          "listitem",
+        ),
+      ).toHaveLength(2),
+    );
   });
 });
 

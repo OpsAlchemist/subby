@@ -139,10 +139,18 @@ describe("cloud + transient missing: guardrail refuses empty-recreate", () => {
     const entries = await readdir(userData);
     expect(entries).not.toContain(fileNames.subscriptions);
 
-    // The backup is untouched and still restorable.
+    // The backup is untouched and still present. Inspect the backup FILE ON DISK
+    // rather than via `readBackup`: this backup was assembled from a bare v1
+    // array, so `assembleBackupPayload` stamped it the current BACKUP_SCHEMA_
+    // VERSION (2) while holding v1-shaped records — an internally mixed shape a
+    // `current = 1` adapter's `readBackup` (which refuses a newer-than-current
+    // stamp since Story 7.4) will not load. The raw bytes prove the backup
+    // captured the data and survived the guarded (non-recreating) read.
     const backups = await storage.listBackups();
     expect(backups.length).toBeGreaterThan(0);
-    const backup = await storage.readBackup(backups[0]);
+    const backup = JSON.parse(
+      await readFile(join(userData, fileNames.backupDir, backups[0]), "utf8"),
+    ) as { subscriptions: unknown[] };
     expect(backup.subscriptions).toEqual([v1Subscription({ id: "live" })]);
   });
 

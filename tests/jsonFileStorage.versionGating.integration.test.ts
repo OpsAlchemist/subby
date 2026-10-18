@@ -280,9 +280,13 @@ describe("version gating at injected current = 2 (migrate-before-validate)", () 
     expect(rawAfter.version).toBe(2);
 
     // A pre-migration backup was taken, capturing the RAW v1 file (version 1).
+    // Inspect the backup FILE ON DISK (not via `readBackup`): since Story 7.4,
+    // `readBackup` MIGRATES a `< current` backup on the way out (migrate-on-
+    // restore), so it would return a v2 file — the on-disk bytes are the faithful
+    // raw v1 snapshot this assertion is about.
     const backups = await migrator.listBackups();
     expect(backups.length).toBeGreaterThan(0);
-    const backup = await migrator.readBackup(backups[0]);
+    const backup = await readJson(join(userData, fileNames.backupDir, backups[0]));
     expect(backup.version).toBe(1);
     expect(backup.subscriptions).toEqual(v1Subs);
 
@@ -401,9 +405,13 @@ describe("version gating at injected current = 2 (migrate-before-validate)", () 
     expect((await readJson(subsPath)).version).toBe(1);
 
     // The pre-migration backup was taken BEFORE the failing migrate and survives.
+    // Inspect the backup FILE ON DISK: this backup holds an unmigratable v1
+    // record (currency "ZZZ"), so `readBackup` — which migrates-on-restore since
+    // Story 7.4 — would (correctly) refuse it as corrupt. The raw bytes are what
+    // this assertion is about: the pre-migration snapshot survived intact.
     const backups = await storage.listBackups();
     expect(backups.length).toBeGreaterThan(0);
-    const backup = await storage.readBackup(backups[0]);
+    const backup = await readJson(join(userData, fileNames.backupDir, backups[0]));
     expect(backup.version).toBe(1);
     expect(backup.subscriptions).toEqual(v1File.subscriptions);
   });
