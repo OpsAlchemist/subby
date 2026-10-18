@@ -171,6 +171,25 @@ async function refreshOnlineSettings(): Promise<void> {
   }
 }
 
+/**
+ * React to a successful `settings:update` (Story 8.1 + 8.6). Refreshes the
+ * online-toggle cache for the dynamic CSP (AD-7), then — if `fxRefresh` is now on
+ * — triggers one FX rate refresh (Story 8.6). This REUSES the existing
+ * settings-mutation seam, so there is NO second timer subsystem: the toggle-on
+ * flip is one of the only two FX triggers (the other is launch). The FX job
+ * itself self-gates on the toggle and the ≤24h cadence, so a flip-off-then-on
+ * burst never beats the network cap. Fire-and-forget; a throw is swallowed by the
+ * IPC-layer guard around this hook so it never fails the IPC call.
+ */
+async function onSettingsMutated(): Promise<void> {
+  await refreshOnlineSettings();
+  // The cache now reflects the just-persisted toggles. Trigger an FX refresh only
+  // when fxRefresh is on; the job no-ops otherwise and self-caps at ≤1×/24h.
+  if (onlineSettingsCache.fxRefresh && appContext !== null) {
+    appContext.services.enqueueFxRefresh();
+  }
+}
+
 /** Begin a genuine quit: stop intercepting window close, then quit the app. */
 function requestQuit(): void {
   isQuitting = true;
@@ -335,6 +354,15 @@ function scheduleDeferredSchedulerFirstTick(): void {
 function startDeferredEnrichmentDrain(): void {
   if (enrichment === null) return;
   enrichment.start();
+  // Launch FX refresh trigger (Story 8.6): if `fxRefresh` is on at launch, request
+  // ONE refresh now that the service may drain (post-barrier + ready-to-show,
+  // AD-28). This is one of the only two FX triggers (the other is the toggle-on
+  // flip via `onSettingsMutated`) — NO second timer. The job self-gates on the
+  // ≤24h cadence, so a relaunch within 24h of a successful fetch hits no network.
+  // `onlineSettingsCache` was seeded post-barrier, so it reflects the real toggle.
+  if (onlineSettingsCache.fxRefresh) {
+    enrichment.enqueueFxRefresh();
+  }
 }
 
 function createWindow(): void {
@@ -486,10 +514,13 @@ app.whenReady().then(async () => {
     // The `onSettingsMutated` hook refreshes the online-toggle cache whenever a
     // `settings:update` succeeds, so enabling an online feature at runtime
     // (Story 8.2) widens the CSP on the next request — no second
-    // `onHeadersReceived` registration (AD-7). Fire-and-forget: the refresh is a
-    // lock-free read and the CSP only needs to be current by the next request.
+    // `onHeadersReceived` registration (AD-7). It ALSO triggers an FX refresh when
+    // `fxRefresh` is now on (Story 8.6) — reusing the SAME settings-mutation seam,
+    // no second timer. Fire-and-forget: the refresh is a lock-free read, the CSP
+    // only needs to be current by the next request, and the FX job self-gates on
+    // the toggle + the ≤24h cadence (so a flip-off-then-on burst is still ≤1×/24h).
     registerIpcHandlers(appContext.services, getWindow, () => {
-      void refreshOnlineSettings();
+      void onSettingsMutated();
     });
     registerDialogChannels(appContext);
 

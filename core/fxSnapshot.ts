@@ -58,6 +58,28 @@ export interface BundledFxSnapshot {
 }
 
 /**
+ * The opt-in FX *refresh* override written to the Data Folder (Epic 8, Story
+ * 8.6; AD-23). It is the SAME validated {@link BundledFxSnapshot} shape — so the
+ * money core, `ratesForHome`, and the newest-"as of" resolution treat a refreshed
+ * table identically to the bundle — PLUS a `fetchedAt` ISO-8601 instant.
+ *
+ * `asOf` and `fetchedAt` are two DIFFERENT clocks (Design Notes):
+ *   - `asOf`      — the ECB rate date (`YYYY-MM-DD`, daily granularity). Drives
+ *                   BOTH {@link resolveEffectiveSnapshot} (newest wins) AND the
+ *                   stale-rate guard. Can lag over a weekend with no publication.
+ *   - `fetchedAt` — the wall-clock instant Subby last SUCCESSFULLY fetched. Drives
+ *                   ONLY the EnrichmentService's ≤24h network cap, never totals.
+ *
+ * Keeping them separate means a weekend with no new ECB publication does not
+ * re-fetch every launch (the ≤24h gate holds on `fetchedAt`), and a fresher
+ * post-release bundle still wins on `asOf`.
+ */
+export interface FxOverride extends BundledFxSnapshot {
+  /** The wall-clock instant of the last successful fetch (ISO-8601). */
+  fetchedAt: string;
+}
+
+/**
  * Thrown when a raw bundled snapshot fails validation: a bad shape, an
  * unknown/missing `schemaVersion`, a malformed/absent `asOf`, a missing/empty
  * `rates`, a missing `base`, or a base whose own rate is not exactly 1. This is
@@ -259,6 +281,78 @@ export function ratesForHome(snapshot: BundledFxSnapshot, homeCurrency: string):
   }
 
   return { asOf: snapshot.asOf, rates: rebased };
+}
+
+// --- Opt-in FX refresh override (Epic 8, Story 8.6; AD-23) -------------------
+
+/** `YYYY-MM-DD(THH:MM[:SS[.mmm]]Z…)` sanity shape for the `fetchedAt` instant. */
+const FETCHED_AT_RE = /^\d{4}-\d{2}-\d{2}T.+/;
+
+/**
+ * Validate a raw (`unknown`) object into a typed {@link FxOverride}, failing
+ * LOUDLY on any defect (a wrong rate is a wrong total — reuse the bundle's
+ * positive-rate discipline via {@link parseBundledSnapshot}).
+ *
+ * It first runs the FULL {@link parseBundledSnapshot} validation (shape, schema
+ * version, `asOf`, `base`, `attribution`, every rate strictly positive, base ↦ 1,
+ * known currencies) and then additionally requires a non-empty `fetchedAt`
+ * ISO-8601-ish instant string. A `fetchedAt` with a bad shape, or any defect the
+ * bundle parser rejects, THROWS — so the EnrichmentService never writes a
+ * malformed override, and a corrupt override read degrades to `null` (the caller
+ * catches this throw), never a crash and never a silent wrong number.
+ *
+ * @throws FxSnapshotError      on a bad shape / schema / asOf / base / rates /
+ *                              fetchedAt.
+ * @throws UnknownCurrencyError on an unknown currency (reused from `core/money`).
+ */
+export function parseFxOverride(raw: unknown): FxOverride {
+  // Reuse the full loud bundle validation (positive rates, base ↦ 1, etc.).
+  const snapshot = parseBundledSnapshot(raw);
+
+  // `fetchedAt` is the one field the bundle shape does not carry. It must be a
+  // non-empty ISO-8601 instant string (the wall-clock cadence clock).
+  const { fetchedAt } = raw as Record<string, unknown>;
+  if (typeof fetchedAt !== "string" || !FETCHED_AT_RE.test(fetchedAt.trim())) {
+    throw new FxSnapshotError(
+      `fetchedAt must be an ISO-8601 instant string, got ${JSON.stringify(fetchedAt)}`,
+    );
+  }
+
+  return { ...snapshot, fetchedAt: fetchedAt.trim() };
+}
+
+/**
+ * Resolve the EFFECTIVE snapshot from the two layers {bundle, override}: whichever
+ * has the newer `asOf` wins (AD-23). This is the SINGLE resolution point a
+ * conversion batch calls ONCE, so a stale override never shadows a fresher
+ * post-release bundle and there is no mid-total re-read race.
+ *
+ * Null-safe and churn-stable:
+ *   - both `null`            → `null` (no rates at all; caller degrades off).
+ *   - one `null`             → the other (the only layer present wins).
+ *   - override `asOf` NEWER  → the override (a fresh refresh wins).
+ *   - bundle `asOf` NEWER    → the bundle (a release bump wins; the stale
+ *                              override does NOT shadow it).
+ *   - EQUAL `asOf`           → the BUNDLE, deliberately: a same-date override
+ *                              carries no newer rate information, so preferring
+ *                              the bundle avoids needless churn and keeps the
+ *                              resolution deterministic.
+ *
+ * Comparison is lexicographic over the `YYYY-MM-DD` strings, which is also
+ * chronological for that fixed-width format — no `Date` parsing, no clock, pure
+ * (AD-1). The returned value is one of the inputs by reference (never mutated);
+ * the override's extra `fetchedAt` is irrelevant to totals and simply rides along
+ * when the override wins (it is a superset of {@link BundledFxSnapshot}).
+ */
+export function resolveEffectiveSnapshot(
+  bundle: BundledFxSnapshot | null,
+  override: FxOverride | null,
+): BundledFxSnapshot | null {
+  if (bundle === null) return override;
+  if (override === null) return bundle;
+  // Strictly-newer override wins; an equal-or-older override defers to the bundle
+  // (equal → bundle, avoiding churn; older → the fresher bundle is never shadowed).
+  return override.asOf > bundle.asOf ? override : bundle;
 }
 
 // --- Local exact-decimal helpers (BigInt only) -------------------------------

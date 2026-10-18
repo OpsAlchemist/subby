@@ -381,6 +381,30 @@ describe("Settings → Online Features section (Story 8.2)", () => {
     expect(text).not.toMatch(/\b(this logo|a logo|each logo|per logo)\b/i);
   });
 
+  it("pins the EXACT FX-refresh notice wording (Story 8.6, FR-28)", async () => {
+    // The FX notice must state the whole-table, at-most-daily, reveals-nothing
+    // framing — the privacy-safe live fetch. Pinning this exact string makes any
+    // silent copy regression FAIL (per the spec's verify/pin requirement).
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const notice = within(region).getByText(
+      "Fetches the whole exchange-rate table from Frankfurter (api.frankfurter.dev), at most once a day. Reveals nothing about which currencies or subscriptions you track.",
+    );
+    expect(notice).toBeInTheDocument();
+
+    // The notice is the FX switch's own programmatic description.
+    const fx = within(region).getByRole("switch", { name: fxName });
+    expect(fx.getAttribute("aria-describedby")).toBe(notice.id);
+
+    // Guard the three load-bearing phrases individually.
+    const text = notice.textContent ?? "";
+    expect(text).toContain("whole exchange-rate table");
+    expect(text).toContain("api.frankfurter.dev");
+    expect(text).toContain("at most once a day");
+    expect(text).toContain("Reveals nothing about which currencies or subscriptions you track");
+  });
+
   it("each switch's aria-describedby resolves to its own exposure notice", async () => {
     render(<Settings />);
     const region = await screen.findByRole("region", { name: "Online Features" });

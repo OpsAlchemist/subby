@@ -28,11 +28,13 @@
  * The renderer auto-enqueue trigger and the live toggle arrive in Story 8.5.
  */
 
+import type { BundledFxSnapshot, FxOverride } from "core/fxSnapshot";
 import type { OnlineSettingsV2, SettingsV2 } from "core/models/settings";
 
 import { NetworkGateError } from "../net/gateway";
 import type { FetchedLogo } from "../net/providers/logoFetcher";
 import { fetchLogo } from "../net/providers/logoFetcher";
+import { fetchFxRates } from "../net/providers/fxFetcher";
 import type { GetWindow } from "../ipc/handlers";
 import { CH } from "../ipc/channels";
 import type { LogoBlobCache } from "./logoBlobCache";
@@ -40,14 +42,44 @@ import { normalizeDomainKey } from "./logoBlobCache";
 
 /**
  * The subset of app services the enrichment worker needs: the live online
- * toggles (read per job so the gate always keys off the current state). Matches
- * `AppServices` structurally, so the production context passes directly while
- * tests supply a tiny stub.
+ * toggles (read per job so the gate always keys off the current state) and, for
+ * the FX refresh job (Story 8.6), the atomic FX-override read/write (through the
+ * StoragePort, AD-23 — the EnrichmentService is the SOLE writer). The production
+ * context supplies these from the assembled services + storage; tests supply a
+ * tiny stub.
  */
 export interface EnrichmentServices {
   /** Read the persisted settings (re-read per job so the gate sees current toggles). */
   getSettings(): Promise<SettingsV2>;
+  /**
+   * Read the current FX override (Story 8.6) — for the ≤24h self-gate on
+   * `fetchedAt`. Degrades a missing/corrupt override to `null`. OPTIONAL so a
+   * logo-only test stub need not implement it; the FX job no-ops without it.
+   */
+  readFxOverride?(): Promise<FxOverride | null>;
+  /**
+   * Write the FX override atomically through the port (Story 8.6, AD-23). The
+   * EnrichmentService is the SOLE writer. OPTIONAL (see {@link readFxOverride}).
+   */
+  writeFxOverride?(override: FxOverride): Promise<void>;
 }
+
+/**
+ * The FX provider seam: fetch the WHOLE ECB table through the gateway (gated by
+ * `online`), or throw. Matches {@link fetchFxRates}; injectable so a test supplies
+ * a fake returning a fixed table or a controlled throw without any real socket.
+ */
+export type FxProvider = (
+  online: OnlineSettingsV2,
+  fetchImpl?: typeof fetch,
+) => Promise<BundledFxSnapshot>;
+
+/**
+ * The FX refresh network CAP (FR-28 "at most daily"): a successful fetch within
+ * this window makes the next FX job a no-op (no socket). It is a CAP, not a
+ * guarantee — a continuously-open session is NOT forced to refresh (out of scope).
+ */
+export const FX_REFRESH_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * The logo provider seam: fetch bytes+content-type for a domain through the
@@ -74,11 +106,13 @@ export interface EnrichmentOptions {
   getWindow: GetWindow;
   /** The logo provider. Defaults to the real gated {@link fetchLogo}; tests inject a fake. */
   provider?: LogoProvider;
+  /** The FX provider (Story 8.6). Defaults to the real gated {@link fetchFxRates}; tests inject a fake. */
+  fxProvider?: FxProvider;
   /** Injectable network primitive, threaded through the provider to the gateway (tests). */
   fetchImpl?: typeof fetch;
   /** Coalesce window in ms. Defaults to {@link DEFAULT_COALESCE_MS}. */
   coalesceMs?: number;
-  /** Injectable wall clock (unused today; reserved for parity with the Scheduler). */
+  /** Injectable wall clock. Used by the FX refresh ≤24h cadence (Story 8.6); defaults to `() => new Date()`. */
   now?: () => Date;
 }
 
@@ -93,8 +127,19 @@ export class EnrichmentService {
   private readonly blobCache: LogoBlobCache;
   private readonly getWindow: GetWindow;
   private readonly provider: LogoProvider;
+  private readonly fxProvider: FxProvider;
   private readonly fetchImpl?: typeof fetch;
   private readonly coalesceMs: number;
+  private readonly now: () => Date;
+
+  /**
+   * Guards against overlapping FX refresh jobs (Story 8.6). A second
+   * {@link enqueueFxRefresh} while one is in flight is a no-op — the single serial
+   * FX job, mirroring the logo queue's single-worker discipline. The ≤24h cap on
+   * `fetchedAt` is the real throttle; this just prevents a launch + toggle-flip
+   * double-trigger from racing two fetches at once.
+   */
+  private fxRefreshInFlight = false;
 
   /** FIFO queue of registrable domains awaiting a fetch. */
   private readonly queue: string[] = [];
@@ -119,13 +164,22 @@ export class EnrichmentService {
   /** True when ≥1 completion occurred since the last broadcast (a broadcast is owed). */
   private broadcastPending = false;
 
+  /**
+   * True when an FX refresh was requested before {@link start} permitted draining
+   * (AD-28) — e.g. the launch trigger fires before `ready-to-show`. {@link start}
+   * consumes it so the refresh runs once the barrier has passed, never earlier.
+   */
+  private fxRefreshRequested = false;
+
   constructor(opts: EnrichmentOptions) {
     this.services = opts.services;
     this.blobCache = opts.blobCache;
     this.getWindow = opts.getWindow;
     this.provider = opts.provider ?? fetchLogo;
+    this.fxProvider = opts.fxProvider ?? fetchFxRates;
     this.fetchImpl = opts.fetchImpl;
     this.coalesceMs = opts.coalesceMs ?? DEFAULT_COALESCE_MS;
+    this.now = opts.now ?? (() => new Date());
   }
 
   /**
@@ -138,6 +192,12 @@ export class EnrichmentService {
     if (this.stopped) return;
     this.started = true;
     if (this.queue.length > 0) void this.drain();
+    // Run a deferred FX refresh that was requested before the start gate (AD-28,
+    // e.g. the launch-with-toggle-on trigger fired before `ready-to-show`).
+    if (this.fxRefreshRequested) {
+      this.fxRefreshRequested = false;
+      void this.runFxRefresh();
+    }
   }
 
   /**
@@ -154,6 +214,7 @@ export class EnrichmentService {
       this.broadcastTimer = null;
     }
     this.broadcastPending = false;
+    this.fxRefreshRequested = false;
     // Drop any queued-but-unprocessed domains so a restart does not replay them.
     this.queue.length = 0;
   }
@@ -177,6 +238,133 @@ export class EnrichmentService {
     if (this.queue.includes(normalized)) return;
     this.queue.push(normalized);
     if (this.started) void this.drain();
+  }
+
+  /**
+   * Request an FX rate refresh and return IMMEDIATELY (AD-9; Story 8.6). The two
+   * production triggers (`main.ts` at launch when `fxRefresh` is on, and the
+   * `onSettingsMutated` hook when the toggle flips on) call this — NO second timer
+   * subsystem. Fire-and-forget: the caller never awaits the fetch.
+   *
+   *   - A `stop()`ped service is a no-op.
+   *   - Before {@link start} has permitted draining (AD-28), the request is
+   *     REMEMBERED and run by `start()` (so a launch trigger that fires before
+   *     `ready-to-show` still refreshes once, after the barrier).
+   *   - Once started, the FX job runs now (fire-and-forget).
+   *
+   * The job itself self-gates on BOTH the `fxRefresh` toggle AND the ≤24h cadence
+   * ({@link FX_REFRESH_MIN_INTERVAL_MS}), so even if triggered more often the
+   * network is hit ≤1×/24h (FR-28 is a CAP). Returns `void` synchronously — the
+   * public {@link refreshFxNow} is the awaitable variant tests use.
+   */
+  enqueueFxRefresh(): void {
+    if (this.stopped) return;
+    if (!this.started) {
+      // Defer until the start gate (AD-28). `start()` consumes the flag.
+      this.fxRefreshRequested = true;
+      return;
+    }
+    void this.runFxRefresh();
+  }
+
+  /**
+   * Run ONE FX refresh and await it (public so tests drive the worker
+   * deterministically). Production uses the fire-and-forget {@link enqueueFxRefresh};
+   * this is the same job, awaitable. A no-op before {@link start} / after
+   * {@link stop}.
+   */
+  async refreshFxNow(): Promise<void> {
+    if (!this.started || this.stopped) return;
+    await this.runFxRefresh();
+  }
+
+  /**
+   * The FX refresh job (Story 8.6; AD-8/9/23). Gated and self-throttled; NEVER
+   * throws into the event loop (AD-28). Order:
+   *   1. in-flight guard — one FX job at a time (a launch + toggle-flip double
+   *      trigger does not race two fetches).
+   *   2. GATE on `settings.online.fxRefresh` — off → no-op (no fetch, no socket;
+   *      the gateway would also refuse, but short-circuiting here avoids the throw).
+   *   3. ≤24h SELF-GATE — read the current override's `fetchedAt`; if a successful
+   *      fetch happened within {@link FX_REFRESH_MIN_INTERVAL_MS}, no-op (the CAP).
+   *   4. FETCH the whole ECB table through the gated provider; a `NetworkGateError`
+   *      or any transport/parse error is a SILENT miss (no override written, prior
+   *      override/bundle stays effective).
+   *   5. WRITE the override atomically (loud rate-validate on write; a bad rate
+   *      throws and is caught here as a silent miss — "no override written") with
+   *      `fetchedAt = now()`.
+   *   6. BROADCAST a single coalesced `evt:dataChanged` so the renderer reloads and
+   *      re-queries `getFxSnapshot` (newer `asOf` swaps in) — the SAME path logos use.
+   */
+  private async runFxRefresh(): Promise<void> {
+    if (this.fxRefreshInFlight || this.stopped) return;
+    // The FX override read/write seams are optional (a logo-only stub omits them);
+    // without them the FX job cannot run.
+    const readOverride = this.services.readFxOverride?.bind(this.services);
+    const writeOverride = this.services.writeFxOverride?.bind(this.services);
+    if (readOverride === undefined || writeOverride === undefined) return;
+
+    this.fxRefreshInFlight = true;
+    try {
+      // (2) Gate: the toggle must be ON. Read fresh per job so a flip is honored.
+      const settings = await this.services.getSettings();
+      if (!settings.online.fxRefresh) return;
+
+      // (3) ≤24h self-gate on the LAST successful fetch instant (`fetchedAt`).
+      const existing = await readOverride();
+      if (existing !== null) {
+        const lastFetchedMs = Date.parse(existing.fetchedAt);
+        const delta = this.now().getTime() - lastFetchedMs;
+        // The no-op applies ONLY to a stamp in the PAST within the window
+        // (`0 <= delta < 24h`). A FUTURE stamp (clock skew / an edited file) makes
+        // `delta` negative; without the lower bound that would always read as
+        // "< 24h" and suppress refresh indefinitely — so a future/out-of-range
+        // stamp falls through to a fetch (the safe freshness direction).
+        if (
+          Number.isFinite(lastFetchedMs) &&
+          delta >= 0 &&
+          delta < FX_REFRESH_MIN_INTERVAL_MS
+        ) {
+          return; // fetched within 24h → no network (the CAP)
+        }
+      }
+
+      // (4) Fetch the whole table through the gated provider. A NetworkGateError
+      // (toggle off mid-flight / unregistered host) or any transport/parse error
+      // is a silent miss — nothing written, prior snapshot stays effective.
+      const snapshot = await this.fxProvider(settings.online, this.fetchImpl);
+
+      // A stop() (quit) that landed while fetching halts the write/broadcast.
+      if (this.stopped) return;
+
+      // (5) Write the override atomically with the current wall-clock `fetchedAt`.
+      // The port's write-time parse validates rates LOUDLY; a bad rate throws here
+      // and is caught below as a silent miss (no override written).
+      const override: FxOverride = {
+        ...snapshot,
+        fetchedAt: this.now().toISOString(),
+      };
+      await writeOverride(override);
+
+      // (6) One coalesced broadcast so the renderer swaps in the newer rates via
+      // the existing evt:dataChanged → store-reload → getFxSnapshot path (AD-8).
+      this.scheduleBroadcast();
+      this.flushBroadcast();
+    } catch (err) {
+      // DEGRADE, never propagate (AD-28). A NetworkGateError is the ordinary
+      // gate-closed/off-toggle miss — nothing changed, nothing to log loudly. Any
+      // other fault (transport, non-ok status, parse, write-validate) is a local
+      // non-telemetry diagnostic; the prior snapshot stays effective.
+      if (!(err instanceof NetworkGateError)) {
+        console.error(
+          `[subby] FX refresh degraded (caught, not thrown): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    } finally {
+      this.fxRefreshInFlight = false;
+    }
   }
 
   /**

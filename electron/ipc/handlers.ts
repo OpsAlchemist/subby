@@ -431,8 +431,8 @@ export function registerIpcHandlers(
   handle<IpcResult<RateSnapshot>>(
     CH.fx.snapshot,
     (_event, homeCurrency: string): Promise<IpcResult<RateSnapshot>> =>
-      query(() => {
-        const snapshot = services.getFxSnapshot(homeCurrency);
+      query(async () => {
+        const snapshot = await services.getFxSnapshot(homeCurrency);
         if (snapshot === null) {
           // A loud, named error the renderer surfaces as "rates unavailable".
           // Thrown here so `query`'s catch maps it to an IpcResult failure.

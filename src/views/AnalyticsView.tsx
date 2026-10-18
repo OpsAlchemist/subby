@@ -49,7 +49,7 @@ import {
 import type { SubscriptionV2 } from "core/models/subscription";
 import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStoreData } from "@/stores/hooks";
-import { getFxSnapshotSafe } from "@/api/subby";
+import { getFxSnapshotSafe, onDataChanged } from "@/api/subby";
 import StaleRateNote from "@/components/StaleRateNote";
 
 /** Number of "most expensive" subscriptions to surface (Req 11.4). */
@@ -119,9 +119,13 @@ interface FxState {
 }
 
 /**
- * Fetch the bundled FX {@link RateSnapshot} for `homeCurrency`, re-fetching when
- * it changes (mirrors the Dashboard's Story-6.1 fetch — FX is a STATIC bundle in
- * 1.0, so this loads once per Home-Currency value, NOT on every `onDataChanged`).
+ * Fetch the EFFECTIVE FX {@link RateSnapshot} for `homeCurrency`, re-fetching when
+ * it changes AND on every `onDataChanged` (Story 8.6 — mirrors the Dashboard). An
+ * opt-in FX refresh writes a fresher override and broadcasts `evt:dataChanged`;
+ * re-querying swaps the newer `asOf`/rates in through the SAME path the stores
+ * reload through (the override is transparent — same `RateSnapshot`). The initial
+ * per-Home-Currency fetch shows the loading state; a background `onDataChanged`
+ * re-fetch does NOT reset to loading (no flash — figures stay up and recompute).
  * `getFxSnapshotSafe` never throws; a `null` becomes `errored` so the view
  * degrades to "rates unavailable" rather than crashing.
  */
@@ -135,12 +139,17 @@ function useFxSnapshot(homeCurrency: string): FxState {
   useEffect(() => {
     let cancelled = false;
     setState({ snapshot: null, loading: true, errored: false });
-    void getFxSnapshotSafe(homeCurrency).then((snapshot) => {
+    const apply = (snapshot: RateSnapshot | null): void => {
       if (cancelled) return;
       setState({ snapshot, loading: false, errored: snapshot === null });
+    };
+    void getFxSnapshotSafe(homeCurrency).then(apply);
+    const off = onDataChanged(() => {
+      void getFxSnapshotSafe(homeCurrency).then(apply);
     });
     return () => {
       cancelled = true;
+      off();
     };
   }, [homeCurrency]);
 

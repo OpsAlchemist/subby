@@ -3,9 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { EnrichmentService } from "../electron/services/enrichment";
 import type {
   EnrichmentServices,
+  FxProvider,
   LogoProvider,
 } from "../electron/services/enrichment";
 import { NetworkGateError } from "../electron/net/gateway";
+import type { BundledFxSnapshot, FxOverride } from "core/fxSnapshot";
 import type { OnlineSettingsV2, SettingsV2 } from "core/models/settings";
 
 /**
@@ -92,6 +94,7 @@ function okProvider(contentType = "image/png"): LogoProvider {
 
 const ALL_OFF: OnlineSettingsV2 = { liveLogoFetch: false, fxRefresh: false };
 const LOGO_ON: OnlineSettingsV2 = { liveLogoFetch: true, fxRefresh: false };
+const FX_ON: OnlineSettingsV2 = { liveLogoFetch: false, fxRefresh: true };
 
 afterEach(() => {
   vi.useRealTimers();
@@ -358,5 +361,243 @@ describe("drain only after start() (AD-28 launch ordering)", () => {
     expect(provider).not.toHaveBeenCalled();
     expect(write).not.toHaveBeenCalled();
     expect(send).not.toHaveBeenCalled();
+  });
+});
+
+// --- FX refresh job (Story 8.6; AD-8/9/23) -----------------------------------
+
+/** A mapped BundledFxSnapshot-shaped value the FX provider returns on success. */
+function makeFxSnapshot(asOf = "2026-10-15"): BundledFxSnapshot {
+  return {
+    schemaVersion: 1,
+    asOf,
+    base: "EUR",
+    attribution: "ECB via Frankfurter.",
+    rates: { EUR: "1", USD: "1.1", INR: "92.0" },
+  };
+}
+
+/**
+ * An FX-capable services stub: mutable online toggles + an in-memory FX override
+ * read/write that records writes. `readFxOverride` returns the stored override
+ * (or a seeded one) so the ≤24h self-gate can be exercised.
+ */
+function makeFxServices(online: OnlineSettingsV2, seedOverride: FxOverride | null = null) {
+  const state = { online, override: seedOverride };
+  const getSettings = vi.fn(async () => makeSettings(state.online));
+  const readFxOverride = vi.fn(async () => state.override);
+  const writeFxOverride = vi.fn(async (o: FxOverride) => {
+    state.override = o;
+  });
+  const services: EnrichmentServices = {
+    getSettings,
+    readFxOverride,
+    writeFxOverride,
+  };
+  return { services, state, getSettings, readFxOverride, writeFxOverride };
+}
+
+/** A fixed wall clock the ≤24h cadence math reads. */
+function fixedNow(iso: string): () => Date {
+  return () => new Date(iso);
+}
+
+describe("FX refresh job (Story 8.6): gate, ≤24h cap, write + one broadcast, degrade", () => {
+  const okFxProvider = (asOf = "2026-10-15"): FxProvider =>
+    vi.fn(async () => makeFxSnapshot(asOf));
+
+  it("gate OFF (fxRefresh false): no fetch, no override write, no broadcast", async () => {
+    const { services, writeFxOverride } = makeFxServices(ALL_OFF);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, fxProvider });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("success: fetches the whole table, writes the override with fetchedAt, ONE broadcast", async () => {
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    // The provider was passed the live online toggles (the gate keys off them).
+    expect(vi.mocked(fxProvider).mock.calls[0]![0]).toEqual(FX_ON);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override).not.toBeNull();
+    expect(state.override!.asOf).toBe("2026-10-15");
+    expect(state.override!.fetchedAt).toBe("2026-10-15T08:00:00.000Z");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls[0][0]).toBe("evt:dataChanged");
+  });
+
+  it("≤24h cap: an override fetched < 24h ago makes the job a NO-OP (no fetch)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now`
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(fxProvider).not.toHaveBeenCalled(); // within 24h → no network
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("after 24h: an override fetched > 24h ago is refreshed (fetch + rewrite)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-10"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // > 24h before `now`
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override!.asOf).toBe("2026-10-15"); // rewritten with the new table
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("a FUTURE fetchedAt (clock skew / edited file) falls through to a refresh (not suppressed)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-20T08:00:00.000Z", // 5 days in the FUTURE vs `now`
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    // A negative delta is NOT "< 24h in the past" — the lower-bound guard lets the
+    // job fall through to a fetch (the safe freshness direction), so an edited/
+    // skewed future stamp cannot suppress refresh indefinitely.
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+  });
+
+  it("failed fetch (gate error): keeps the prior override, no write, silent", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-10"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // > 24h → the cap does not short-circuit
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider: FxProvider = vi.fn(async () => {
+      throw new NetworkGateError("blocked: api.frankfurter.dev");
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).not.toHaveBeenCalled(); // no override written on failure
+    expect(state.override).toBe(seeded); // the last good snapshot stays effective
+    expect(send).not.toHaveBeenCalled(); // silent — no toast, no reload
+  });
+
+  it("failed fetch (transport error): also keeps the prior override, silent", async () => {
+    const { services, writeFxOverride } = makeFxServices(FX_ON);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider: FxProvider = vi.fn(async () => {
+      throw new Error("FX refresh failed: HTTP 503");
+    });
+    const svc = new EnrichmentService({ services, blobCache, getWindow, fxProvider });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("enqueueFxRefresh before start() is deferred and runs once start() permits it (AD-28)", async () => {
+    // A write-signal so the fire-and-forget deferred job can be awaited.
+    let resolveWrite!: () => void;
+    const written = new Promise<void>((r) => {
+      resolveWrite = r;
+    });
+    const state = { online: FX_ON, override: null as FxOverride | null };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    const readFxOverride = vi.fn(async () => state.override);
+    const writeFxOverride = vi.fn(async (o: FxOverride) => {
+      state.override = o;
+      resolveWrite();
+    });
+    const services: EnrichmentServices = { getSettings, readFxOverride, writeFxOverride };
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, fxProvider });
+
+    // NOT started: the request must not fetch yet.
+    svc.enqueueFxRefresh();
+    await Promise.resolve();
+    expect(fxProvider).not.toHaveBeenCalled();
+
+    // start() runs the deferred refresh (fire-and-forget); await its write signal.
+    svc.start();
+    await written;
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
   });
 });

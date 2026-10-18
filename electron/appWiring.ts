@@ -24,7 +24,12 @@ import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
 import { lookupSuggestion, type PriceSeed, type PriceSuggestion } from "core/priceSeed";
-import { ratesForHome, type BundledFxSnapshot } from "core/fxSnapshot";
+import {
+  ratesForHome,
+  resolveEffectiveSnapshot,
+  type BundledFxSnapshot,
+  type FxOverride,
+} from "core/fxSnapshot";
 import { EMPTY_LOGO_PACK, type LogoPack } from "core/logo";
 import type { RateSnapshot } from "core/money";
 import type { Category } from "core/models/category";
@@ -210,17 +215,25 @@ export interface AppServices {
    */
   getPriceSuggestion(name: string): PriceSuggestion | null;
 
-  // --- FX snapshot (Story 6.1) ---
+  // --- FX snapshot (Story 6.1 + Story 8.6 refresh override) ---
   /**
-   * Return the bundled FX {@link RateSnapshot} rebased to `homeCurrency`
-   * (`rates[home] === "1"`, every other currency expressed in Home major
-   * units), or `null` when the bundled snapshot failed to load (missing/corrupt)
-   * or the Home Currency is unknown/absent from it. READ-ONLY, lock-free, never
-   * throws: the snapshot is an immutable shipped bundle, never the StoragePort.
-   * Staleness is NOT decided here (core takes no clock); the renderer applies
-   * `rateConfidence` with its own local `today` to the returned `asOf`.
+   * Return the EFFECTIVE FX {@link RateSnapshot} rebased to `homeCurrency`
+   * (`rates[home] === "1"`, every other currency expressed in Home major units),
+   * or `null` when no snapshot is available (bundle failed to load AND no
+   * override) or the Home Currency is unknown/absent from the effective snapshot.
+   *
+   * The effective snapshot is resolved ONCE per call (a call == a conversion
+   * batch) by {@link resolveEffectiveSnapshot} over {bundle, override}: whichever
+   * has the newer `asOf` wins (AD-23) — the opt-in Story 8.6 refresh override
+   * (`<DataFolder>/fx-snapshot.json`) when it is fresher, else the shipped bundle
+   * (so a stale override never shadows a post-release bundle). READ-ONLY and
+   * lock-free: the override read is atomic (temp-then-rename), so a lock-free read
+   * sees the whole old or whole new file, never a torn one; a missing/corrupt
+   * override degrades to "no override" (`null`), never a throw. Staleness is NOT
+   * decided here (core takes no clock); the renderer applies `rateConfidence` with
+   * its own local `today` to the returned `asOf`.
    */
-  getFxSnapshot(homeCurrency: string): RateSnapshot | null;
+  getFxSnapshot(homeCurrency: string): Promise<RateSnapshot | null>;
 
   // --- Logo Pack (Story 8.3) ---
   /**
@@ -251,6 +264,23 @@ export interface AppServices {
    * wired (e.g. a test context that did not inject one).
    */
   enqueueEnrichment(domain: string): void;
+
+  // --- FX refresh override (Story 8.6, AD-23) ---
+  /**
+   * Persist the FX refresh override atomically through the StoragePort, serialized
+   * under the settings-family lock (AD-2/AD-29) so the single-writer discipline
+   * holds and a lock-free `getFxSnapshot` reader never observes a torn write. The
+   * EnrichmentService's FX job is the ONLY caller. Validates rates LOUDLY (a bad
+   * rate throws, caught by the service as a silent miss — "no override written").
+   */
+  writeFxOverride(override: FxOverride): Promise<void>;
+  /**
+   * Request a background FX rate refresh and return IMMEDIATELY (AD-9). Triggered
+   * by `main.ts` at launch (when `fxRefresh` is on) and by the `onSettingsMutated`
+   * hook when the toggle flips on — NO second timer. The job self-gates on the
+   * toggle and the ≤24h cadence; a no-op when the enrichment service is not wired.
+   */
+  enqueueFxRefresh(): void;
 
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
@@ -640,17 +670,23 @@ export function buildAppServices(
       return lookupSuggestion(priceSeed, name);
     },
 
-    // --- FX snapshot (Story 6.1) ---------------------------------------------
-    getFxSnapshot(homeCurrency) {
-      // Lock-free, read-only rebase over the immutable in-memory EUR-based
-      // bundle. When the snapshot failed to load, rates are unavailable → null.
+    // --- FX snapshot (Story 6.1 + Story 8.6 refresh override) ----------------
+    async getFxSnapshot(homeCurrency) {
+      // Resolve the EFFECTIVE snapshot ONCE per call (a call == a conversion
+      // batch, AD-23): newest `asOf` of {bundle, override} wins. The override read
+      // is lock-free + atomic (temp-then-rename), so it observes a whole old/new
+      // file, never a torn one; a missing/corrupt override degrades to `null`
+      // (bundle still totals), so this never throws from the read.
+      const override = await storage.readFxOverride();
+      const effective = resolveEffectiveSnapshot(fxSnapshot, override);
+      // No bundle AND no override → rates unavailable.
+      if (effective === null) return null;
       // `ratesForHome` can throw for an unknown Home Currency or one absent from
-      // the snapshot (UnknownCurrencyError / FxSnapshotError); catch here so a
-      // bad query degrades to null rather than crossing the bridge as a throw —
+      // the effective snapshot (UnknownCurrencyError / FxSnapshotError); catch here
+      // so a bad query degrades to null rather than crossing the bridge as a throw —
       // the renderer treats null as "rates unavailable", never a wrong total.
-      if (fxSnapshot === null) return null;
       try {
-        return ratesForHome(fxSnapshot, homeCurrency);
+        return ratesForHome(effective, homeCurrency);
       } catch {
         return null;
       }
@@ -680,6 +716,22 @@ export function buildAppServices(
       // A no-op when no enrichment service is wired. The worker enforces the
       // gate (liveLogoFetch), never-refetch, and silent-fail-and-fallback.
       enrichment?.service.enqueue(domain);
+    },
+
+    // --- FX refresh override (Story 8.6, AD-23) ------------------------------
+    writeFxOverride(override) {
+      // Serialize on the SETTINGS family lock (AD-2/AD-29): the override is a
+      // settings-adjacent single-writer file, so taking the same lock settings
+      // mutations take keeps the EnrichmentService the sole serialized writer and
+      // guarantees a lock-free `getFxSnapshot` reader never races the atomic write.
+      return lock("settings", () => storage.writeFxOverride(override));
+    },
+
+    enqueueFxRefresh() {
+      // Fire-and-forget (AD-9): ask the serial FX job to run and return. A no-op
+      // when no enrichment service is wired. The job enforces the `fxRefresh` gate,
+      // the ≤24h cadence cap, and silent-fail-keep-last-good.
+      enrichment?.service.enqueueFxRefresh();
     },
 
     // --- Settings ------------------------------------------------------------
@@ -841,7 +893,15 @@ export function createAppContext(
   // assembled services once they exist.
   let assembled: AppServices;
   const service = new EnrichmentService({
-    services: { getSettings: () => assembled.getSettings() },
+    services: {
+      getSettings: () => assembled.getSettings(),
+      // The FX refresh job (Story 8.6) is the SOLE writer of the override, through
+      // the StoragePort (AD-23). The read/write are serialized under the settings-
+      // family lock (see `writeFxOverride` on AppServices) so a lock-free reader
+      // never sees a torn file; the service itself is a single serial FX job.
+      readFxOverride: () => storage.readFxOverride(),
+      writeFxOverride: (override) => assembled.writeFxOverride(override),
+    },
     blobCache,
     getWindow,
   });

@@ -348,9 +348,9 @@ describe("AppServices FX snapshot (Story 6.1)", () => {
     });
   }
 
-  it("a Home currency returns the rebased snapshot (Home → 1), carrying asOf", () => {
+  it("a Home currency returns the rebased snapshot (Home → 1), carrying asOf", async () => {
     const svc = buildAppServices(storage, null, makeSnapshot());
-    const snap = svc.getFxSnapshot("USD");
+    const snap = await svc.getFxSnapshot("USD");
     expect(snap).not.toBeNull();
     // Home anchor: USD → exactly "1".
     expect(snap!.rates.USD).toBe("1");
@@ -361,26 +361,102 @@ describe("AppServices FX snapshot (Story 6.1)", () => {
     expect(Number(snap!.rates.INR)).toBeCloseTo(1.095 / 91.35, 6);
   });
 
-  it("an unknown/absent Home Currency returns null without throwing (degrade)", () => {
+  it("an unknown/absent Home Currency returns null without throwing (degrade)", async () => {
     const svc = buildAppServices(storage, null, makeSnapshot());
     // GBP is a known currency but absent from this snapshot's rates.
-    expect(svc.getFxSnapshot("GBP")).toBeNull();
+    expect(await svc.getFxSnapshot("GBP")).toBeNull();
     // A currency not in the exponent table at all.
-    expect(() => svc.getFxSnapshot("ZZZ")).not.toThrow();
-    expect(svc.getFxSnapshot("ZZZ")).toBeNull();
+    await expect(svc.getFxSnapshot("ZZZ")).resolves.toBeNull();
+    expect(await svc.getFxSnapshot("ZZZ")).toBeNull();
   });
 
-  it("a missing/corrupt bundle (null) returns null for ANY Home without throwing", () => {
+  it("a missing/corrupt bundle (null) returns null for ANY Home without throwing", async () => {
     // Simulate the main-process degrade-off: the loader yielded null.
     const svc = buildAppServices(storage, null, null);
-    expect(svc.getFxSnapshot("USD")).toBeNull();
-    expect(svc.getFxSnapshot("INR")).toBeNull();
-    expect(() => svc.getFxSnapshot("anything")).not.toThrow();
+    expect(await svc.getFxSnapshot("USD")).toBeNull();
+    expect(await svc.getFxSnapshot("INR")).toBeNull();
+    await expect(svc.getFxSnapshot("anything")).resolves.toBeNull();
   });
 
   it("`fx:snapshot` is a registered read-only channel constant", async () => {
     const { CH } = await import("../electron/ipc/channels");
     expect(CH.fx.snapshot).toBe("fx:snapshot");
+  });
+});
+
+describe("AppServices FX snapshot override resolution (Story 8.6; AD-23)", () => {
+  function makeBundle(): BundledFxSnapshot {
+    return parseBundledSnapshot({
+      schemaVersion: 1,
+      asOf: "2026-10-01",
+      base: "EUR",
+      attribution: "Bundled ECB reference rates.",
+      rates: { EUR: "1", USD: "1.0950", INR: "91.350" },
+    });
+  }
+
+  /** Write an override to the Data Folder through the port (the service's seam). */
+  async function seedOverride(asOf: string, usd: string): Promise<void> {
+    await storage.writeFxOverride({
+      schemaVersion: 1,
+      asOf,
+      base: "EUR",
+      attribution: "ECB via Frankfurter.",
+      rates: { EUR: "1", USD: usd, INR: "92.000" },
+      fetchedAt: "2026-10-15T08:00:00.000Z",
+    });
+  }
+
+  it("a NEWER override wins: getFxSnapshot returns the override's asOf + rates", async () => {
+    const svc = buildAppServices(storage, null, makeBundle());
+    await seedOverride("2026-10-15", "1.2000");
+
+    const snap = await svc.getFxSnapshot("EUR");
+    expect(snap).not.toBeNull();
+    expect(snap!.asOf).toBe("2026-10-15"); // the override, not the 2026-10-01 bundle
+    // Home=EUR rebases to "how many EUR one USD is worth" = 1 / eurRate[USD].
+    // From the OVERRIDE table (eurRate[USD]=1.2000): 1/1.2 ≈ 0.8333 — distinct
+    // from the bundle's 1/1.0950 ≈ 0.9132, proving the override's rates are used.
+    expect(Number(snap!.rates.USD)).toBeCloseTo(1 / 1.2, 6);
+  });
+
+  it("a STALE override does NOT shadow a fresher bundle (release bump wins)", async () => {
+    // Bundle at 2026-11-01 (a release bump) with the override still at 2026-10-15.
+    const bundle = parseBundledSnapshot({
+      schemaVersion: 1,
+      asOf: "2026-11-01",
+      base: "EUR",
+      attribution: "Bundled ECB reference rates (release bump).",
+      rates: { EUR: "1", USD: "1.0950", INR: "91.350" },
+    });
+    const svc = buildAppServices(storage, null, bundle);
+    await seedOverride("2026-10-15", "1.2000");
+
+    const snap = await svc.getFxSnapshot("EUR");
+    expect(snap!.asOf).toBe("2026-11-01"); // the fresher bundle wins
+    // Rebased from the BUNDLE (eurRate[USD]=1.0950): 1/1.0950 ≈ 0.9132 — NOT the
+    // stale override's 1/1.2 ≈ 0.8333, proving the override did not shadow it.
+    expect(Number(snap!.rates.USD)).toBeCloseTo(1 / 1.095, 6);
+  });
+
+  it("a malformed override on disk degrades to 'no override' (bundle still totals)", async () => {
+    const svc = buildAppServices(storage, null, makeBundle());
+    // Write a corrupt override file directly (bypassing the loud write validator).
+    await writeFile(
+      join(userData, fileNames.fxOverride),
+      '{ "schemaVersion": 1, "asOf": "2026-10-15", "garbage": true ',
+      "utf8",
+    );
+
+    const snap = await svc.getFxSnapshot("EUR");
+    // The corrupt override is ignored; the bundle (2026-10-01) still totals.
+    expect(snap).not.toBeNull();
+    expect(snap!.asOf).toBe("2026-10-01");
+  });
+
+  it("no bundle AND no override → null (rates unavailable)", async () => {
+    const svc = buildAppServices(storage, null, null);
+    expect(await svc.getFxSnapshot("USD")).toBeNull();
   });
 });
 
