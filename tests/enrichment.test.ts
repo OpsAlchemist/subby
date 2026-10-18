@@ -600,4 +600,37 @@ describe("FX refresh job (Story 8.6): gate, ≤24h cap, write + one broadcast, d
     expect(fxProvider).toHaveBeenCalledTimes(1);
     expect(writeFxOverride).toHaveBeenCalledTimes(1);
   });
+
+  it("opt-out DURING the override read: no fetch, no write (TOCTOU re-read)", async () => {
+    // Regression (PR #2, qodo): the gate was checked BEFORE the awaited
+    // readFxOverride(); if the user turned fxRefresh OFF during that await, the
+    // stale "on" settings still reached the provider and a request could open after
+    // the setting was saved off. The job must RE-READ the toggles immediately before
+    // the fetch and skip when now off.
+    const state = { online: FX_ON, override: null as FxOverride | null };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    // readFxOverride resolves null (no cadence suppression) AND flips the toggle OFF
+    // while its promise is pending — exactly the TOCTOU window.
+    const readFxOverride = vi.fn(async () => {
+      state.online = ALL_OFF;
+      return null;
+    });
+    const writeFxOverride = vi.fn(async (o: FxOverride) => {
+      state.override = o;
+    });
+    const services: EnrichmentServices = { getSettings, readFxOverride, writeFxOverride };
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, fxProvider });
+    svc.start();
+
+    await svc.refreshFxNow();
+
+    // The fresh re-read saw fxRefresh=off → the provider is never called, nothing
+    // is written, no broadcast — no request opens after the save.
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
 });

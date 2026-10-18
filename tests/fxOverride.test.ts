@@ -119,14 +119,40 @@ describe("parseFxOverride: LOUD validation (reuses the bundle positive-rate rule
 // --- resolveEffectiveSnapshot: newest asOf wins ------------------------------
 
 describe("resolveEffectiveSnapshot: newest asOf wins (AD-23)", () => {
-  it("a NEWER override wins over the bundle", () => {
+  it("a NEWER override wins over the bundle (layered, not swapped wholesale)", () => {
     const b = bundle("2026-10-01");
     const o = override("2026-10-15", "2026-10-15T00:00:00Z");
     const effective = resolveEffectiveSnapshot(b, o);
-    expect(effective).toBe(o);
     expect(effective!.asOf).toBe("2026-10-15");
     // The override's distinct USD rate is the one that flows into totals.
     expect(effective!.rates.USD).toBe("1.1000");
+  });
+
+  it("a newer override LAYERS over the bundle: bundle-only currencies (AED/SAR) survive", () => {
+    // Regression (PR #2, qodo): ECB/Frankfurter omits currencies the bundle ships
+    // (AED, SAR). A wholesale swap dropped them — an AED/SAR Home read "unavailable",
+    // and AED/SAR subscriptions lost conversion under any Home. The override must be
+    // layered OVER the bundle: override rates win per-currency, bundle-only keys stay.
+    const b = parseBundledSnapshot({
+      schemaVersion: 1,
+      asOf: "2026-10-01",
+      base: "EUR",
+      attribution: "ECB bundle.",
+      rates: { EUR: "1", USD: "1.0950", AED: "4.02", SAR: "4.11" },
+    });
+    const o = parseFxOverride({
+      schemaVersion: 1,
+      asOf: "2026-10-15", // newer → wins
+      base: "EUR",
+      attribution: "ECB via Frankfurter.",
+      rates: { EUR: "1", USD: "1.1000" }, // ECB set: no AED/SAR
+      fetchedAt: "2026-10-15T00:00:00Z",
+    });
+    const eff = resolveEffectiveSnapshot(b, o)!;
+    expect(eff.asOf).toBe("2026-10-15");
+    expect(eff.rates.USD).toBe("1.1000"); // override wins where present
+    expect(eff.rates.AED).toBe("4.02"); // bundle-only → preserved
+    expect(eff.rates.SAR).toBe("4.11"); // bundle-only → preserved
   });
 
   it("a FRESHER bundle is NOT shadowed by a stale override (release bump wins)", () => {

@@ -350,9 +350,28 @@ export function resolveEffectiveSnapshot(
 ): BundledFxSnapshot | null {
   if (bundle === null) return override;
   if (override === null) return bundle;
-  // Strictly-newer override wins; an equal-or-older override defers to the bundle
-  // (equal → bundle, avoiding churn; older → the fresher bundle is never shadowed).
-  return override.asOf > bundle.asOf ? override : bundle;
+  // An equal-or-older override defers wholesale to the bundle (equal → bundle,
+  // avoiding churn; older → the fresher bundle is never shadowed).
+  if (override.asOf <= bundle.asOf) return bundle;
+
+  // Strictly-newer override wins — but it is LAYERED over the bundle, not swapped
+  // in wholesale. The ECB/Frankfurter refresh publishes only ECB's set, which
+  // OMITS currencies the bundle ships (e.g. AED, SAR). Replacing the whole table
+  // would drop those: a Home Currency of AED/SAR would then have no rate (totals
+  // read "unavailable"), and AED/SAR subscriptions would lose conversion under any
+  // Home. So the fresher override rate wins per-currency and the bundle fills any
+  // gap. Layering is only sound when both tables share a base (both ECB → EUR); if
+  // the bases ever differ, fall back to the override alone rather than mix bases.
+  if (override.base !== bundle.base) return override;
+  return {
+    schemaVersion: override.schemaVersion,
+    asOf: override.asOf,
+    base: override.base,
+    attribution: override.attribution,
+    // Bundle first, override second → override values win, bundle-only keys (AED,
+    // SAR, …) survive. `base ↦ "1"` is identical in both, so the merge is safe.
+    rates: { ...bundle.rates, ...override.rates },
+  };
 }
 
 // --- Local exact-decimal helpers (BigInt only) -------------------------------

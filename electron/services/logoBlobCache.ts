@@ -30,11 +30,21 @@
  * filesystem.
  */
 
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { extname, join } from "node:path";
 
 import { fileNames } from "../storage/paths";
 import { writeFileAtomic } from "../storage/safeJson";
+
+/**
+ * Hard cap on a single cached logo blob (CWE-770). A brand mark — SVG or a 64px
+ * favicon — is a few KB; 512 KiB is far above any legitimate logo yet bounds the
+ * main-process heap. Enforced BOTH on write (never persist an oversized provider
+ * response) and on read (defensively skip an oversized file that reached `logos/`
+ * by any other path — e.g. a symlink or an externally-planted file — so
+ * `readAllAsDataUris` can never buffer an unbounded blob into IPC memory).
+ */
+export const MAX_LOGO_BYTES = 512 * 1024;
 
 /**
  * The content-types the cache knows how to persist and the file extension it
@@ -196,6 +206,10 @@ export class LogoBlobCache {
     if (key === null) return false;
     const ext = extensionFor(contentType);
     if (ext === null) return false; // uncacheable content-type → drop silently
+    // Reject an oversized blob BEFORE it touches disk or later IPC memory (CWE-770).
+    // A real logo is a few KB; anything past the cap is dropped silently like an
+    // uncacheable type (the row keeps its lettered fallback, never-refetch gates it).
+    if (bytes.length > MAX_LOGO_BYTES) return false;
     const file = join(this.logosDir(), `${key}.${ext}`);
     await writeFileAtomic(file, bytes);
     return true;
@@ -229,8 +243,15 @@ export class LogoBlobCache {
       const key = parsed.domain.toLowerCase();
       if (out[key] !== undefined) continue; // first readable entry per domain wins
       const mime = EXTENSION_CONTENT_TYPES[parsed.ext];
+      const path = join(dir, name);
       try {
-        const bytes = await readFile(join(dir, name));
+        // Defensive size cap (CWE-770): skip an oversized file BEFORE buffering it
+        // into the base64 map that crosses IPC. `write` already caps what WE
+        // persist; this guards a file that reached `logos/` by another path (a
+        // symlink, an externally-planted file) from exhausting the main-process heap.
+        const info = await stat(path);
+        if (info.size > MAX_LOGO_BYTES) continue;
+        const bytes = await readFile(path);
         out[key] = `data:${mime};base64,${bytes.toString("base64")}`;
       } catch {
         // Skip an unreadable blob — the row falls back to the lettered tile.

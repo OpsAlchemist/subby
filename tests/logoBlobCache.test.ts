@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   LogoBlobCache,
+  MAX_LOGO_BYTES,
   extensionFor,
   normalizeDomainKey,
 } from "../electron/services/logoBlobCache";
@@ -85,6 +86,36 @@ describe("LogoBlobCache.write + has + readAllAsDataUris", () => {
     expect(written).toBe(false);
     expect(await cache.has("netflix.com")).toBe(false);
     await expect(readdir(logosDir(dataDir))).rejects.toBeTruthy(); // dir never created
+  });
+
+  it("write() rejects an oversized blob (CWE-770 cap) and persists nothing", async () => {
+    // Regression (PR #2, amazon-q): no upper bound let a huge provider response be
+    // written and later buffered into IPC memory. A blob past MAX_LOGO_BYTES is
+    // dropped silently (returns false), exactly like an uncacheable content-type.
+    const cache = new LogoBlobCache(() => dataDir);
+    const huge = new Uint8Array(MAX_LOGO_BYTES + 1);
+    const written = await cache.write("netflix.com", huge, "image/png");
+    expect(written).toBe(false);
+    expect(await cache.has("netflix.com")).toBe(false);
+    // A blob exactly at the cap is accepted (boundary).
+    const atCap = new Uint8Array(MAX_LOGO_BYTES);
+    expect(await cache.write("spotify.com", atCap, "image/png")).toBe(true);
+  });
+
+  it("readAllAsDataUris skips an oversized file planted in logos/ (defensive cap)", async () => {
+    // Regression (PR #2, amazon-q): a large file reaching logos/ by another path
+    // (symlink / externally planted) must not be buffered into the IPC map. The
+    // read path stats each file and skips anything past the cap.
+    const cache = new LogoBlobCache(() => dataDir);
+    await cache.write("netflix.com", new Uint8Array([0xde, 0xad]), "image/png");
+    // Plant an oversized file directly under logos/ (bypassing write()'s cap).
+    await writeFile(
+      join(logosDir(dataDir), "evil.png"),
+      Buffer.alloc(MAX_LOGO_BYTES + 1),
+    );
+    const map = await cache.readAllAsDataUris();
+    expect(map["netflix.com"]).toBeDefined(); // the small, valid blob survives
+    expect(map["evil"]).toBeUndefined(); // the oversized one is skipped
   });
 
   it("readAllAsDataUris returns a domain→data:<mime>;base64 map", async () => {

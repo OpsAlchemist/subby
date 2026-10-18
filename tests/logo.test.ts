@@ -49,6 +49,21 @@ describe("domainFromWebsite: normalize website → registrable domain", () => {
     expect(domainFromWebsite("https://foo.bar.youtube.com/x")).toBe("youtube.com");
   });
 
+  it("keeps three labels for a known multi-level ccTLD so distinct sites stay distinct", () => {
+    // Regression (PR #2, qodo): the last-two-labels heuristic collapsed bbc.co.uk
+    // and sky.co.uk both to `co.uk`, so live logo fetch queried `https://co.uk` and
+    // shared ONE wrong cached image. Known second-level suffixes keep three labels.
+    expect(domainFromWebsite("https://www.bbc.co.uk/news")).toBe("bbc.co.uk");
+    expect(domainFromWebsite("sky.co.uk")).toBe("sky.co.uk");
+    expect(domainFromWebsite("bbc.co.uk")).not.toBe(domainFromWebsite("sky.co.uk"));
+    expect(domainFromWebsite("shop.example.com.au")).toBe("example.com.au");
+    expect(domainFromWebsite("www.rakuten.co.jp")).toBe("rakuten.co.jp");
+    // A bare suffix with only two labels still resolves to those two (no 3rd exists).
+    expect(domainFromWebsite("co.uk")).toBe("co.uk");
+    // An UNLISTED exotic suffix safely falls back to the two-label heuristic.
+    expect(domainFromWebsite("foo.example.xyzzy")).toBe("example.xyzzy");
+  });
+
   it("lowercases the host and drops userinfo + port", () => {
     expect(domainFromWebsite("NETFLIX.COM")).toBe("netflix.com");
     expect(domainFromWebsite("https://user@Netflix.com:443/path")).toBe("netflix.com");

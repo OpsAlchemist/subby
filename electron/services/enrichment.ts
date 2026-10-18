@@ -329,10 +329,17 @@ export class EnrichmentService {
         }
       }
 
-      // (4) Fetch the whole table through the gated provider. A NetworkGateError
-      // (toggle off mid-flight / unregistered host) or any transport/parse error
-      // is a silent miss — nothing written, prior snapshot stays effective.
-      const snapshot = await this.fxProvider(settings.online, this.fetchImpl);
+      // (4) Fetch the whole table through the gated provider. RE-READ the toggles
+      // immediately before the fetch: the gate check in (2) happened before the
+      // awaited `readOverride()`, so the user may have turned `fxRefresh` OFF during
+      // that await. Pass the FRESH toggles (and bail if now off) so a request can
+      // never open after the setting was saved as off — the gateway is also keyed
+      // off these same toggles, so a stale "on" here would otherwise still fetch.
+      // A NetworkGateError (toggle off / unregistered host) or any transport/parse
+      // error is a silent miss — nothing written, prior snapshot stays effective.
+      const online = (await this.services.getSettings()).online;
+      if (!online.fxRefresh) return;
+      const snapshot = await this.fxProvider(online, this.fetchImpl);
 
       // A stop() (quit) that landed while fetching halts the write/broadcast.
       if (this.stopped) return;

@@ -29,6 +29,30 @@ describe("logoProviderUrl: targets the registered liveLogoFetch host", () => {
     // The domain is sent to the provider (as the `url` query param).
     expect(decodeURIComponent(url)).toContain("netflix.com");
   });
+
+  it("fail-closed SSRF guard: rejects a non-domain-shaped value (CWE-918)", () => {
+    // Regression (PR #2, amazon-q): `logoProviderUrl` is exported and embeds its
+    // arg in the `url` query param. A caller bypassing the EnrichmentService's
+    // normalizeDomainKey gate (a direct call, or a future call site) must not be
+    // able to steer the favicon service at an attacker-controlled target.
+    for (const bad of [
+      "https://attacker.example/pwn", // a full URL
+      "evil.example/path", // embedded path
+      "a.com&x=y", // query-injection chars
+      "a.com#frag",
+      "a.com/../../x",
+      "nodot", // no dot → not a registrable domain
+      " ", // empty after trim
+      "..", // empty labels
+    ]) {
+      expect(() => logoProviderUrl(bad)).toThrow(/invalid domain/);
+    }
+    // A legitimate bare registrable domain still works (and lowercases).
+    expect(new URL(logoProviderUrl("Netflix.COM")).hostname).toBe(
+      FEATURE_HOSTS.liveLogoFetch,
+    );
+    expect(decodeURIComponent(logoProviderUrl("Netflix.COM"))).toContain("netflix.com");
+  });
 });
 
 describe("fetchLogo: gated fetch with injected fetchImpl", () => {

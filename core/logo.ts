@@ -209,11 +209,33 @@ export function domainFromWebsite(website: string): string | null {
   const labels = s.split(".").filter((l) => l.length > 0);
   if (labels.length < 2) return null;
 
-  // Registrable domain ≈ the last two labels. Simple and dependency-free; a
-  // ccTLD edge like `co.uk` just resolves one label too shallow, which at worst
-  // misses the bundled icon and falls back to the lettered tile — never wrong.
-  return labels.slice(-2).join(".");
+  // Registrable domain ≈ the last two labels, EXCEPT when those two form a known
+  // multi-level public suffix (e.g. `co.uk`, `com.au`, `co.jp`) — then keep three,
+  // so `bbc.co.uk` and `sky.co.uk` stay distinct rather than both collapsing to the
+  // bare suffix `co.uk`. Without this, live logo fetch would query `https://co.uk`
+  // and cache ONE wrong image shared across every subscription on that suffix. This
+  // is a curated, dependency-free list of the common second-level suffixes (not a
+  // full public-suffix list — an unlisted exotic suffix still falls back to the
+  // two-label heuristic, which at worst misses a bundled icon, never wrong-fetches).
+  const lastTwo = labels.slice(-2).join(".");
+  if (labels.length >= 3 && MULTI_LEVEL_SUFFIXES.has(lastTwo)) {
+    return labels.slice(-3).join(".");
+  }
+  return lastTwo;
 }
+
+/**
+ * Common two-level public suffixes where the registrable domain is the THIRD
+ * label from the right (e.g. `bbc.co.uk`), not the second. Curated and
+ * dependency-free — covers the suffixes real subscription services use; an
+ * unlisted suffix safely degrades to the last-two-labels heuristic.
+ */
+const MULTI_LEVEL_SUFFIXES: ReadonlySet<string> = new Set([
+  "co.uk", "org.uk", "me.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp",
+  "com.au", "net.au", "org.au", "co.nz", "org.nz", "com.br", "com.cn",
+  "com.mx", "com.sg", "com.hk", "com.tr", "co.in", "co.za", "co.kr",
+  "com.tw", "co.il", "com.ar",
+]);
 
 /**
  * Resolve a row's logo from the bundled {@link LogoPack}, the fetched-logo cache,

@@ -47,11 +47,28 @@ const PROVIDER_ORIGIN = "https://t2.gstatic.com";
  * origin so the provider resolves the site's favicon.
  */
 export function logoProviderUrl(domain: string): string {
+  // Fail-closed SSRF guard (CWE-918): `domain` is embedded as the `url` query
+  // parameter sent to the favicon service, so a non-domain-shaped value (e.g. a
+  // full `https://attacker/...` URL, a path, or embedded `&`/`#`) would steer the
+  // provider at an attacker-controlled target. The EnrichmentService already gates
+  // every enqueue through `normalizeDomainKey`, but this exported function must not
+  // trust its sole upstream — a direct caller, or a future call site added without
+  // that guard, has to be refused here too. Shape mirrors `normalizeDomainKey`: a
+  // bare registrable domain (lowercase, domain chars only, at least one dot, no
+  // empty label), nothing a URL could hide inside.
+  const key = domain.trim().toLowerCase();
+  const shaped =
+    /^[a-z0-9.-]+$/.test(key) &&
+    key.includes(".") &&
+    !key.split(".").some((label) => label === "");
+  if (!shaped) {
+    throw new Error(`logoProviderUrl: invalid domain ${JSON.stringify(domain)}`);
+  }
   const params = new URLSearchParams({
     client: "SOCIAL",
     type: "FAVICON",
     fallback_opts: "TYPE,SIZE,URL",
-    url: `https://${domain}`,
+    url: `https://${key}`,
     size: "64",
   });
   return `${PROVIDER_ORIGIN}/faviconV2?${params.toString()}`;
