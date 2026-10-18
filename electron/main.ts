@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { app, BrowserWindow, ipcMain, session } from "electron";
 
-import type { SettingsV2 } from "core/models/settings";
+import type { OnlineSettingsV2, SettingsV2 } from "core/models/settings";
 import type { AppError, IpcResult } from "shared/types";
 
 import {
@@ -14,18 +14,59 @@ import {
   registerIpcHandlers,
   unregisterIpcHandlers,
 } from "./ipc/handlers";
+import { buildCsp } from "./net/csp";
 import { runChooseDataFolder } from "./services/dialog";
 import { NotificationService } from "./services/notificationService";
 import { Scheduler } from "./services/scheduler";
 import { destroyTray, ensureTray } from "./services/tray";
 
-/** Strict production CSP: same-origin only, zero remote origins (Req 20.2). */
-const PROD_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-  "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; " +
-  "object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
-
 const isDev = !app.isPackaged && Boolean(process.env["ELECTRON_RENDERER_URL"]);
+
+/**
+ * Silence Chromium's own phone-home surfaces at init (AD-7).
+ *
+ * Subby's gated-network boundary (`electron/net/`) is only meaningful if the
+ * browser engine underneath it cannot leak independently of the gate. Chromium
+ * ships several background network surfaces; the two reachable via command-line
+ * switches are disabled here, BEFORE the `ready` event (switches set after
+ * `ready` are ignored):
+ *   - `disable-component-update` — stops the component updater that fetches
+ *     Widevine/CRL/etc. bundles from Google in the background.
+ *   - `disable-domain-reliability` — stops Chrome's Domain Reliability service
+ *     from uploading network-error beacons to Google.
+ *
+ * The spellcheck dictionary download (also a Google CDN fetch) is additionally
+ * disabled per-window via `webPreferences.spellcheck: false`, and belt-and-
+ * braces at the session level inside {@link disablePhoneHomeSurfacesOnReady}.
+ * The renderer stays sandboxed with no Node integration (unchanged), and no
+ * auto-updater is added (AD-30) — an updater would itself be a phone-home
+ * surface against the telemetry line.
+ */
+function disablePhoneHomeSwitches(): void {
+  app.commandLine.appendSwitch("disable-component-update");
+  app.commandLine.appendSwitch("disable-domain-reliability");
+}
+// Must run before `ready`: command-line switches set after the app is ready are
+// not honored. Called at module load, which is before `app.whenReady` resolves.
+disablePhoneHomeSwitches();
+
+/**
+ * Session-level phone-home silence applied once the app is ready (AD-7).
+ *
+ * `setSpellCheckerDictionaryDownloadURL("")` points the Hunspell dictionary
+ * downloader at an empty URL so no dictionary is ever fetched from the Google
+ * CDN even if the spellchecker were somehow enabled (it is already off per
+ * window). No-op on macOS (the OS spellchecker is used), harmless elsewhere, and
+ * wrapped so a platform quirk can never throw into the launch sequence.
+ */
+function disablePhoneHomeSurfacesOnReady(): void {
+  if (isDev) return;
+  try {
+    session.defaultSession.setSpellCheckerDictionaryDownloadURL("");
+  } catch {
+    // Defensive: never let a session-API quirk abort launch (AD-28).
+  }
+}
 
 /**
  * Delay (ms) before the deferred scheduler first-tick. Kept small but non-zero
@@ -66,6 +107,21 @@ let isQuitting = false;
  */
 let trayModeCache = false;
 
+/**
+ * Cached `settings.online` toggles, refreshed from disk post-barrier and on
+ * every `settings:update` success. The dynamic production CSP
+ * ({@link applyProductionCsp}) reads this cache SYNCHRONOUSLY inside
+ * `onHeadersReceived` (which cannot await a settings read) so enabling an online
+ * feature later (Story 8.2) updates `connect-src` without a second header
+ * registration. Seeded all-false so the pre-barrier CSP is byte-identical to the
+ * fully-offline 1.0 policy (`connect-src 'self'`). Mirrors {@link trayModeCache}
+ * / {@link refreshTrayMode}.
+ */
+let onlineSettingsCache: OnlineSettingsV2 = {
+  liveLogoFetch: false,
+  fxRefresh: false,
+};
+
 /** Accessor passed to the IPC layer for renderer broadcasts. */
 const getWindow = (): BrowserWindow | null => mainWindow;
 
@@ -87,6 +143,24 @@ async function refreshTrayMode(): Promise<boolean> {
   return trayModeCache;
 }
 
+/**
+ * Re-read `settings.online` from the live services and refresh
+ * {@link onlineSettingsCache} so the synchronous `onHeadersReceived` CSP builder
+ * sees the current toggles. Called once post-barrier (seed) and after every
+ * `settings:update` success (so a feature enabled at runtime widens the CSP on
+ * the next request without a second header registration). Keeps the last known
+ * value on a transient read failure or before the context is built. (AD-6/AD-7.)
+ */
+async function refreshOnlineSettings(): Promise<void> {
+  if (appContext === null) return;
+  try {
+    const settings = await appContext.services.getSettings();
+    onlineSettingsCache = settings.online;
+  } catch {
+    // Keep the last known value on a transient read failure.
+  }
+}
+
 /** Begin a genuine quit: stop intercepting window close, then quit the app. */
 function requestQuit(): void {
   isQuitting = true;
@@ -97,11 +171,18 @@ function applyProductionCsp(): void {
   // In production the renderer loads from file://; enforce the strict CSP at
   // the network layer as defense-in-depth alongside the index.html meta tag.
   if (isDev) return;
+  // SINGLE registration. The callback is synchronous and cannot await a settings
+  // read, so it builds the policy from the cached `settings.online` toggles
+  // ({@link onlineSettingsCache}, refreshed post-barrier and on every
+  // `settings:update`). `buildCsp` derives `connect-src` from the SAME
+  // `allowedHosts` resolver the socket-level gate uses, so the CSP and the gate
+  // can never allow different hosts (AD-6/AD-7). With both toggles off this is
+  // byte-identical to the fully-offline 1.0 CSP (`connect-src 'self'`).
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        "Content-Security-Policy": [PROD_CSP],
+        "Content-Security-Policy": [buildCsp(onlineSettingsCache)],
       },
     });
   });
@@ -233,6 +314,11 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Phone-home silence (AD-7): disable Chromium's spellchecker so it never
+      // downloads a Hunspell dictionary from Google at first focus of a text
+      // field. One of the few phone-home surfaces that is a per-window
+      // `webPreferences` flag rather than a global command-line switch.
+      spellcheck: false,
     },
   });
 
@@ -285,6 +371,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // Silence Chromium's own phone-home surfaces at init before the window loads
+  // (AD-7): the session-level dictionary-download override here, the
+  // command-line switches already set at module load, and `spellcheck: false`
+  // on the window below. Nothing may leak underneath the gated-network boundary.
+  disablePhoneHomeSurfacesOnReady();
   applyProductionCsp();
 
   // Ordered launch sequence with a migration barrier (AD-28). The steps run in a
@@ -330,6 +421,13 @@ app.whenReady().then(async () => {
     // (Req 13.3/13.4). This reads user data, so it must follow the barrier.
     await refreshTrayMode();
 
+    // Seed the online-toggle cache from (now barrier-passed) persisted settings
+    // so the synchronous `onHeadersReceived` CSP builder reflects the user's
+    // actual toggles from the first request (AD-7). Reads user data → after the
+    // barrier. For a fresh/offline user this is all-false, so `connect-src`
+    // stays `'self'`.
+    await refreshOnlineSettings();
+
     // Register IPC handlers once over the assembled services, after the barrier
     // so a handler read never observes un-migrated data. Tearing down first makes
     // registration idempotent and avoids duplicate-handler errors on a dev
@@ -337,7 +435,14 @@ app.whenReady().then(async () => {
     stage = "handlers";
     unregisterIpcHandlers();
     unregisterDialogChannels();
-    registerIpcHandlers(appContext.services, getWindow);
+    // The `onSettingsMutated` hook refreshes the online-toggle cache whenever a
+    // `settings:update` succeeds, so enabling an online feature at runtime
+    // (Story 8.2) widens the CSP on the next request — no second
+    // `onHeadersReceived` registration (AD-7). Fire-and-forget: the refresh is a
+    // lock-free read and the CSP only needs to be current by the next request.
+    registerIpcHandlers(appContext.services, getWindow, () => {
+      void refreshOnlineSettings();
+    });
     registerDialogChannels(appContext);
 
     // (4) Window: on `ready-to-show` it presents and defers the scheduler

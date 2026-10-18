@@ -67,6 +67,18 @@ import { CH } from "./channels";
 export type GetWindow = () => BrowserWindow | null;
 
 /**
+ * Optional side-effect fired after a successful `settings:update` (Story 8.1).
+ *
+ * Lets the main process react to a settings change without re-reading settings
+ * synchronously elsewhere — the gated-network CSP cache
+ * (`onlineSettingsCache` in `main.ts`) refreshes through this so a toggled
+ * online feature widens `connect-src` on the next request (AD-7). It is a plain
+ * notification (no arguments): the hook re-reads the authoritative settings
+ * itself. Any throw is swallowed so it never fails the IPC call.
+ */
+export type OnSettingsMutated = () => void;
+
+/**
  * Result data returned by the `cat:remove` handler.
  *
  * Deleting an in-use category is not an error — it is a confirmation flow
@@ -157,10 +169,14 @@ const SYSTEM_ERROR_CODES: ReadonlySet<AppError["code"]> = new Set([
  * @param getWindow Accessor for the renderer window used to broadcast
  *                  `evt:dataChanged` / `evt:error`. May return `null` if no
  *                  window is currently open (broadcasts are then skipped).
+ * @param onSettingsMutated Optional hook fired after a `settings:update`
+ *                  succeeds (Story 8.1). Used by `main.ts` to refresh the
+ *                  gated-network CSP cache; a throw here is swallowed.
  */
 export function registerIpcHandlers(
   services: AppServices,
   getWindow: GetWindow,
+  onSettingsMutated?: OnSettingsMutated,
 ): void {
   const broadcastDataChanged = (): void => {
     const win = getWindow();
@@ -373,8 +389,23 @@ export function registerIpcHandlers(
 
   handle<IpcResult<SettingsV2>>(
     CH.settings.update,
-    (_event, patch: Partial<SettingsV2>) =>
-      mutate(() => services.updateSettings(patch)),
+    async (
+      _event,
+      patch: Partial<SettingsV2>,
+    ): Promise<IpcResult<SettingsV2>> => {
+      const result = await mutate(() => services.updateSettings(patch));
+      // Notify the main process of a successful settings change so the
+      // gated-network CSP cache can refresh (AD-7). Guarded so a hook fault
+      // never turns a successful update into a failed IPC call.
+      if (result.ok && onSettingsMutated) {
+        try {
+          onSettingsMutated();
+        } catch {
+          // Swallow: the hook is a best-effort side effect, never load-bearing.
+        }
+      }
+      return result;
+    },
   );
 
   // --- Suggested price (FR-13, Story 5.4) ------------------------------------

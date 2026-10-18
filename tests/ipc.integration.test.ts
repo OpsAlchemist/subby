@@ -704,6 +704,74 @@ describe("backup:create IPC round-trip (Story 7.3)", () => {
   });
 });
 
+describe("settings:update onSettingsMutated hook (Story 8.1 — CSP-refresh trigger)", () => {
+  it("fires the hook exactly once on a successful settings:update", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    sentChannels.length = 0;
+    const onSettingsMutated = vi.fn();
+    registerIpcHandlers(services, () => null, onSettingsMutated);
+
+    const listener = ipcHandlers.get(CH.settings.update);
+    expect(listener).toBeTypeOf("function");
+
+    // A real successful patch over the live services (toggle an online feature).
+    const result = (await listener!({} as never, {
+      online: { liveLogoFetch: true, fxRefresh: false },
+    })) as { ok: boolean };
+
+    expect(result.ok).toBe(true);
+    expect(onSettingsMutated).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT fire the hook when updateSettings fails (result.ok === false)", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    const onSettingsMutated = vi.fn();
+    // A services stub whose updateSettings rejects — only this channel is driven.
+    const failing = {
+      ...services,
+      updateSettings: vi.fn(async () => {
+        throw new Error("disk full");
+      }),
+    } as unknown as AppServices;
+    registerIpcHandlers(failing, () => null, onSettingsMutated);
+
+    const listener = ipcHandlers.get(CH.settings.update);
+    const result = (await listener!({} as never, { trayMode: true })) as {
+      ok: boolean;
+    };
+
+    expect(result.ok).toBe(false);
+    expect(onSettingsMutated).not.toHaveBeenCalled();
+  });
+
+  it("still resolves ok:true when the hook itself throws (throw is swallowed)", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    const onSettingsMutated = vi.fn(() => {
+      throw new Error("hook boom");
+    });
+    registerIpcHandlers(services, () => null, onSettingsMutated);
+
+    const listener = ipcHandlers.get(CH.settings.update);
+    // A successful patch; the hook throws but must not turn the IPC call into a
+    // failure (the hook is a best-effort side effect).
+    const result = (await listener!({} as never, { trayMode: true })) as {
+      ok: boolean;
+    };
+
+    expect(onSettingsMutated).toHaveBeenCalledTimes(1);
+    expect(result.ok).toBe(true);
+  });
+});
+
 describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
   // Type-level guarantee: every expected name is a real SubbyApi member.
   // If a name drifts from the facade type, the project typecheck fails.

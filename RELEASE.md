@@ -81,9 +81,47 @@ pre-release.
 - [ ] All CI checks green on `main`.
 - [ ] Manual smoke test of each installer (launch, add/edit subscription,
       import/export, restart persistence, notifications, tray mode).
+- [ ] **Zero-outbound packet-capture (release-QA).** See
+      "[Network privacy verification](#network-privacy-verification)" — confirm a
+      packaged build with all Online Features OFF makes NO outbound request.
 - [ ] `package.json` version bumped and committed.
 - [ ] Release notes drafted (highlights, fixes, known issues).
 - [ ] (Stable) Code signing & notarization configured — see below.
+
+## Network privacy verification
+
+Subby's promise is "private by default": with every **Online Features** toggle
+OFF the app makes **zero** outbound network requests. This is verified **two
+ways**, and both must pass before a release.
+
+1. **Static scan (automated, in CI).** `tests/privacy.test.ts` fails if any
+   network primitive (`fetch`/XHR/WebSocket/EventSource) or networking module
+   appears anywhere outside the single audited site `electron/net/gateway.ts`
+   (a sibling under `net/` with a primitive still fails), hard-bans
+   telemetry/tracking/`sendBeacon` everywhere (including inside `net/`), and
+   asserts the production CSP carries no remote origin while toggles are off.
+   `tests/net/gateway.test.ts` proves the gate refuses an off-toggle or
+   unregistered-host request **before** the network primitive is ever invoked
+   (the injected primitive spy records zero calls).
+
+2. **Runtime packet-capture (manual release-QA step; addendum §SM-3).** The
+   pure-Node CI harness cannot packet-capture a running Chromium, so this is a
+   **documented manual step**, not faked in CI. On a **packaged** build with all
+   Online Features **OFF**:
+   - Launch the app behind a capture tool — e.g. **Little Snitch** / **LuLu**
+     (macOS), **Wireshark** / **mitmproxy**, or a monitoring proxy — with all of
+     Subby's process egress logged.
+   - Exercise the app for a few minutes (open each screen, add/edit a
+     subscription, open Settings → Online Features but leave every toggle off).
+   - **Expected:** zero outbound **TCP/HTTPS connections to any remote host**
+     from the Subby process — no logo provider (`t2.gstatic.com`), no FX host
+     (`api.frankfurter.dev`), and none of Chromium's own phone-home surfaces
+     (component updater, domain-reliability, spellcheck dictionary CDN), which
+     are disabled at app init. DNS name lookups themselves (UDP/53 to the system
+     resolver) are **excluded** from this assertion — what must be zero is any
+     connection that carries application data to a remote endpoint.
+   - Then enable a single toggle and confirm the ONLY new egress is that one
+     feature's registered host over HTTPS, matching the CSP `connect-src`.
 
 ## Known beta limitations
 
