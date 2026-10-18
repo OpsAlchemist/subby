@@ -164,6 +164,10 @@ function createFakeApi(initial: SubscriptionV2[]): FakeApi {
         ? errResult<RateSnapshot>({ code: "not_found", message: "unavailable" })
         : ok(fake.fxSnapshot as RateSnapshot)) as SubbyApi["getFxSnapshot"],
 
+    // --- Logo Pack (Story 8.3): empty pack → every row uses the lettered fallback ---
+    getLogoPack: (() =>
+      ok({ version: 1, generatedAt: "", note: "", icons: {} })) as SubbyApi["getLogoPack"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),

@@ -19,6 +19,7 @@
 
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
 import type { AppError, IpcResult } from "shared/types";
+import { EMPTY_LOGO_PACK, type LogoPack } from "core/logo";
 
 // --- Facade access / injection ----------------------------------------------
 
@@ -186,6 +187,32 @@ export async function getFxSnapshotSafe(
     return await fxApi.snapshot(home);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Logo Pack operations (Story 8.3). READ-ONLY: `pack` returns the bundled
+ * {@link LogoPack} (or throws a {@link SubbyError} on a bridge/IPC failure).
+ * The logo surface uses the never-throws {@link getLogoPackSafe} so an absent
+ * bridge or a surprise failure degrades to an EMPTY pack — every row then shows
+ * the deterministic lettered fallback, never a crash.
+ */
+export const logoApi = {
+  pack: () => unwrap(getSubby().getLogoPack()),
+} as const;
+
+/**
+ * Logo Pack fetch that NEVER throws: resolves to the {@link LogoPack} or the
+ * {@link EMPTY_LOGO_PACK}, swallowing any bridge/IPC failure (a missing/corrupt
+ * bundle already arrives as an empty pack from main; this guards the no-preload
+ * / unexpected-throw case too). The logo surface treats the empty pack as "every
+ * row uses the lettered fallback" — a logo is decorative, never load-bearing.
+ */
+export async function getLogoPackSafe(): Promise<LogoPack> {
+  try {
+    return await logoApi.pack();
+  } catch {
+    return EMPTY_LOGO_PACK;
   }
 }
 

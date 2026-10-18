@@ -19,12 +19,14 @@ import { subscriptionsStore } from "./subscriptionsStore";
 import { categoriesStore } from "./categoriesStore";
 import { settingsStore } from "./settingsStore";
 import { backupsStore } from "./backupsStore";
+import { logoPackStore } from "./logoPackStore";
 import { errorStore } from "./errorStore";
 
 export { subscriptionsStore } from "./subscriptionsStore";
 export { categoriesStore } from "./categoriesStore";
 export { settingsStore } from "./settingsStore";
 export { backupsStore } from "./backupsStore";
+export { logoPackStore } from "./logoPackStore";
 export { errorStore } from "./errorStore";
 export type { Store, StoreState } from "./createStore";
 export { createStore } from "./createStore";
@@ -65,6 +67,11 @@ export function initStores(): () => void {
 
     // Initial population so views render current data on startup.
     void reloadAll();
+
+    // Hydrate the Logo Pack ONCE at launch (Story 8.3). It is immutable shipped
+    // data, so it is NOT in `allStores` (nothing to reload on a mutation) — a
+    // single load is enough for every row to resolve its tile synchronously.
+    void logoPackStore.load();
 
     let torndown = false;
     return () => {

@@ -25,6 +25,7 @@ import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
 import { lookupSuggestion, type PriceSeed, type PriceSuggestion } from "core/priceSeed";
 import { ratesForHome, type BundledFxSnapshot } from "core/fxSnapshot";
+import { EMPTY_LOGO_PACK, type LogoPack } from "core/logo";
 import type { RateSnapshot } from "core/money";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
@@ -35,7 +36,11 @@ import type { ConflictMode, SubscriptionInputV2 } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
 import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
-import { readBundledFxSnapshot, readBundledPriceSeed } from "./storage/resourceReader";
+import {
+  readBundledFxSnapshot,
+  readBundledLogoPack,
+  readBundledPriceSeed,
+} from "./storage/resourceReader";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
@@ -214,6 +219,17 @@ export interface AppServices {
    */
   getFxSnapshot(homeCurrency: string): RateSnapshot | null;
 
+  // --- Logo Pack (Story 8.3) ---
+  /**
+   * Return the bundled {@link LogoPack} loaded once at construction (FR-26,
+   * AD-25). READ-ONLY, lock-free, NEVER throws and NEVER touches the network:
+   * the pack is immutable shipped data read through the resource reader, not the
+   * StoragePort. A missing/corrupt pack arrives here as the EMPTY pack, so the
+   * renderer resolves every row to the deterministic lettered fallback — never a
+   * crash, never a blocking fetch, never a toast.
+   */
+  getLogoPack(): LogoPack;
+
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
   getSettings(): Promise<SettingsV2>;
@@ -370,6 +386,30 @@ export const defaultFxSnapshotLoader: FxSnapshotLoader = () => {
 };
 
 /**
+ * Load the bundled Logo Pack, degrading to the EMPTY pack on any failure (Story
+ * 8.3).
+ *
+ * The default production loader reads the asar-aware bundle via
+ * {@link readBundledLogoPack}, which itself never throws (a missing/corrupt pack
+ * yields the {@link EMPTY_LOGO_PACK}). Injectable so tests can supply a fixed
+ * {@link LogoPack} (or the empty pack to simulate an absent/corrupt bundle)
+ * WITHOUT booting Electron (the default would touch the `electron` `app`
+ * globals).
+ */
+export type LogoPackLoader = () => LogoPack;
+
+/** The production Logo Pack loader: read the bundle, EMPTY pack on any failure. */
+export const defaultLogoPackLoader: LogoPackLoader = () => {
+  try {
+    return readBundledLogoPack();
+  } catch {
+    // readBundledLogoPack already degrades, but belt-and-suspenders: a logo is
+    // decorative, so any surprise failure resolves to the lettered fallback.
+    return EMPTY_LOGO_PACK;
+  }
+};
+
+/**
  * Build the application services over an injected {@link StoragePort}.
  *
  * Used directly in tests with an in-memory/temp-dir storage implementation, and
@@ -384,11 +424,16 @@ export const defaultFxSnapshotLoader: FxSnapshotLoader = () => {
  *                     to load — rates then surface as "unavailable"). Defaults to
  *                     the production {@link defaultFxSnapshotLoader}; tests inject
  *                     a fixed snapshot.
+ * @param logoPack     the loaded bundled Logo Pack (or the EMPTY pack when it
+ *                     failed to load — every row then shows the lettered
+ *                     fallback). Defaults to the production
+ *                     {@link defaultLogoPackLoader}; tests inject a fixed pack.
  */
 export function buildAppServices(
   storage: StoragePort,
   priceSeed: PriceSeed | null = defaultPriceSeedLoader(),
   fxSnapshot: BundledFxSnapshot | null = defaultFxSnapshotLoader(),
+  logoPack: LogoPack = defaultLogoPackLoader(),
 ): AppServices {
   // Per-file write authority (AD-29). Every mutating method below runs its whole
   // `read → core → write` (and, for a destructive op, its pre-op backup) inside
@@ -563,6 +608,15 @@ export function buildAppServices(
       } catch {
         return null;
       }
+    },
+
+    // --- Logo Pack (Story 8.3) -----------------------------------------------
+    getLogoPack() {
+      // Lock-free, read-only return of the immutable in-memory pack read once at
+      // construction. When the pack failed to load it is the EMPTY pack, so the
+      // renderer resolves every row to the lettered fallback. No network, no
+      // StoragePort, never throws.
+      return logoPack;
     },
 
     // --- Settings ------------------------------------------------------------

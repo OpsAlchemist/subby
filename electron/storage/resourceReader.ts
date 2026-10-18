@@ -38,12 +38,20 @@ import {
   parsePriceSeed,
   type PriceSeed,
 } from "core/priceSeed";
+import {
+  parseLogoPack,
+  EMPTY_LOGO_PACK,
+  type LogoPack,
+} from "core/logo";
 
 /** The canonical name of the bundled FX snapshot resource. */
 export const FX_SNAPSHOT_RESOURCE = "fx-snapshot.json" as const;
 
 /** The canonical name of the bundled suggested-price-seed resource (Story 5.4). */
 export const PRICE_SEED_RESOURCE = "price-seed.json" as const;
+
+/** The canonical name of the bundled Logo Pack resource (Story 8.3). */
+export const LOGO_PACK_RESOURCE = "logo-pack.json" as const;
 
 /**
  * Inputs for {@link resolveResourceDir}, supplied by the app-wiring layer at the
@@ -163,6 +171,29 @@ export function readBundledPriceSeed(
   opts: ResolveResourceDirOptions = defaultResolveOptions(),
 ): PriceSeed {
   return parsePriceSeed(readBundledResource(PRICE_SEED_RESOURCE, opts));
+}
+
+/**
+ * Convenience: read the bundled Logo Pack into a typed {@link LogoPack} (Story
+ * 8.3). Unlike the FX snapshot / price seed (which fail LOUD on a bad bundle
+ * because a wrong number is dangerous), a missing/corrupt logo pack is purely
+ * COSMETIC — the correct degraded behavior is "every row shows the lettered
+ * fallback", never a crash and never a toast. So this reader DEGRADES to the
+ * {@link EMPTY_LOGO_PACK} on a {@link ResourceReadError} (missing/malformed JSON)
+ * and defers to the lenient, never-throwing {@link parseLogoPack} for a bad
+ * shape. It never throws.
+ */
+export function readBundledLogoPack(
+  opts: ResolveResourceDirOptions = defaultResolveOptions(),
+): LogoPack {
+  try {
+    return parseLogoPack(readBundledResource(LOGO_PACK_RESOURCE, opts));
+  } catch {
+    // ResourceReadError (missing/malformed): degrade to the empty pack so every
+    // row falls back to the lettered tile — a logo is decorative, never
+    // load-bearing.
+    return EMPTY_LOGO_PACK;
+  }
 }
 
 /**

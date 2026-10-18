@@ -52,6 +52,7 @@ import type { CreateCategoryResult } from "core/categories";
 import type { ImportOutcome } from "core/import";
 import type { PriceSuggestion } from "core/priceSeed";
 import type { RateSnapshot } from "core/money";
+import type { LogoPack } from "core/logo";
 import type {
   AppError,
   ExportRequest,
@@ -441,6 +442,16 @@ export function registerIpcHandlers(
       }),
   );
 
+  // --- Logo Pack (Story 8.3) -------------------------------------------------
+  // READ-ONLY: never broadcasts `evt:dataChanged`. Unlike `fx:snapshot`, an
+  // absent/corrupt pack is NOT an error outcome — the service returns the EMPTY
+  // pack, which is valid data the renderer resolves to lettered fallbacks. So
+  // this returns `{ ok: true, data: pack }` directly. The service never throws;
+  // `query` still wraps it defensively so a crash never crosses the bridge.
+  handle<IpcResult<LogoPack>>(CH.logos.pack, () =>
+    query(() => services.getLogoPack()),
+  );
+
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
 
   handle<IpcResult<ImportOutcome>>(
@@ -508,6 +519,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.settings.update,
   CH.price.suggest,
   CH.fx.snapshot,
+  CH.logos.pack,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,

@@ -32,6 +32,7 @@ import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { fileNames } from "../electron/storage/paths";
 import { parsePriceSeed, type PriceSeed } from "core/priceSeed";
 import { parseBundledSnapshot, type BundledFxSnapshot } from "core/fxSnapshot";
+import { parseLogoPack, type LogoPack } from "core/logo";
 import { DEFAULT_SETTINGS, DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
 import type { SubscriptionV2 } from "core/models/subscription";
@@ -380,6 +381,56 @@ describe("AppServices FX snapshot (Story 6.1)", () => {
   it("`fx:snapshot` is a registered read-only channel constant", async () => {
     const { CH } = await import("../electron/ipc/channels");
     expect(CH.fx.snapshot).toBe("fx:snapshot");
+  });
+});
+
+describe("AppServices Logo Pack (Story 8.3)", () => {
+  /** A tiny valid Logo Pack fixture (one bundled brand). */
+  function makePack(): LogoPack {
+    return parseLogoPack({
+      version: 1,
+      generatedAt: "2026-10-18T00:00:00.000Z",
+      note: "test fixture pack",
+      icons: {
+        "netflix.com": { title: "Netflix", hex: "E50914", path: "M0 0h24v24H0z" },
+      },
+    });
+  }
+
+  it("getLogoPack() returns the injected pack verbatim (lock-free, read-only)", () => {
+    const pack = makePack();
+    const svc = buildAppServices(storage, null, null, pack);
+    expect(svc.getLogoPack()).toBe(pack);
+    expect(svc.getLogoPack().icons["netflix.com"].title).toBe("Netflix");
+  });
+
+  it("`logos:pack` handler returns { ok: true, data: pack } (no broadcast)", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    sentChannels.length = 0;
+
+    const pack = makePack();
+    const svc = buildAppServices(storage, null, null, pack);
+    const fakeWin = {
+      isDestroyed: () => false,
+      webContents: { send: (channel: string) => sentChannels.push(channel) },
+    };
+    registerIpcHandlers(svc, () => fakeWin as never);
+
+    expect(CH.logos.pack).toBe("logos:pack");
+    const listener = ipcHandlers.get(CH.logos.pack);
+    expect(listener).toBeTypeOf("function");
+
+    const result = (await listener!({} as never)) as {
+      ok: boolean;
+      data?: LogoPack;
+    };
+    expect(result.ok).toBe(true);
+    expect(result.data).toBe(pack);
+    // READ-ONLY: a read never broadcasts evt:dataChanged.
+    expect(sentChannels).not.toContain(CH.events.dataChanged);
   });
 });
 
@@ -790,6 +841,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "chooseDataFolder",
     "getPriceSuggestion",
     "getFxSnapshot",
+    "getLogoPack",
     "importData",
     "exportData",
     "listBackups",

@@ -51,6 +51,7 @@ import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStore, useStoreData } from "@/stores/hooks";
 import { getFxSnapshotSafe } from "@/api/subby";
 import CategoryColorDot from "@/components/CategoryColorDot";
+import LogoTile from "@/components/LogoTile";
 import CountUp from "@/components/CountUp";
 import Skeleton from "@/components/Skeleton";
 import StaleRateNote from "@/components/StaleRateNote";
@@ -273,14 +274,17 @@ function SubscriptionPanel({
               key={s.id}
               className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0"
             >
-              <span className="min-w-0 truncate">
-                <span className="font-medium">{s.name}</span>
-                {s.category && (
-                  <span className="ml-2 inline-flex items-center text-sm text-muted-foreground">
-                    <CategoryColorDot categoryName={s.category} />
-                    {s.category}
-                  </span>
-                )}
+              <span className="flex min-w-0 items-center gap-2">
+                <LogoTile name={s.name} website={s.website} />
+                <span className="min-w-0 truncate">
+                  <span className="font-medium">{s.name}</span>
+                  {s.category && (
+                    <span className="ml-2 inline-flex items-center text-sm text-muted-foreground">
+                      <CategoryColorDot categoryName={s.category} />
+                      {s.category}
+                    </span>
+                  )}
+                </span>
               </span>
               <span className="shrink-0 text-sm text-muted-foreground">
                 {renderMeta(s)}

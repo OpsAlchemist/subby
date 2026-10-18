@@ -19,6 +19,7 @@ import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription
 import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { PriceSuggestion } from "core/priceSeed";
 import type { RateSnapshot } from "core/money";
+import type { LogoPack } from "core/logo";
 import type { ImportOutcome } from "core/import";
 import type {
   AppError,
@@ -117,6 +118,18 @@ export interface SubbyApi {
    * a wrong confident total.
    */
   getFxSnapshot(homeCurrency: string): Promise<IpcResult<RateSnapshot>>;
+
+  // --- Logo Pack (Story 8.3) ---
+  /**
+   * Fetch the bundled {@link LogoPack} ONCE at launch (FR-26, AD-25). READ-ONLY:
+   * no mutation, no `evt:dataChanged`, and NO network — the pack is immutable
+   * shipped data delivered through the resource reader → IPC → store triad. A
+   * missing/corrupt bundle resolves to an EMPTY pack (valid data, not an error),
+   * so the renderer shows the deterministic lettered fallback for every row. The
+   * renderer hydrates this into `logoPackStore` so rows resolve synchronously
+   * with no per-row IPC (AD-9).
+   */
+  getLogoPack(): Promise<IpcResult<LogoPack>>;
 
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;
