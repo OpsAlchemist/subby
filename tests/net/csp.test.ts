@@ -3,7 +3,7 @@ import { describe, it, expect } from "vitest";
 import type { OnlineSettingsV2 } from "core/models/settings";
 
 import { buildCsp } from "../../electron/net/csp";
-import { FEATURE_HOSTS } from "../../electron/net/hosts";
+import { allowedHosts, FEATURE_HOSTS } from "../../electron/net/hosts";
 
 /**
  * Dynamic production CSP (Story 8.1, AD-7) — the settings-driven `connect-src`.
@@ -29,11 +29,26 @@ describe("buildCsp: connect-src is settings-driven (AD-7)", () => {
   it("adds exactly the logo host (and nothing more) when only liveLogoFetch is on", () => {
     const csp = buildCsp({ liveLogoFetch: true, fxRefresh: false });
     expect(cspDirective(csp, "connect-src")).toBe(`'self' https://${LOGO_HOST}`);
+    // The logo host is EXACTLY t2.gstatic.com (the Story 8.5 provider of record).
+    expect(LOGO_HOST).toBe("t2.gstatic.com");
+    expect(csp).toContain("https://t2.gstatic.com");
     // The FX host must NOT appear when its toggle is off.
     expect(csp).not.toContain(FX_HOST);
     // Static directives are preserved.
     expect(cspDirective(csp, "default-src")).toBe("'self'");
     expect(cspDirective(csp, "object-src")).toBe("'none'");
+  });
+
+  it("removes the logo host when liveLogoFetch flips off — the toggle add/remove is symmetric (Story 8.5)", () => {
+    // The headline off-invariant seen from the CSP side: with every online toggle
+    // off, connect-src is exactly 'self' and the logo host is gone — proving the
+    // host is ADDED only while the toggle is on and REMOVED the moment it is off
+    // (the dynamic CSP computes the same allowlist the socket gate does, AD-6/7).
+    const off = buildCsp({ liveLogoFetch: false, fxRefresh: false });
+    expect(cspDirective(off, "connect-src")).toBe("'self'");
+    expect(off).not.toContain(LOGO_HOST);
+    expect(off).not.toMatch(/https?:/);
+    expect(off).not.toMatch(/\bws{1,2}:/);
   });
 
   it("adds exactly the FX host (and nothing more) when only fxRefresh is on", () => {
@@ -57,5 +72,15 @@ describe("buildCsp: connect-src is settings-driven (AD-7)", () => {
     const csp = buildCsp({ liveLogoFetch: true, fxRefresh: true });
     expect(csp).not.toMatch(/\bhttp:/);
     expect(csp).not.toMatch(/\bws{1,2}:/);
+  });
+});
+
+describe("allowedHosts: single-provider invariant for live logo fetch (Story 8.5)", () => {
+  it("resolves to EXACTLY one origin — the provider of record t2.gstatic.com — and no second origin", () => {
+    // Pins "exactly one logo origin, the provider of record": if a future change
+    // ever adds a second logo provider / per-service origin, this fails loudly.
+    const hosts = allowedHosts({ liveLogoFetch: true, fxRefresh: false });
+    expect(hosts).toEqual(new Set(["t2.gstatic.com"]));
+    expect(hosts.size).toBe(1);
   });
 });

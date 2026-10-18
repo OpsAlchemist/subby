@@ -74,6 +74,25 @@ The opt-in online *live logo fetch* (which would fetch a brand's favicon from th
 network for brands not in the bundled pack) is a separate, explicitly opt-in
 feature and is off by default.
 
+**Live logo fetch — provider of record and fallback-of-record.** When — and only
+when — you turn **Live logo fetch** on, a bundled+cache *miss* for a real domain
+is fetched from a single provider of record: **Google's favicon service** (host
+`t2.gstatic.com`, path `/faviconV2`). That request sends the service's domain (not
+your identity or any subscription detail) to Google; over time, the aggregate set
+of domains you fetch reveals the full set of services you track to Google, linked
+to your IP address — which is exactly what the enable notice states before you
+turn it on. A **successfully** fetched logo is cached locally and **not
+re-fetched**. A fetch that fails to produce a usable logo (a 404, a transport
+error, or an uncacheable response) is **not** cached and degrades silently to the
+lettered tile — no retry, no error — so that domain may be retried on a later
+mount or session while the toggle stays on (a negative-cache to suppress repeated
+failures is planned follow-up work). The **documented fallback-of-record** —
+should the primary provider ever become unusable (e.g. a terms-of-service change)
+— is the service's **own `/favicon.ico`**, which would leak only to a service you
+already subscribe to. That fallback is a *degradation story*, not a second fetch
+path shipped today: Google's `t2.gstatic.com/faviconV2` is the sole live provider,
+and Subby ships no separate favicon fetcher.
+
 ## Renderer security posture
 
 The renderer is treated as untrusted and tightly sandboxed:

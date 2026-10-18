@@ -19,8 +19,9 @@ import type { OnlineSettingsV2 } from "core/models/settings";
 /**
  * The registered host for each online feature (run-level decisions, Epic 8
  * context):
- *   - `liveLogoFetch` → `t2.gstatic.com` — Google `s2/faviconV2` logo provider
- *     of record (Story 8.5). Confirmed to receive the queried domain.
+ *   - `liveLogoFetch` → `t2.gstatic.com` — Google's favicon service (path
+ *     `/faviconV2`) logo provider of record (Story 8.5). Confirmed to receive
+ *     the queried domain.
  *   - `fxRefresh` → `api.frankfurter.dev` — Frankfurter's ECB rate path (AD-23),
  *     lineage-consistent with the bundled ECB FX snapshot.
  *

@@ -353,6 +353,34 @@ describe("Settings → Online Features section (Story 8.2)", () => {
     ).toBeInTheDocument();
   });
 
+  it("pins the EXACT aggregate-exposure logo notice wording (Story 8.5, AD-14, FR-27)", async () => {
+    // The highest-scrutiny notice must disclose the AGGREGATE exposure — the full
+    // set of services over time, the real recipient (Google / t2.gstatic.com), AND
+    // the IP linkage — never a per-logo framing. This exact string is a consent
+    // correctness guarantee; pinning it makes any silent copy regression FAIL.
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const notice = within(region).getByText(
+      "Over time this reveals the full set of services you track to Google (t2.gstatic.com), linked to your IP address.",
+    );
+    expect(notice).toBeInTheDocument();
+
+    // The notice is the logo switch's own programmatic description (so a screen
+    // reader hears the aggregate disclosure WITH the control it gates).
+    const logos = within(region).getByRole("switch", { name: logosName });
+    expect(logos.getAttribute("aria-describedby")).toBe(notice.id);
+
+    // Guard the three load-bearing phrases individually so a partial edit (e.g.
+    // dropping the IP linkage or renaming the recipient) also fails.
+    const text = notice.textContent ?? "";
+    expect(text).toContain("full set of services you track");
+    expect(text).toContain("Google (t2.gstatic.com)");
+    expect(text).toContain("linked to your IP address");
+    // It is an AGGREGATE framing, never a single-logo one.
+    expect(text).not.toMatch(/\b(this logo|a logo|each logo|per logo)\b/i);
+  });
+
   it("each switch's aria-describedby resolves to its own exposure notice", async () => {
     render(<Settings />);
     const region = await screen.findByRole("region", { name: "Online Features" });

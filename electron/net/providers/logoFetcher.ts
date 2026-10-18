@@ -9,8 +9,8 @@
  * socket opens (a {@link NetworkGateError}) and 8.4 is fully exercisable with the
  * gate CLOSED (enqueue → refused → silent fallback).
  *
- * Provider of record (run-level Epic 8 decision): Google `s2/faviconV2`, host
- * `t2.gstatic.com` — the SAME host registered for `liveLogoFetch` in
+ * Provider of record (run-level Epic 8 decision): Google's favicon service at
+ * host `t2.gstatic.com`, path `/faviconV2` — the SAME host registered for `liveLogoFetch` in
  * `net/hosts.ts`, so the gate's allowlist and this URL can never diverge. The
  * query sends the subscription's domain to that host; that user-facing exposure
  * only goes live in Story 8.5 when the toggle can be enabled. Here the provider
