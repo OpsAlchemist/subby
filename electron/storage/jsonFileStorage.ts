@@ -47,6 +47,7 @@ import {
 } from "core/models/schema";
 import { assignDefaultColors } from "core/categories";
 import { assembleBackupPayload, backupFileName } from "core/backup";
+import { parseFxOverride, type FxOverride } from "core/fxSnapshot";
 import { migrate } from "core/migrations";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
@@ -387,6 +388,10 @@ export class JsonFileStorage implements StoragePort {
 
   private get reminderLedgerPath(): string {
     return join(this.dataDir, fileNames.reminderLedger);
+  }
+
+  private get fxOverridePath(): string {
+    return join(this.dataDir, fileNames.fxOverride);
   }
 
   /**
@@ -983,6 +988,52 @@ export class JsonFileStorage implements StoragePort {
   async writeReminderLedger(ledger: ReminderLedger): Promise<void> {
     await this.ensureTree();
     await writeJsonAtomic(this.reminderLedgerPath, ledger);
+  }
+
+  // --- FX refresh override (Epic 8, Story 8.6 — AD-23) -----------------------
+
+  /**
+   * Read the opt-in FX refresh override (`<DataFolder>/fx-snapshot.json`), the
+   * optional second FX layer the EnrichmentService writes when `fxRefresh` is on.
+   *
+   * DEGRADES to `null` on EVERY non-happy path — a missing file, unreadable bytes,
+   * invalid JSON, or a shape/rate the loud {@link parseFxOverride} rejects — so a
+   * corrupt or absent override is simply "no override" and the bundle still totals
+   * (never a crash, never a wrong number). This mirrors the reminder-ledger read's
+   * degrade posture and the lock-free, atomic-write guarantee: because
+   * `writeFxOverride` is a temp-then-rename atomic write, a lock-free read observes
+   * either the whole old or whole new file, never a torn one. The loud rate
+   * validation is enforced on WRITE and on PARSE here; a read defect degrades, it
+   * does not throw.
+   */
+  async readFxOverride(): Promise<FxOverride | null> {
+    await this.ensureTree();
+    // Read + parse through the never-throwing safe reader; the loud override
+    // parser is the validator. ANY failure classification (missing/malformed/
+    // corrupt) degrades to `null` — "no override", bundle still totals.
+    const result = await safeReadJson<FxOverride>(this.fxOverridePath, (data) =>
+      parseFxOverride(data),
+    );
+    return result.ok ? result.value : null;
+  }
+
+  /**
+   * Persist the FX refresh override atomically (temp-then-rename). The
+   * EnrichmentService is the SOLE caller (AD-23); `appWiring` serializes it under
+   * the settings-family lock so there is one serialized writer and a lock-free
+   * read never sees a torn file.
+   *
+   * Validates LOUDLY before writing: a candidate with a non-positive/malformed
+   * rate, a bad shape, or a missing `fetchedAt` THROWS (a wrong rate is a wrong
+   * total — never silently persisted). The EnrichmentService's degrade path
+   * catches that throw as a silent miss and leaves the prior override untouched.
+   */
+  async writeFxOverride(override: FxOverride): Promise<void> {
+    await this.ensureTree();
+    // Loud write-candidate validation: re-parse so a bad rate/shape throws here
+    // (the single discipline shared with the bundle) and is never persisted.
+    const validated = parseFxOverride(override);
+    await writeJsonAtomic(this.fxOverridePath, validated);
   }
 
   // --- Backups (Req 18.1, 18.2) ----------------------------------------------

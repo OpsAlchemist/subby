@@ -24,7 +24,13 @@ import { exportCsv, exportJson } from "core/export";
 import { planImport, type ImportOutcome } from "core/import";
 import { hexColor } from "core/models/schema";
 import { lookupSuggestion, type PriceSeed, type PriceSuggestion } from "core/priceSeed";
-import { ratesForHome, type BundledFxSnapshot } from "core/fxSnapshot";
+import {
+  ratesForHome,
+  resolveEffectiveSnapshot,
+  type BundledFxSnapshot,
+  type FxOverride,
+} from "core/fxSnapshot";
+import { EMPTY_LOGO_PACK, type LogoPack } from "core/logo";
 import type { RateSnapshot } from "core/money";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
@@ -35,7 +41,14 @@ import type { ConflictMode, SubscriptionInputV2 } from "shared/types";
 
 import { JsonFileStorage } from "./storage/jsonFileStorage";
 import { defaultIsCloudPath, type CloudPathPredicate } from "./storage/paths";
-import { readBundledFxSnapshot, readBundledPriceSeed } from "./storage/resourceReader";
+import {
+  readBundledFxSnapshot,
+  readBundledLogoPack,
+  readBundledPriceSeed,
+} from "./storage/resourceReader";
+import { LogoBlobCache } from "./services/logoBlobCache";
+import { EnrichmentService } from "./services/enrichment";
+import type { GetWindow } from "./ipc/handlers";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
@@ -202,17 +215,72 @@ export interface AppServices {
    */
   getPriceSuggestion(name: string): PriceSuggestion | null;
 
-  // --- FX snapshot (Story 6.1) ---
+  // --- FX snapshot (Story 6.1 + Story 8.6 refresh override) ---
   /**
-   * Return the bundled FX {@link RateSnapshot} rebased to `homeCurrency`
-   * (`rates[home] === "1"`, every other currency expressed in Home major
-   * units), or `null` when the bundled snapshot failed to load (missing/corrupt)
-   * or the Home Currency is unknown/absent from it. READ-ONLY, lock-free, never
-   * throws: the snapshot is an immutable shipped bundle, never the StoragePort.
-   * Staleness is NOT decided here (core takes no clock); the renderer applies
-   * `rateConfidence` with its own local `today` to the returned `asOf`.
+   * Return the EFFECTIVE FX {@link RateSnapshot} rebased to `homeCurrency`
+   * (`rates[home] === "1"`, every other currency expressed in Home major units),
+   * or `null` when no snapshot is available (bundle failed to load AND no
+   * override) or the Home Currency is unknown/absent from the effective snapshot.
+   *
+   * The effective snapshot is resolved ONCE per call (a call == a conversion
+   * batch) by {@link resolveEffectiveSnapshot} over {bundle, override}: whichever
+   * has the newer `asOf` wins (AD-23) — the opt-in Story 8.6 refresh override
+   * (`<DataFolder>/fx-snapshot.json`) when it is fresher, else the shipped bundle
+   * (so a stale override never shadows a post-release bundle). READ-ONLY and
+   * lock-free: the override read is atomic (temp-then-rename), so a lock-free read
+   * sees the whole old or whole new file, never a torn one; a missing/corrupt
+   * override degrades to "no override" (`null`), never a throw. Staleness is NOT
+   * decided here (core takes no clock); the renderer applies `rateConfidence` with
+   * its own local `today` to the returned `asOf`.
    */
-  getFxSnapshot(homeCurrency: string): RateSnapshot | null;
+  getFxSnapshot(homeCurrency: string): Promise<RateSnapshot | null>;
+
+  // --- Logo Pack (Story 8.3) ---
+  /**
+   * Return the bundled {@link LogoPack} loaded once at construction (FR-26,
+   * AD-25). READ-ONLY, lock-free, NEVER throws and NEVER touches the network:
+   * the pack is immutable shipped data read through the resource reader, not the
+   * StoragePort. A missing/corrupt pack arrives here as the EMPTY pack, so the
+   * renderer resolves every row to the deterministic lettered fallback — never a
+   * crash, never a blocking fetch, never a toast.
+   */
+  getLogoPack(): LogoPack;
+
+  // --- Logo blob cache + enrichment (Story 8.4) ---
+  /**
+   * Return the fetched-logo cache as a domain→`data:<mime>;base64,…` map (AD-13).
+   * READ-ONLY, lock-free: reads the `<DataFolder>/logos/` blob cache fresh. `{}`
+   * until a logo has been fetched (live fetch is off until Story 8.5), so for
+   * real users this story it is empty — the renderer then resolves every row to
+   * the bundled pack or the lettered fallback. Never throws (an absent/unreadable
+   * cache yields `{}`); the StoragePort is untouched.
+   */
+  getLogoCache(): Promise<Record<string, string>>;
+  /**
+   * Enqueue a domain for background logo enrichment and return IMMEDIATELY (AD-9)
+   * — the UI never awaits the fetch. The single serial worker processes the job
+   * later (gated by `liveLogoFetch`) and, on a successful cache write, broadcasts
+   * a coalesced `evt:dataChanged`. A no-op when the enrichment service is not
+   * wired (e.g. a test context that did not inject one).
+   */
+  enqueueEnrichment(domain: string): void;
+
+  // --- FX refresh override (Story 8.6, AD-23) ---
+  /**
+   * Persist the FX refresh override atomically through the StoragePort, serialized
+   * under the settings-family lock (AD-2/AD-29) so the single-writer discipline
+   * holds and a lock-free `getFxSnapshot` reader never observes a torn write. The
+   * EnrichmentService's FX job is the ONLY caller. Validates rates LOUDLY (a bad
+   * rate throws, caught by the service as a silent miss — "no override written").
+   */
+  writeFxOverride(override: FxOverride): Promise<void>;
+  /**
+   * Request a background FX rate refresh and return IMMEDIATELY (AD-9). Triggered
+   * by `main.ts` at launch (when `fxRefresh` is on) and by the `onSettingsMutated`
+   * hook when the toggle flips on — NO second timer. The job self-gates on the
+   * toggle and the ≤24h cadence; a no-op when the enrichment service is not wired.
+   */
+  enqueueFxRefresh(): void;
 
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
@@ -267,10 +335,33 @@ export interface AppServices {
   backupNow(reason: string): Promise<string>;
 }
 
-/** The assembled application context: the storage port plus the services. */
+/**
+ * The enrichment wiring the services + `main.ts` share (Story 8.4). Kept as a
+ * narrow seam so `buildAppServices` can take an injected fake in tests and the
+ * production composition root can construct the real {@link LogoBlobCache} +
+ * {@link EnrichmentService}.
+ *
+ *   - `blobCache` backs the read-only {@link AppServices.getLogoCache}.
+ *   - `service` backs {@link AppServices.enqueueEnrichment}; `main.ts` also calls
+ *     `start()`/`stop()` on it directly for the deferred-drain launch ordering.
+ */
+export interface EnrichmentWiring {
+  blobCache: LogoBlobCache;
+  service: EnrichmentService;
+}
+
+/** The assembled application context: the storage port, services, and enrichment. */
 export interface AppContext {
   storage: StoragePort;
   services: AppServices;
+  /**
+   * The logo-enrichment pipeline (Story 8.4). Always built by
+   * {@link createAppContext} (with the live `getWindow`). `main.ts` captures it
+   * and permits it to drain only after the migration barrier has passed AND the
+   * window is `ready-to-show` — via `start()`, which it defers to `ready-to-show`
+   * (AD-28); it stops the service on quit.
+   */
+  enrichment: EnrichmentService;
 }
 
 /**
@@ -370,6 +461,30 @@ export const defaultFxSnapshotLoader: FxSnapshotLoader = () => {
 };
 
 /**
+ * Load the bundled Logo Pack, degrading to the EMPTY pack on any failure (Story
+ * 8.3).
+ *
+ * The default production loader reads the asar-aware bundle via
+ * {@link readBundledLogoPack}, which itself never throws (a missing/corrupt pack
+ * yields the {@link EMPTY_LOGO_PACK}). Injectable so tests can supply a fixed
+ * {@link LogoPack} (or the empty pack to simulate an absent/corrupt bundle)
+ * WITHOUT booting Electron (the default would touch the `electron` `app`
+ * globals).
+ */
+export type LogoPackLoader = () => LogoPack;
+
+/** The production Logo Pack loader: read the bundle, EMPTY pack on any failure. */
+export const defaultLogoPackLoader: LogoPackLoader = () => {
+  try {
+    return readBundledLogoPack();
+  } catch {
+    // readBundledLogoPack already degrades, but belt-and-suspenders: a logo is
+    // decorative, so any surprise failure resolves to the lettered fallback.
+    return EMPTY_LOGO_PACK;
+  }
+};
+
+/**
  * Build the application services over an injected {@link StoragePort}.
  *
  * Used directly in tests with an in-memory/temp-dir storage implementation, and
@@ -384,11 +499,17 @@ export const defaultFxSnapshotLoader: FxSnapshotLoader = () => {
  *                     to load — rates then surface as "unavailable"). Defaults to
  *                     the production {@link defaultFxSnapshotLoader}; tests inject
  *                     a fixed snapshot.
+ * @param logoPack     the loaded bundled Logo Pack (or the EMPTY pack when it
+ *                     failed to load — every row then shows the lettered
+ *                     fallback). Defaults to the production
+ *                     {@link defaultLogoPackLoader}; tests inject a fixed pack.
  */
 export function buildAppServices(
   storage: StoragePort,
   priceSeed: PriceSeed | null = defaultPriceSeedLoader(),
   fxSnapshot: BundledFxSnapshot | null = defaultFxSnapshotLoader(),
+  logoPack: LogoPack = defaultLogoPackLoader(),
+  enrichment: EnrichmentWiring | null = null,
 ): AppServices {
   // Per-file write authority (AD-29). Every mutating method below runs its whole
   // `read → core → write` (and, for a destructive op, its pre-op backup) inside
@@ -549,20 +670,68 @@ export function buildAppServices(
       return lookupSuggestion(priceSeed, name);
     },
 
-    // --- FX snapshot (Story 6.1) ---------------------------------------------
-    getFxSnapshot(homeCurrency) {
-      // Lock-free, read-only rebase over the immutable in-memory EUR-based
-      // bundle. When the snapshot failed to load, rates are unavailable → null.
+    // --- FX snapshot (Story 6.1 + Story 8.6 refresh override) ----------------
+    async getFxSnapshot(homeCurrency) {
+      // Resolve the EFFECTIVE snapshot ONCE per call (a call == a conversion
+      // batch, AD-23): newest `asOf` of {bundle, override} wins. The override read
+      // is lock-free + atomic (temp-then-rename), so it observes a whole old/new
+      // file, never a torn one; a missing/corrupt override degrades to `null`
+      // (bundle still totals), so this never throws from the read.
+      const override = await storage.readFxOverride();
+      const effective = resolveEffectiveSnapshot(fxSnapshot, override);
+      // No bundle AND no override → rates unavailable.
+      if (effective === null) return null;
       // `ratesForHome` can throw for an unknown Home Currency or one absent from
-      // the snapshot (UnknownCurrencyError / FxSnapshotError); catch here so a
-      // bad query degrades to null rather than crossing the bridge as a throw —
+      // the effective snapshot (UnknownCurrencyError / FxSnapshotError); catch here
+      // so a bad query degrades to null rather than crossing the bridge as a throw —
       // the renderer treats null as "rates unavailable", never a wrong total.
-      if (fxSnapshot === null) return null;
       try {
-        return ratesForHome(fxSnapshot, homeCurrency);
+        return ratesForHome(effective, homeCurrency);
       } catch {
         return null;
       }
+    },
+
+    // --- Logo Pack (Story 8.3) -----------------------------------------------
+    getLogoPack() {
+      // Lock-free, read-only return of the immutable in-memory pack read once at
+      // construction. When the pack failed to load it is the EMPTY pack, so the
+      // renderer resolves every row to the lettered fallback. No network, no
+      // StoragePort, never throws.
+      return logoPack;
+    },
+
+    // --- Logo blob cache + enrichment (Story 8.4) ----------------------------
+    async getLogoCache() {
+      // Lock-free, read-only read of the `<DataFolder>/logos/` blob cache as a
+      // domain→data-URI map. No enrichment wiring (e.g. a bare test context) →
+      // an empty map. The cache helper never throws (an absent cache yields {}),
+      // and the StoragePort is untouched (AD-13).
+      if (enrichment === null) return {};
+      return enrichment.blobCache.readAllAsDataUris();
+    },
+
+    enqueueEnrichment(domain) {
+      // Fire-and-forget (AD-9): push onto the serial worker's queue and return.
+      // A no-op when no enrichment service is wired. The worker enforces the
+      // gate (liveLogoFetch), never-refetch, and silent-fail-and-fallback.
+      enrichment?.service.enqueue(domain);
+    },
+
+    // --- FX refresh override (Story 8.6, AD-23) ------------------------------
+    writeFxOverride(override) {
+      // Serialize on the SETTINGS family lock (AD-2/AD-29): the override is a
+      // settings-adjacent single-writer file, so taking the same lock settings
+      // mutations take keeps the EnrichmentService the sole serialized writer and
+      // guarantees a lock-free `getFxSnapshot` reader never races the atomic write.
+      return lock("settings", () => storage.writeFxOverride(override));
+    },
+
+    enqueueFxRefresh() {
+      // Fire-and-forget (AD-9): ask the serial FX job to run and return. A no-op
+      // when no enrichment service is wired. The job enforces the `fxRefresh` gate,
+      // the ≤24h cadence cap, and silent-fail-keep-last-good.
+      enrichment?.service.enqueueFxRefresh();
     },
 
     // --- Settings ------------------------------------------------------------
@@ -672,7 +841,8 @@ export function buildAppServices(
 /**
  * Construct the production {@link AppContext}: build the {@link JsonFileStorage}
  * adapter (injecting the platform `userData` directory and any persisted data
- * folder override) and assemble the services over it.
+ * folder override), the Story 8.4 enrichment pipeline, and assemble the services
+ * over them.
  *
  * @param defaultUserData The platform `userData` directory
  *                        (`app.getPath('userData')`).
@@ -685,11 +855,21 @@ export function buildAppServices(
  *                        guardrail is dormant until PRD Q7 supplies a real per-OS
  *                        detector behind this same seam. Threaded here so the
  *                        swap is a one-argument change with no structural edit.
+ * @param getWindow       Accessor returning the live renderer window (or `null`),
+ *                        used by the {@link EnrichmentService} to broadcast a
+ *                        coalesced `evt:dataChanged` on a completed job (AD-8).
+ *                        It is a LAZY closure (`() => mainWindow`), so passing it
+ *                        before the window exists is safe — it is only read when a
+ *                        job completes, long after launch. Defaults to a no-window
+ *                        accessor so a bare `createAppContext(dir)` call (tests)
+ *                        still wires a functioning service that simply skips the
+ *                        broadcast when no window is present.
  */
 export function createAppContext(
   defaultUserData: string,
   dataFolder: string | null = null,
   isCloudPath: CloudPathPredicate = defaultIsCloudPath,
+  getWindow: GetWindow = () => null,
 ): AppContext {
   const storage = new JsonFileStorage(
     defaultUserData,
@@ -697,6 +877,39 @@ export function createAppContext(
     undefined,
     isCloudPath,
   );
-  const services = buildAppServices(storage);
-  return { storage, services };
+
+  // Story 8.4 enrichment pipeline. The blob cache reads the active data folder
+  // FRESH on each op via `storage.getDataFolder` (bound), so a Data-Folder
+  // relocation is a plain re-point. The service is built here but only DRAINS
+  // after `main.ts` calls `start()` (post-barrier + ready-to-show, AD-28). The
+  // services need the blob cache (for `getLogoCache`) and the service (for
+  // `enqueueEnrichment`), so build them first and inject them.
+  const blobCache = new LogoBlobCache(() => storage.getDataFolder());
+
+  // Placeholder services used only to satisfy the EnrichmentService's
+  // `getSettings` seam; it is immediately replaced by the real services below.
+  // To avoid a chicken-and-egg (service needs services, services need service),
+  // the service reads settings through a thin accessor that forwards to the
+  // assembled services once they exist.
+  let assembled: AppServices;
+  const service = new EnrichmentService({
+    services: {
+      getSettings: () => assembled.getSettings(),
+      // The FX refresh job (Story 8.6) is the SOLE writer of the override, through
+      // the StoragePort (AD-23). The read/write are serialized under the settings-
+      // family lock (see `writeFxOverride` on AppServices) so a lock-free reader
+      // never sees a torn file; the service itself is a single serial FX job.
+      readFxOverride: () => storage.readFxOverride(),
+      writeFxOverride: (override) => assembled.writeFxOverride(override),
+    },
+    blobCache,
+    getWindow,
+  });
+
+  assembled = buildAppServices(storage, undefined, undefined, undefined, {
+    blobCache,
+    service,
+  });
+
+  return { storage, services: assembled, enrichment: service };
 }

@@ -350,6 +350,61 @@ export default function Settings(): JSX.Element {
         </div>
       </SettingsSection>
 
+      {/*
+        Online Features (Story 8.2; FR-25, AD-22) — the ONE place every
+        network-using capability is listed, each off by default. Each feature's
+        always-visible data-exposure notice sits ABOVE its switch and is wired to
+        the switch via `aria-describedby`, so the disclosure is announced WITH the
+        control and is readable BEFORE it is enabled. Enabling only persists
+        `settings.online.*` through the existing optimistic `persist` path — the
+        UI awaits no fetch and spawns no enrichment here (that is Stories
+        8.4–8.6). Recipient names mirror `electron/net/hosts.ts` (FEATURE_HOSTS).
+      */}
+      <SettingsSection
+        title="Online Features"
+        description="Everything here is off by default. Each feature says what leaves your device before you turn it on."
+      >
+        <div className="space-y-2">
+          <p
+            id="online-logos-notice"
+            className="text-sm text-muted-foreground"
+          >
+            Over time this reveals the full set of services you track to Google
+            (t2.gstatic.com), linked to your IP address.
+          </p>
+          <Toggle
+            id="setting-online-logos"
+            label="Fetch brand logos for services Subby doesn't bundle"
+            describedBy="online-logos-notice"
+            checked={settings.online.liveLogoFetch}
+            onChange={(checked) =>
+              void persist({
+                online: { ...settings.online, liveLogoFetch: checked },
+              })
+            }
+          />
+        </div>
+
+        <div className="space-y-2">
+          <p id="online-fx-notice" className="text-sm text-muted-foreground">
+            Fetches the whole exchange-rate table from Frankfurter
+            (api.frankfurter.dev), at most once a day. Reveals nothing about
+            which currencies or subscriptions you track.
+          </p>
+          <Toggle
+            id="setting-online-fx"
+            label="Refresh exchange rates"
+            describedBy="online-fx-notice"
+            checked={settings.online.fxRefresh}
+            onChange={(checked) =>
+              void persist({
+                online: { ...settings.online, fxRefresh: checked },
+              })
+            }
+          />
+        </div>
+      </SettingsSection>
+
       <AttributionFooter />
     </SettingsScaffold>
   );
@@ -378,17 +433,32 @@ function Field({
   );
 }
 
-/** An accessible switch-style boolean toggle backed by a checkbox. */
+/**
+ * An accessible switch-style boolean toggle backed by a checkbox.
+ *
+ * `description` (when provided WITHOUT `describedBy`) is rendered inside the
+ * `<label>` and so becomes part of the switch's accessible NAME — the right
+ * shape for a terse helper line like the tray hint.
+ *
+ * `describedBy` wires the switch to an EXTERNAL element via `aria-describedby`
+ * so that element is announced as a *description* alongside the name, not folded
+ * into it (Story 8.2: the Online Features exposure notice must be a description
+ * the user can read before enabling, with the name being just feature + state).
+ * The caller owns and renders that element (an always-visible `<p id>` sibling);
+ * when `describedBy` is set, no `description` is folded into the name.
+ */
 function Toggle({
   id,
   label,
   description,
+  describedBy,
   checked,
   onChange,
 }: {
   id: string;
   label: string;
   description?: string;
+  describedBy?: string;
   checked: boolean;
   onChange: (checked: boolean) => void;
 }): JSX.Element {
@@ -401,7 +471,7 @@ function Toggle({
         <span className="block text-sm font-medium text-foreground">
           {label}
         </span>
-        {description && (
+        {!describedBy && description && (
           <span className="block text-sm text-muted-foreground">
             {description}
           </span>
@@ -412,6 +482,7 @@ function Toggle({
           id={id}
           type="checkbox"
           role="switch"
+          aria-describedby={describedBy}
           className={`peer sr-only ${FOCUS_RING}`}
           checked={checked}
           onChange={(e) => onChange(e.target.checked)}

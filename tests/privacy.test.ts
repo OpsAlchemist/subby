@@ -3,19 +3,29 @@ import { dirname, extname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+import { buildCsp } from "../electron/net/csp";
+
 /**
- * Privacy checks (Task 30.2, Req 20.1–20.3).
+ * Privacy checks (Task 30.2, Req 20.1–20.3; reworked for Epic 8 / Story 8.1).
  *
- * Subby is privacy-first and fully offline: it must operate with no analytics,
- * telemetry, or tracking (Req 20.1) and make no outbound internet request
- * (Req 20.2), storing data only on the local file system (Req 20.3). These are
- * static, source-level assertions (node environment): they scan the production
- * source trees and assert the absence of any network/telemetry usage, and they
- * read the renderer Content-Security-Policy and assert it blocks remote origins.
+ * Subby is privacy-first and private-by-default. Through 1.0 it was fully
+ * offline; Epic 8 introduces the FIRST outbound network behind ONE audited
+ * boundary (`electron/net/`). These static, source-level assertions are the
+ * headline privacy gate (node environment): they scan the production source
+ * trees and prove the net boundary holds.
  *
- * The intent is ZERO outbound calls, so the assertions fail loudly if any
- * forbidden API or module ever appears in shipped source. Tests and
- * `node_modules` are excluded — only code that ships is scanned.
+ * The gate has three parts:
+ *   1. Network primitives (`fetch`/XHR/WebSocket/EventSource) and networking /
+ *      HTTP-client MODULES may appear ONLY under `electron/net/` — the single
+ *      audited site. Anywhere else is a failure that names the offending file.
+ *   2. Telemetry / tracking / `sendBeacon` are banned EVERYWHERE, INCLUDING
+ *      inside `electron/net/` — that ban is permanent and never gated. The net
+ *      module may fetch, but it may never beacon or pull an analytics SDK.
+ *   3. The dynamic production CSP (`buildCsp`) carries NO remote origin while
+ *      the online toggles are off: `connect-src` is exactly `'self'`, byte-
+ *      identical to the fully-offline 1.0 policy.
+ *
+ * Tests and `node_modules` are excluded — only code that ships is scanned.
  */
 
 // Repo root is the parent of this `tests/` directory.
@@ -25,6 +35,21 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const SOURCE_DIRS = ["core", "electron", "src", "shared"] as const;
 
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+
+/**
+ * The ONE audited network-primitive SITE (AD-5): `electron/net/gateway.ts` is
+ * the SOLE file where a network primitive or networking/HTTP-client module may
+ * appear — NOT the whole `electron/net/` directory. A future sibling under
+ * `net/` (csp.ts, hosts.ts, index.ts, or a new one) that adds a raw `fetch(`
+ * must still fail the scan. Path is normalized to the OS separator so the check
+ * holds on Windows too.
+ */
+const GATEWAY_FILE = join("electron", "net", "gateway.ts");
+
+/** True ONLY for the single audited gateway file (AD-5). */
+function isGatewayFile(file: string): boolean {
+  return relative(ROOT, file) === GATEWAY_FILE;
+}
 
 /** A source file is excluded from the scan if it is itself a test/spec file. */
 function isTestFile(path: string): boolean {
@@ -73,23 +98,36 @@ function stripComments(source: string): string {
 
 /**
  * Forbidden runtime network APIs (Req 20.2). Matched as call/usage sites in
- * shippable code (after comment stripping).
+ * shippable code (after comment stripping). Allowed ONLY under `electron/net/`
+ * (the single audited boundary); banned everywhere else.
+ *
+ * NOTE: `sendBeacon` is deliberately NOT here — it is a TELEMETRY surface, not a
+ * legitimate data-fetch primitive, so it is banned EVERYWHERE including inside
+ * `net/` (see {@link TELEMETRY_APIS}).
  */
 const FORBIDDEN_NETWORK_APIS: ReadonlyArray<{ name: string; re: RegExp }> = [
   { name: "fetch(", re: /\bfetch\s*\(/ },
   { name: "XMLHttpRequest", re: /\bXMLHttpRequest\b/ },
   { name: "WebSocket", re: /\bWebSocket\b/ },
   { name: "EventSource", re: /\bEventSource\b/ },
+];
+
+/**
+ * Telemetry / tracking APIs banned EVERYWHERE — including inside `electron/net/`.
+ * This ban is permanent and never gated: the net module may fetch, but it may
+ * never beacon out. `sendBeacon` is the canonical fire-and-forget tracking
+ * primitive, so it belongs here and not in {@link FORBIDDEN_NETWORK_APIS}.
+ */
+const TELEMETRY_APIS: ReadonlyArray<{ name: string; re: RegExp }> = [
   { name: "navigator.sendBeacon", re: /\bsendBeacon\s*\(/ },
 ];
 
 /**
- * Forbidden module specifiers (Req 20.1, 20.2): Node networking modules, HTTP
- * client libraries, and analytics/telemetry SDKs. Scoped packages match by
- * prefix. The app's own *spending* analytics lives in `core/analytics` and is
- * NOT a telemetry SDK, so we match concrete tracking package names only.
+ * Forbidden networking / HTTP-client MODULE specifiers (Req 20.2): Node
+ * networking modules and HTTP client libraries. Allowed ONLY under
+ * `electron/net/`; banned everywhere else.
  */
-const FORBIDDEN_EXACT_MODULES = new Set<string>([
+const NETWORK_MODULES = new Set<string>([
   // Node networking
   "http",
   "https",
@@ -113,7 +151,14 @@ const FORBIDDEN_EXACT_MODULES = new Set<string>([
   "ky",
   "undici",
   "request",
-  // Analytics / telemetry SDKs
+]);
+
+/**
+ * Telemetry / analytics MODULE specifiers banned EVERYWHERE — including inside
+ * `electron/net/`. The app's own *spending* analytics lives in `core/analytics`
+ * and is NOT a telemetry SDK, so we match concrete tracking package names only.
+ */
+const TELEMETRY_EXACT_MODULES = new Set<string>([
   "mixpanel",
   "mixpanel-browser",
   "posthog-js",
@@ -125,8 +170,8 @@ const FORBIDDEN_EXACT_MODULES = new Set<string>([
   "@vercel/analytics",
 ]);
 
-/** Scoped/prefix telemetry packages that must never be imported. */
-const FORBIDDEN_MODULE_PREFIXES = [
+/** Scoped/prefix telemetry packages that must never be imported, anywhere. */
+const TELEMETRY_MODULE_PREFIXES = [
   "@sentry/",
   "@amplitude/",
   "@segment/",
@@ -134,9 +179,15 @@ const FORBIDDEN_MODULE_PREFIXES = [
   "@posthog/",
 ] as const;
 
-function isForbiddenModule(spec: string): boolean {
-  if (FORBIDDEN_EXACT_MODULES.has(spec)) return true;
-  return FORBIDDEN_MODULE_PREFIXES.some((p) => spec.startsWith(p));
+/** True for a networking/HTTP-client module (allowed only under `net/`). */
+function isNetworkModule(spec: string): boolean {
+  return NETWORK_MODULES.has(spec);
+}
+
+/** True for a telemetry/analytics module (banned everywhere). */
+function isTelemetryModule(spec: string): boolean {
+  if (TELEMETRY_EXACT_MODULES.has(spec)) return true;
+  return TELEMETRY_MODULE_PREFIXES.some((p) => spec.startsWith(p));
 }
 
 /** Extract every module specifier from `import ... from "x"` / `require("x")` / dynamic `import("x")`. */
@@ -151,9 +202,9 @@ function extractModuleSpecifiers(source: string): string[] {
   return specs;
 }
 
-// --- Source scan (Req 20.1, 20.2, 20.3) --------------------------------------
+// --- Source scan (Req 20.1, 20.2, 20.3; AD-5) --------------------------------
 
-describe("Privacy: no network or telemetry in shippable source (Req 20.1, 20.2)", () => {
+describe("Privacy: network confined to electron/net, telemetry banned everywhere (Req 20.1, 20.2, AD-5)", () => {
   const files = SOURCE_DIRS.flatMap((d) => collectSourceFiles(join(ROOT, d)));
 
   it("scans a non-trivial set of source files", () => {
@@ -162,9 +213,13 @@ describe("Privacy: no network or telemetry in shippable source (Req 20.1, 20.2)"
     expect(files.length).toBeGreaterThan(10);
   });
 
-  it("contains no forbidden network API calls (fetch/XHR/WebSocket/sendBeacon)", () => {
+  it("confines network API calls (fetch/XHR/WebSocket/EventSource) to electron/net/gateway.ts", () => {
     const offenders: string[] = [];
     for (const file of files) {
+      // Network PRIMITIVES are allowed in the one audited FILE only (AD-5) —
+      // not the whole net/ directory. A sibling net/ file adding a primitive
+      // must still be caught here.
+      if (isGatewayFile(file)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
       for (const api of FORBIDDEN_NETWORK_APIS) {
         if (api.re.test(code)) {
@@ -172,24 +227,73 @@ describe("Privacy: no network or telemetry in shippable source (Req 20.1, 20.2)"
         }
       }
     }
-    expect(offenders, `Unexpected network API usage:\n${offenders.join("\n")}`).toEqual([]);
+    expect(
+      offenders,
+      `Network API outside electron/net/gateway.ts:\n${offenders.join("\n")}`,
+    ).toEqual([]);
   });
 
-  it("imports no network, HTTP-client, or telemetry modules", () => {
+  it("confines network / HTTP-client module imports to electron/net/gateway.ts", () => {
     const offenders: string[] = [];
     for (const file of files) {
+      if (isGatewayFile(file)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
       for (const spec of extractModuleSpecifiers(code)) {
-        if (isForbiddenModule(spec)) {
+        if (isNetworkModule(spec)) {
           offenders.push(`${relative(ROOT, file)} → ${spec}`);
         }
       }
     }
-    expect(offenders, `Forbidden module imports:\n${offenders.join("\n")}`).toEqual([]);
+    expect(
+      offenders,
+      `Network/HTTP-client module outside electron/net/gateway.ts:\n${offenders.join("\n")}`,
+    ).toEqual([]);
+  });
+
+  it("bans telemetry / sendBeacon EVERYWHERE, including inside electron/net", () => {
+    const offenders: string[] = [];
+    for (const file of files) {
+      // NO exception for electron/net here — the telemetry ban is permanent.
+      const code = stripComments(readFileSync(file, "utf8"));
+      for (const api of TELEMETRY_APIS) {
+        if (api.re.test(code)) {
+          offenders.push(`${relative(ROOT, file)} → ${api.name}`);
+        }
+      }
+      for (const spec of extractModuleSpecifiers(code)) {
+        if (isTelemetryModule(spec)) {
+          offenders.push(`${relative(ROOT, file)} → ${spec}`);
+        }
+      }
+    }
+    expect(
+      offenders,
+      `Telemetry/tracking usage (banned everywhere):\n${offenders.join("\n")}`,
+    ).toEqual([]);
+  });
+
+  it("exempts ONLY gateway.ts, not sibling net/ files — a primitive in net/csp.ts would be caught", () => {
+    // gateway.ts is exempt; its siblings are NOT (AD-5: gateway is the sole site).
+    expect(isGatewayFile(join(ROOT, "electron", "net", "gateway.ts"))).toBe(true);
+    for (const sibling of ["csp.ts", "hosts.ts", "index.ts", "future.ts"]) {
+      expect(
+        isGatewayFile(join(ROOT, "electron", "net", sibling)),
+        `${sibling} must NOT be exempt`,
+      ).toBe(false);
+    }
+
+    // The scan the confinement test runs: a `fetch(` found in a non-gateway net
+    // file is scanned (not skipped) and therefore flagged as an offender.
+    const siblingFile = join(ROOT, "electron", "net", "csp.ts");
+    const synthetic = stripComments("export const f = () => fetch('https://x');");
+    const flagged = !isGatewayFile(siblingFile)
+      ? FORBIDDEN_NETWORK_APIS.some((api) => api.re.test(synthetic))
+      : false;
+    expect(flagged, "a primitive in net/csp.ts must be caught").toBe(true);
   });
 });
 
-// --- Renderer CSP blocks remote origins (Req 20.2) ---------------------------
+// --- Renderer / production CSP blocks remote origins (Req 20.2, AD-7) --------
 
 /** Pull a single directive's value out of a CSP string. */
 function cspDirective(csp: string, directive: string): string | null {
@@ -197,7 +301,7 @@ function cspDirective(csp: string, directive: string): string | null {
   return match ? match[1].trim() : null;
 }
 
-describe("Privacy: renderer CSP disallows remote origins (Req 20.2)", () => {
+describe("Privacy: CSP disallows remote origins while online toggles are off (Req 20.2, AD-7)", () => {
   it("the index.html meta CSP sets default-src 'self' and never allows http(s) connect-src", () => {
     const html = readFileSync(join(ROOT, "src", "index.html"), "utf8");
     const cspMatch = html.match(
@@ -216,23 +320,15 @@ describe("Privacy: renderer CSP disallows remote origins (Req 20.2)", () => {
     expect(cspDirective(csp, "object-src")).toBe("'none'");
   });
 
-  it("the production CSP in electron/main.ts restricts connect-src to 'self' and sets object-src 'none'", () => {
-    const main = readFileSync(join(ROOT, "electron", "main.ts"), "utf8");
-    // Locate the PROD_CSP string literal: one or more double-quoted fragments
-    // joined by `+`, terminated by `;`. The `;` directive separators inside the
-    // string never match because they sit inside the `[^"]*` fragment bodies.
-    const prodMatch = main.match(
-      /const\s+PROD_CSP\s*=\s*((?:"[^"]*"\s*\+?\s*)+);/,
-    );
-    expect(prodMatch, "main.ts must define PROD_CSP").not.toBeNull();
-    // Reconstruct the literal by joining the quoted string fragments.
-    const fragments = prodMatch![1].match(/"([^"]*)"/g) ?? [];
-    const csp = fragments.map((f) => f.slice(1, -1)).join("");
+  it("buildCsp with both online toggles off yields connect-src 'self' and no remote origin", () => {
+    // The dynamic production CSP is settings-driven (AD-7): with every online
+    // feature off it must be byte-identical to the fully-offline 1.0 policy.
+    const csp = buildCsp({ liveLogoFetch: false, fxRefresh: false });
 
     expect(csp.length).toBeGreaterThan(0);
     expect(cspDirective(csp, "default-src")).toBe("'self'");
     expect(cspDirective(csp, "connect-src")).toBe("'self'");
-    // Remote origins of any scheme are forbidden in production.
+    // Remote origins of any scheme are forbidden while toggles are off.
     expect(csp).not.toMatch(/https?:/);
     expect(csp).not.toMatch(/\bws{1,2}:/);
     expect(cspDirective(csp, "object-src")).toBe("'none'");
@@ -254,11 +350,12 @@ describe("Privacy: storage is local-file-only (Req 20.3)", () => {
       if (specs.some((s) => s === "node:fs" || s === "fs" || s.startsWith("node:fs"))) {
         usesFs = true;
       }
-      // Re-assert: storage must not reach for any network module.
+      // Re-assert: storage must not reach for any network or telemetry module.
       for (const spec of specs) {
-        expect(isForbiddenModule(spec), `${relative(ROOT, file)} imports ${spec}`).toBe(
-          false,
-        );
+        expect(
+          isNetworkModule(spec) || isTelemetryModule(spec),
+          `${relative(ROOT, file)} imports ${spec}`,
+        ).toBe(false);
       }
     }
     expect(usesFs, "storage adapter should read/write via node:fs").toBe(true);

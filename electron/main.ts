@@ -1,7 +1,7 @@
 import { join } from "node:path";
 import { app, BrowserWindow, ipcMain, session } from "electron";
 
-import type { SettingsV2 } from "core/models/settings";
+import type { OnlineSettingsV2, SettingsV2 } from "core/models/settings";
 import type { AppError, IpcResult } from "shared/types";
 
 import {
@@ -14,18 +14,60 @@ import {
   registerIpcHandlers,
   unregisterIpcHandlers,
 } from "./ipc/handlers";
+import { buildCsp } from "./net/csp";
 import { runChooseDataFolder } from "./services/dialog";
+import { EnrichmentService } from "./services/enrichment";
 import { NotificationService } from "./services/notificationService";
 import { Scheduler } from "./services/scheduler";
 import { destroyTray, ensureTray } from "./services/tray";
 
-/** Strict production CSP: same-origin only, zero remote origins (Req 20.2). */
-const PROD_CSP =
-  "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-  "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; " +
-  "object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
-
 const isDev = !app.isPackaged && Boolean(process.env["ELECTRON_RENDERER_URL"]);
+
+/**
+ * Silence Chromium's own phone-home surfaces at init (AD-7).
+ *
+ * Subby's gated-network boundary (`electron/net/`) is only meaningful if the
+ * browser engine underneath it cannot leak independently of the gate. Chromium
+ * ships several background network surfaces; the two reachable via command-line
+ * switches are disabled here, BEFORE the `ready` event (switches set after
+ * `ready` are ignored):
+ *   - `disable-component-update` — stops the component updater that fetches
+ *     Widevine/CRL/etc. bundles from Google in the background.
+ *   - `disable-domain-reliability` — stops Chrome's Domain Reliability service
+ *     from uploading network-error beacons to Google.
+ *
+ * The spellcheck dictionary download (also a Google CDN fetch) is additionally
+ * disabled per-window via `webPreferences.spellcheck: false`, and belt-and-
+ * braces at the session level inside {@link disablePhoneHomeSurfacesOnReady}.
+ * The renderer stays sandboxed with no Node integration (unchanged), and no
+ * auto-updater is added (AD-30) — an updater would itself be a phone-home
+ * surface against the telemetry line.
+ */
+function disablePhoneHomeSwitches(): void {
+  app.commandLine.appendSwitch("disable-component-update");
+  app.commandLine.appendSwitch("disable-domain-reliability");
+}
+// Must run before `ready`: command-line switches set after the app is ready are
+// not honored. Called at module load, which is before `app.whenReady` resolves.
+disablePhoneHomeSwitches();
+
+/**
+ * Session-level phone-home silence applied once the app is ready (AD-7).
+ *
+ * `setSpellCheckerDictionaryDownloadURL("")` points the Hunspell dictionary
+ * downloader at an empty URL so no dictionary is ever fetched from the Google
+ * CDN even if the spellchecker were somehow enabled (it is already off per
+ * window). No-op on macOS (the OS spellchecker is used), harmless elsewhere, and
+ * wrapped so a platform quirk can never throw into the launch sequence.
+ */
+function disablePhoneHomeSurfacesOnReady(): void {
+  if (isDev) return;
+  try {
+    session.defaultSession.setSpellCheckerDictionaryDownloadURL("");
+  } catch {
+    // Defensive: never let a session-API quirk abort launch (AD-28).
+  }
+}
 
 /**
  * Delay (ms) before the deferred scheduler first-tick. Kept small but non-zero
@@ -53,6 +95,15 @@ let appContext: AppContext | null = null;
 let scheduler: Scheduler | null = null;
 
 /**
+ * The logo-enrichment service (Story 8.4). Lives in the main process and owns a
+ * single serial queue; `enrich:enqueue` returns immediately while the worker
+ * fetches through the gated gateway, persists to the `logos/` blob cache, and
+ * broadcasts a coalesced `evt:dataChanged`. Constructed inside the app context
+ * post-barrier, DRAINED only after `ready-to-show` (AD-28), and stopped on quit.
+ */
+let enrichment: EnrichmentService | null = null;
+
+/**
  * Set once a genuine application quit is underway (`before-quit`, or the tray
  * "Quit" action). While true the window `close` handler stops intercepting so
  * the app can actually exit instead of hiding to the tray (Req 13.3 vs 13.4).
@@ -65,6 +116,21 @@ let isQuitting = false;
  * handler (which cannot await a settings read) to decide whether to quit.
  */
 let trayModeCache = false;
+
+/**
+ * Cached `settings.online` toggles, refreshed from disk post-barrier and on
+ * every `settings:update` success. The dynamic production CSP
+ * ({@link applyProductionCsp}) reads this cache SYNCHRONOUSLY inside
+ * `onHeadersReceived` (which cannot await a settings read) so enabling an online
+ * feature later (Story 8.2) updates `connect-src` without a second header
+ * registration. Seeded all-false so the pre-barrier CSP is byte-identical to the
+ * fully-offline 1.0 policy (`connect-src 'self'`). Mirrors {@link trayModeCache}
+ * / {@link refreshTrayMode}.
+ */
+let onlineSettingsCache: OnlineSettingsV2 = {
+  liveLogoFetch: false,
+  fxRefresh: false,
+};
 
 /** Accessor passed to the IPC layer for renderer broadcasts. */
 const getWindow = (): BrowserWindow | null => mainWindow;
@@ -87,6 +153,43 @@ async function refreshTrayMode(): Promise<boolean> {
   return trayModeCache;
 }
 
+/**
+ * Re-read `settings.online` from the live services and refresh
+ * {@link onlineSettingsCache} so the synchronous `onHeadersReceived` CSP builder
+ * sees the current toggles. Called once post-barrier (seed) and after every
+ * `settings:update` success (so a feature enabled at runtime widens the CSP on
+ * the next request without a second header registration). Keeps the last known
+ * value on a transient read failure or before the context is built. (AD-6/AD-7.)
+ */
+async function refreshOnlineSettings(): Promise<void> {
+  if (appContext === null) return;
+  try {
+    const settings = await appContext.services.getSettings();
+    onlineSettingsCache = settings.online;
+  } catch {
+    // Keep the last known value on a transient read failure.
+  }
+}
+
+/**
+ * React to a successful `settings:update` (Story 8.1 + 8.6). Refreshes the
+ * online-toggle cache for the dynamic CSP (AD-7), then — if `fxRefresh` is now on
+ * — triggers one FX rate refresh (Story 8.6). This REUSES the existing
+ * settings-mutation seam, so there is NO second timer subsystem: the toggle-on
+ * flip is one of the only two FX triggers (the other is launch). The FX job
+ * itself self-gates on the toggle and the ≤24h cadence, so a flip-off-then-on
+ * burst never beats the network cap. Fire-and-forget; a throw is swallowed by the
+ * IPC-layer guard around this hook so it never fails the IPC call.
+ */
+async function onSettingsMutated(): Promise<void> {
+  await refreshOnlineSettings();
+  // The cache now reflects the just-persisted toggles. Trigger an FX refresh only
+  // when fxRefresh is on; the job no-ops otherwise and self-caps at ≤1×/24h.
+  if (onlineSettingsCache.fxRefresh && appContext !== null) {
+    appContext.services.enqueueFxRefresh();
+  }
+}
+
 /** Begin a genuine quit: stop intercepting window close, then quit the app. */
 function requestQuit(): void {
   isQuitting = true;
@@ -97,11 +200,18 @@ function applyProductionCsp(): void {
   // In production the renderer loads from file://; enforce the strict CSP at
   // the network layer as defense-in-depth alongside the index.html meta tag.
   if (isDev) return;
+  // SINGLE registration. The callback is synchronous and cannot await a settings
+  // read, so it builds the policy from the cached `settings.online` toggles
+  // ({@link onlineSettingsCache}, refreshed post-barrier and on every
+  // `settings:update`). `buildCsp` derives `connect-src` from the SAME
+  // `allowedHosts` resolver the socket-level gate uses, so the CSP and the gate
+  // can never allow different hosts (AD-6/AD-7). With both toggles off this is
+  // byte-identical to the fully-offline 1.0 CSP (`connect-src 'self'`).
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        "Content-Security-Policy": [PROD_CSP],
+        "Content-Security-Policy": [buildCsp(onlineSettingsCache)],
       },
     });
   });
@@ -119,7 +229,18 @@ function applyProductionCsp(): void {
  * can only be known after the first read.
  */
 async function bootstrapContext(): Promise<AppContext> {
-  const context = createAppContext(app.getPath("userData"));
+  // `getWindow` is a LAZY closure (`() => mainWindow`), so passing it before the
+  // window exists is safe — the EnrichmentService only reads it when a job
+  // completes (long after launch), to broadcast a coalesced `evt:dataChanged`
+  // through the SAME accessor the IPC handlers use (AD-8). The default data
+  // folder / cloud-path predicate are kept (the override is applied below once
+  // settings are read).
+  const context = createAppContext(
+    app.getPath("userData"),
+    null,
+    undefined,
+    getWindow,
+  );
   const settings = await context.services.getSettings();
   if (settings.dataFolder) {
     // Switch subsequent data file operations to the persisted folder (Req 15.3/15.4).
@@ -220,6 +341,30 @@ function scheduleDeferredSchedulerFirstTick(): void {
   }, SCHEDULER_FIRST_TICK_DELAY_MS);
 }
 
+/**
+ * Permit the EnrichmentService to drain its queue (Story 8.4, AD-28).
+ *
+ * Called from the window's `ready-to-show` so a logo fetch never competes with
+ * first paint and the window is painted before any `evt:dataChanged` swap-in.
+ * Combined with the migration barrier (the service is constructed post-barrier
+ * in the `whenReady` sequence), this is the AD-28 "drain only after barrier AND
+ * ready-to-show" ordering. `start()` is idempotent and a no-op before the
+ * service exists or after it is stopped.
+ */
+function startDeferredEnrichmentDrain(): void {
+  if (enrichment === null) return;
+  enrichment.start();
+  // Launch FX refresh trigger (Story 8.6): if `fxRefresh` is on at launch, request
+  // ONE refresh now that the service may drain (post-barrier + ready-to-show,
+  // AD-28). This is one of the only two FX triggers (the other is the toggle-on
+  // flip via `onSettingsMutated`) — NO second timer. The job self-gates on the
+  // ≤24h cadence, so a relaunch within 24h of a successful fetch hits no network.
+  // `onlineSettingsCache` was seeded post-barrier, so it reflects the real toggle.
+  if (onlineSettingsCache.fxRefresh) {
+    enrichment.enqueueFxRefresh();
+  }
+}
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1200,
@@ -233,6 +378,11 @@ function createWindow(): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Phone-home silence (AD-7): disable Chromium's spellchecker so it never
+      // downloads a Hunspell dictionary from Google at first focus of a text
+      // field. One of the few phone-home surfaces that is a per-window
+      // `webPreferences` flag rather than a global command-line switch.
+      spellcheck: false,
     },
   });
 
@@ -244,6 +394,10 @@ function createWindow(): void {
   window.once("ready-to-show", () => {
     window.show();
     scheduleDeferredSchedulerFirstTick();
+    // Permit the enrichment worker to drain now that the window is painted and
+    // the barrier has passed (AD-28). The queue is empty until Story 8.5 wires
+    // the production auto-enqueue trigger, so this is dormant for real users.
+    startDeferredEnrichmentDrain();
   });
 
   window.on("closed", () => {
@@ -285,6 +439,11 @@ function createWindow(): void {
 }
 
 app.whenReady().then(async () => {
+  // Silence Chromium's own phone-home surfaces at init before the window loads
+  // (AD-7): the session-level dictionary-download override here, the
+  // command-line switches already set at module load, and `spellcheck: false`
+  // on the window below. Nothing may leak underneath the gated-network boundary.
+  disablePhoneHomeSurfacesOnReady();
   applyProductionCsp();
 
   // Ordered launch sequence with a migration barrier (AD-28). The steps run in a
@@ -325,10 +484,25 @@ app.whenReady().then(async () => {
       // convention (AD-18) has a single source rather than a duplicated literal.
     });
 
+    // Capture the EnrichmentService. It was CONSTRUCTED during bootstrap (step 1,
+    // inside `createAppContext`) — construction itself touches no user data, so
+    // its timing is not load-bearing. The AD-28 safety comes from the START gate,
+    // not construction order: it is only permitted to DRAIN at `ready-to-show`
+    // via `startDeferredEnrichmentDrain`, which runs after this barrier has
+    // passed — so a job can only ever see migrated state.
+    enrichment = appContext.enrichment;
+
     // Seed the Tray_Mode cache from (now barrier-passed) persisted settings so
     // the synchronous `window-all-closed` handler has a sane initial value
     // (Req 13.3/13.4). This reads user data, so it must follow the barrier.
     await refreshTrayMode();
+
+    // Seed the online-toggle cache from (now barrier-passed) persisted settings
+    // so the synchronous `onHeadersReceived` CSP builder reflects the user's
+    // actual toggles from the first request (AD-7). Reads user data → after the
+    // barrier. For a fresh/offline user this is all-false, so `connect-src`
+    // stays `'self'`.
+    await refreshOnlineSettings();
 
     // Register IPC handlers once over the assembled services, after the barrier
     // so a handler read never observes un-migrated data. Tearing down first makes
@@ -337,7 +511,17 @@ app.whenReady().then(async () => {
     stage = "handlers";
     unregisterIpcHandlers();
     unregisterDialogChannels();
-    registerIpcHandlers(appContext.services, getWindow);
+    // The `onSettingsMutated` hook refreshes the online-toggle cache whenever a
+    // `settings:update` succeeds, so enabling an online feature at runtime
+    // (Story 8.2) widens the CSP on the next request — no second
+    // `onHeadersReceived` registration (AD-7). It ALSO triggers an FX refresh when
+    // `fxRefresh` is now on (Story 8.6) — reusing the SAME settings-mutation seam,
+    // no second timer. Fire-and-forget: the refresh is a lock-free read, the CSP
+    // only needs to be current by the next request, and the FX job self-gates on
+    // the toggle + the ≤24h cadence (so a flip-off-then-on burst is still ≤1×/24h).
+    registerIpcHandlers(appContext.services, getWindow, () => {
+      void onSettingsMutated();
+    });
     registerDialogChannels(appContext);
 
     // (4) Window: on `ready-to-show` it presents and defers the scheduler
@@ -404,5 +588,6 @@ app.on("before-quit", () => {
 // Tear down main-process resources on quit.
 app.on("quit", () => {
   scheduler?.stop();
+  enrichment?.stop();
   destroyTray();
 });

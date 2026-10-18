@@ -8,6 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { axe } from "jest-axe";
 import "@testing-library/jest-dom/vitest";
 
 import Settings from "@/views/Settings";
@@ -159,6 +160,14 @@ function createFakeApi(): FakeApi {
     getFxSnapshot: ((_home: string) =>
       ok({ asOf: new Date().toISOString().slice(0, 10), rates: { INR: "1" } })) as SubbyApi["getFxSnapshot"],
 
+    // --- Logo Pack (Story 8.3): empty pack → every row uses the lettered fallback ---
+    getLogoPack: (() =>
+      ok({ version: 1, generatedAt: "", note: "", icons: {} })) as SubbyApi["getLogoPack"],
+
+    // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue acks ---
+    getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
+    enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
@@ -308,6 +317,195 @@ describe("Settings persistence calls updateSettings (Req 15.2)", () => {
     await waitFor(() => expect(fake.chooseFolderSpy).toHaveBeenCalledTimes(1));
     // Selecting a folder is not a settings patch, so updateSettings is untouched.
     expect(fake.updateSpy).not.toHaveBeenCalled();
+  });
+});
+
+// --- Online Features control surface (Story 8.2; FR-25, AD-22) ----------------
+
+describe("Settings → Online Features section (Story 8.2)", () => {
+  /** The two switches by their accessible name (feature + state only). */
+  const logosName = /fetch brand logos for services subby doesn't bundle/i;
+  const fxName = /refresh exchange rates/i;
+
+  it("renders both features OFF by default with both exposure notices visible", async () => {
+    render(<Settings />);
+
+    // The section is a labelled landmark region.
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const logos = within(region).getByRole("switch", { name: logosName });
+    const fx = within(region).getByRole("switch", { name: fxName });
+    // KNOWN_SETTINGS.online is all-false → both unchecked.
+    expect(logos).not.toBeChecked();
+    expect(fx).not.toBeChecked();
+
+    // Both exposure notices are visible BEFORE any toggle is touched, and name
+    // the aggregate exposure + the real recipient host (not a per-logo framing).
+    expect(
+      within(region).getByText(
+        /over time this reveals the full set of services you track to google \(t2\.gstatic\.com\)/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(region).getByText(
+        /fetches the whole exchange-rate table from frankfurter \(api\.frankfurter\.dev\).*reveals nothing about which currencies or subscriptions you track/is,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("pins the EXACT aggregate-exposure logo notice wording (Story 8.5, AD-14, FR-27)", async () => {
+    // The highest-scrutiny notice must disclose the AGGREGATE exposure — the full
+    // set of services over time, the real recipient (Google / t2.gstatic.com), AND
+    // the IP linkage — never a per-logo framing. This exact string is a consent
+    // correctness guarantee; pinning it makes any silent copy regression FAIL.
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const notice = within(region).getByText(
+      "Over time this reveals the full set of services you track to Google (t2.gstatic.com), linked to your IP address.",
+    );
+    expect(notice).toBeInTheDocument();
+
+    // The notice is the logo switch's own programmatic description (so a screen
+    // reader hears the aggregate disclosure WITH the control it gates).
+    const logos = within(region).getByRole("switch", { name: logosName });
+    expect(logos.getAttribute("aria-describedby")).toBe(notice.id);
+
+    // Guard the three load-bearing phrases individually so a partial edit (e.g.
+    // dropping the IP linkage or renaming the recipient) also fails.
+    const text = notice.textContent ?? "";
+    expect(text).toContain("full set of services you track");
+    expect(text).toContain("Google (t2.gstatic.com)");
+    expect(text).toContain("linked to your IP address");
+    // It is an AGGREGATE framing, never a single-logo one.
+    expect(text).not.toMatch(/\b(this logo|a logo|each logo|per logo)\b/i);
+  });
+
+  it("pins the EXACT FX-refresh notice wording (Story 8.6, FR-28)", async () => {
+    // The FX notice must state the whole-table, at-most-daily, reveals-nothing
+    // framing — the privacy-safe live fetch. Pinning this exact string makes any
+    // silent copy regression FAIL (per the spec's verify/pin requirement).
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const notice = within(region).getByText(
+      "Fetches the whole exchange-rate table from Frankfurter (api.frankfurter.dev), at most once a day. Reveals nothing about which currencies or subscriptions you track.",
+    );
+    expect(notice).toBeInTheDocument();
+
+    // The notice is the FX switch's own programmatic description.
+    const fx = within(region).getByRole("switch", { name: fxName });
+    expect(fx.getAttribute("aria-describedby")).toBe(notice.id);
+
+    // Guard the three load-bearing phrases individually.
+    const text = notice.textContent ?? "";
+    expect(text).toContain("whole exchange-rate table");
+    expect(text).toContain("api.frankfurter.dev");
+    expect(text).toContain("at most once a day");
+    expect(text).toContain("Reveals nothing about which currencies or subscriptions you track");
+  });
+
+  it("each switch's aria-describedby resolves to its own exposure notice", async () => {
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const logos = within(region).getByRole("switch", { name: logosName });
+    const logosDescId = logos.getAttribute("aria-describedby");
+    expect(logosDescId).toBeTruthy();
+    const logosNotice = document.getElementById(logosDescId!);
+    expect(logosNotice).not.toBeNull();
+    expect(logosNotice).toHaveTextContent(/t2\.gstatic\.com/);
+    // The notice must be readable BEFORE the switch — it precedes it in DOM
+    // order (aria-describedby resolution alone is order-independent).
+    expect(
+      logosNotice!.compareDocumentPosition(logos) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // The notice is a description, NOT folded into the accessible name.
+    expect(logos).toHaveAccessibleName(
+      /fetch brand logos for services subby doesn't bundle/i,
+    );
+    expect(logos).toHaveAccessibleName(expect.not.stringMatching(/t2\.gstatic/i));
+
+    const fx = within(region).getByRole("switch", { name: fxName });
+    const fxDescId = fx.getAttribute("aria-describedby");
+    expect(fxDescId).toBeTruthy();
+    const fxNotice = document.getElementById(fxDescId!);
+    expect(fxNotice).not.toBeNull();
+    expect(fxNotice).toHaveTextContent(/api\.frankfurter\.dev/);
+    expect(fx).toHaveAccessibleName(/refresh exchange rates/i);
+    expect(fx).toHaveAccessibleName(expect.not.stringMatching(/frankfurter/i));
+  });
+
+  it("enabling live logos persists the nested online patch exactly once (fxRefresh preserved)", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    await user.click(within(region).getByRole("switch", { name: logosName }));
+
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+    const patch = fake.updateSpy.mock.calls[0][0] as Partial<SettingsModel>;
+    expect(patch.online).toEqual({ liveLogoFetch: true, fxRefresh: false });
+  });
+
+  it("enabling FX refresh persists the nested online patch exactly once (liveLogoFetch preserved)", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    await user.click(within(region).getByRole("switch", { name: fxName }));
+
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+    const patch = fake.updateSpy.mock.calls[0][0] as Partial<SettingsModel>;
+    expect(patch.online).toEqual({ liveLogoFetch: false, fxRefresh: true });
+  });
+
+  it("disabling a feature persists that flag false while preserving the other", async () => {
+    const user = userEvent.setup();
+    // Seed with live logos already ON so a click turns it OFF.
+    fake.state.settings = {
+      ...fake.state.settings,
+      online: { liveLogoFetch: true, fxRefresh: false },
+    };
+    settingsStore.reset();
+    teardown?.();
+    teardown = initStores();
+    await waitFor(() => expect(settingsStore.getSnapshot().loaded).toBe(true));
+
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+    const logos = within(region).getByRole("switch", { name: logosName });
+    expect(logos).toBeChecked();
+
+    await user.click(logos);
+
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+    const patch = fake.updateSpy.mock.calls[0][0] as Partial<SettingsModel>;
+    expect(patch.online).toEqual({ liveLogoFetch: false, fxRefresh: false });
+  });
+
+  it("the Online Features section is keyboard-operable and axe-clean", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+    const logos = within(region).getByRole("switch", { name: logosName });
+
+    // Keyboard-operable: focus + Space toggles the switch (no mouse needed).
+    logos.focus();
+    expect(logos).toHaveFocus();
+    await user.keyboard(" ");
+    await waitFor(() => expect(fake.updateSpy).toHaveBeenCalledTimes(1));
+
+    // jsdom cannot compute color contrast (the sanctioned exception, mirrors the
+    // Categories scan); every other rule stays on.
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
   });
 });
 
@@ -590,6 +788,7 @@ describe("Settings section-insert scaffold (Story 3.2)", () => {
       "Backups",
       "Appearance",
       "System",
+      "Online Features",
     ]) {
       expect(
         screen.getByRole("region", { name }),

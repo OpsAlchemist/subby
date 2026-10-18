@@ -49,8 +49,9 @@ import {
 } from "core/money";
 import { subscriptionsStore, settingsStore } from "@/stores";
 import { useStore, useStoreData } from "@/stores/hooks";
-import { getFxSnapshotSafe } from "@/api/subby";
+import { getFxSnapshotSafe, onDataChanged } from "@/api/subby";
 import CategoryColorDot from "@/components/CategoryColorDot";
+import LogoTile from "@/components/LogoTile";
 import CountUp from "@/components/CountUp";
 import Skeleton from "@/components/Skeleton";
 import StaleRateNote from "@/components/StaleRateNote";
@@ -119,12 +120,16 @@ interface FxState {
 }
 
 /**
- * Fetch the bundled FX {@link RateSnapshot} for `homeCurrency`, re-fetching when
- * it changes. FX rates are a STATIC bundle in 1.0, so this loads once per
- * Home-Currency value — NOT on every `onDataChanged` (Epic 8's opt-in live
- * refresh swaps a fresher snapshot in later via the data-changed path). The
- * fetch never throws (`getFxSnapshotSafe` swallows a missing/corrupt bundle as
- * `null`); a `null` becomes `errored` so the cards degrade to "rates unavailable".
+ * Fetch the EFFECTIVE FX {@link RateSnapshot} for `homeCurrency`, re-fetching when
+ * it changes AND on every `onDataChanged` (Story 8.6). The opt-in FX refresh
+ * writes a fresher override and broadcasts `evt:dataChanged`; re-querying on that
+ * swaps the newer `asOf`/rates in through the SAME path the stores reload through
+ * (the override is transparent — same `RateSnapshot`). The initial per-Home-
+ * Currency fetch shows skeletons (`loading: true`); a background `onDataChanged`
+ * re-fetch does NOT reset to loading (no skeleton flash — the figures stay up and
+ * recompute when the new snapshot lands). The fetch never throws
+ * (`getFxSnapshotSafe` swallows a missing/corrupt bundle as `null`); a `null`
+ * becomes `errored` so the cards degrade to "rates unavailable".
  */
 function useFxSnapshot(homeCurrency: string): FxState {
   const [state, setState] = useState<FxState>({
@@ -135,17 +140,21 @@ function useFxSnapshot(homeCurrency: string): FxState {
 
   useEffect(() => {
     let cancelled = false;
+    // Initial (per-Home-Currency) fetch: show skeletons until it resolves.
     setState({ snapshot: null, loading: true, errored: false });
-    void getFxSnapshotSafe(homeCurrency).then((snapshot) => {
+    const apply = (snapshot: RateSnapshot | null): void => {
       if (cancelled) return;
-      setState({
-        snapshot,
-        loading: false,
-        errored: snapshot === null,
-      });
+      setState({ snapshot, loading: false, errored: snapshot === null });
+    };
+    void getFxSnapshotSafe(homeCurrency).then(apply);
+    // Background re-fetch on any data change (an FX refresh swap-in) — no skeleton
+    // flash: the figures stay rendered and recompute when the new snapshot lands.
+    const off = onDataChanged(() => {
+      void getFxSnapshotSafe(homeCurrency).then(apply);
     });
     return () => {
       cancelled = true;
+      off();
     };
   }, [homeCurrency]);
 
@@ -273,14 +282,17 @@ function SubscriptionPanel({
               key={s.id}
               className="flex items-center justify-between gap-3 py-2 first:pt-0 last:pb-0"
             >
-              <span className="min-w-0 truncate">
-                <span className="font-medium">{s.name}</span>
-                {s.category && (
-                  <span className="ml-2 inline-flex items-center text-sm text-muted-foreground">
-                    <CategoryColorDot categoryName={s.category} />
-                    {s.category}
-                  </span>
-                )}
+              <span className="flex min-w-0 items-center gap-2">
+                <LogoTile name={s.name} website={s.website} />
+                <span className="min-w-0 truncate">
+                  <span className="font-medium">{s.name}</span>
+                  {s.category && (
+                    <span className="ml-2 inline-flex items-center text-sm text-muted-foreground">
+                      <CategoryColorDot categoryName={s.category} />
+                      {s.category}
+                    </span>
+                  )}
+                </span>
               </span>
               <span className="shrink-0 text-sm text-muted-foreground">
                 {renderMeta(s)}

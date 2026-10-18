@@ -13,8 +13,11 @@ import {
   subscriptionsStore,
   categoriesStore,
   settingsStore,
+  logoPackStore,
+  logoCacheStore,
   errorStore,
 } from "@/stores";
+import type { LogoPack } from "core/logo";
 
 import { DEFAULT_SETTINGS_V2 } from "core/models/schema";
 import type { SettingsV2 } from "core/models/settings";
@@ -124,6 +127,14 @@ function createFakeApi(): FakeApi {
     // --- FX snapshot (Story 6.1): not exercised here — a rebased INR snapshot ---
     getFxSnapshot: ((_home: string) =>
       ok({ asOf: new Date().toISOString().slice(0, 10), rates: { INR: "1" } })) as SubbyApi["getFxSnapshot"],
+
+    // --- Logo Pack (Story 8.3): empty pack → every row uses the lettered fallback ---
+    getLogoPack: (() =>
+      ok({ version: 1, generatedAt: "", note: "", icons: {} })) as SubbyApi["getLogoPack"],
+
+    // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue is a no-op ack ---
+    getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
+    enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -237,6 +248,8 @@ afterEach(() => {
   subscriptionsStore.reset();
   categoriesStore.reset();
   settingsStore.reset();
+  logoPackStore.reset();
+  logoCacheStore.reset();
   errorStore.clear();
   vi.restoreAllMocks();
 });
@@ -478,18 +491,21 @@ describe("category color dot + tag chips (Story 3.4)", () => {
 
     const table = screen.getByRole("table");
     // The colored category renders a decorative dot with its background color;
-    // the colorless one renders none (the NAME still carries the meaning).
+    // the colorless one renders none (the NAME still carries the meaning). The
+    // CategoryColorDot is a round `h-2 w-2 rounded-full` dot — scope the query to
+    // it so the Story 8.3 lettered LogoTile (a `rounded-md` background-colored
+    // span in the NAME cell) is not miscounted as a category dot.
     const dot = table.querySelector(
-      'span[aria-hidden="true"][style*="background-color"]',
+      'span[aria-hidden="true"].rounded-full[style*="background-color"]',
     ) as HTMLElement | null;
     expect(dot).not.toBeNull();
     // Both category NAMES are still present as text.
     expect(within(table).getByText("Streaming")).toBeInTheDocument();
     expect(within(table).getByText("Writing")).toBeInTheDocument();
 
-    // Exactly ONE colored dot (Streaming), since Writing has no color.
+    // Exactly ONE colored category dot (Streaming), since Writing has no color.
     const dots = table.querySelectorAll(
-      'span[aria-hidden="true"][style*="background-color"]',
+      'span[aria-hidden="true"].rounded-full[style*="background-color"]',
     );
     expect(dots).toHaveLength(1);
   });
@@ -1176,5 +1192,126 @@ describe("palette-arrival highlight (Story 3.6, FR-5)", () => {
       (c) => (c[0] as ScrollIntoViewOptions | undefined)?.behavior === "auto",
     );
     expect(snapped).toBe(true);
+  });
+});
+
+// --- Logo tile (Story 8.3) ----------------------------------------------------
+
+describe("logo tile: bundled SVG vs deterministic lettered fallback (Story 8.3)", () => {
+  const NETFLIX_PATH = "M4 1h2v22H4zM18 1h2v22h-2z";
+  const packWithNetflix: LogoPack = {
+    version: 1,
+    generatedAt: "2026-10-18T00:00:00.000Z",
+    note: "test",
+    icons: {
+      "netflix.com": { title: "Netflix", hex: "E50914", path: NETFLIX_PATH },
+    },
+  };
+
+  /** The leading cell of the Name column for a row (holds the LogoTile). */
+  function nameCell(name: string): HTMLElement {
+    const table = screen.getByRole("table");
+    const checkbox = within(table).getByRole("checkbox", { name: `Select ${name}` });
+    const row = checkbox.closest("tr");
+    expect(row).not.toBeNull();
+    // Column order: [checkbox] [name] [category] ... — the name cell is index 1.
+    const cell = row!.querySelectorAll("td")[1] as HTMLElement;
+    expect(cell).toBeTruthy();
+    return cell;
+  }
+
+  it("bundled hit: a row whose website matches the pack renders the bundled SVG path", async () => {
+    // Override the Logo Pack BEFORE initStores so the store hydrates with it.
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", website: "https://www.netflix.com/browse" }),
+    ]);
+    await waitFor(() => expect(logoPackStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Netflix");
+    const path = cell.querySelector("svg path");
+    expect(path, "a bundled row renders an <svg><path>").not.toBeNull();
+    expect(path!.getAttribute("d")).toBe(NETFLIX_PATH);
+    expect(path!.getAttribute("fill")).toBe("#E50914");
+    // The tile is decorative: aria-hidden, not a focus target, no alt text.
+    const tile = cell.querySelector('[aria-hidden="true"]');
+    expect(tile).not.toBeNull();
+  });
+
+  it("bundled miss / empty website: renders the deterministic lettered fallback (no svg)", async () => {
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    await renderList([makeSub({ id: "a", name: "Acme Cloud", website: "acme.example" })]);
+    await waitFor(() => expect(logoPackStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Acme Cloud");
+    expect(cell.querySelector("svg path"), "a miss has no bundled svg").toBeNull();
+    // The lettered tile shows the first letter of the name, uppercased.
+    const tile = cell.querySelector('span[aria-hidden="true"]') as HTMLElement;
+    expect(tile).not.toBeNull();
+    expect(tile.textContent).toBe("A");
+  });
+
+  const DATA_URI = "data:image/png;base64,iVBORw0KGgo=";
+
+  it("cached hit: a pack-miss domain present in the logo cache renders the data-URI <img> (Story 8.4)", async () => {
+    // Pack has netflix.com only; the row's domain (acme.example) is a pack MISS
+    // but IS in the fetched-logo cache → the cache tier renders an <img src>.
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    fake.getLogoCache = (() =>
+      ok<Record<string, string>>({ "acme.example": DATA_URI })) as SubbyApi["getLogoCache"];
+    await renderList([
+      makeSub({ id: "a", name: "Acme", website: "https://acme.example/app" }),
+    ]);
+    await waitFor(() => expect(logoCacheStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Acme");
+    const img = cell.querySelector("img") as HTMLImageElement | null;
+    expect(img, "a cached row renders an <img>").not.toBeNull();
+    expect(img!.getAttribute("src")).toBe(DATA_URI);
+    // No lettered fallback text and no bundled svg path for a cache hit.
+    expect(cell.querySelector("svg path")).toBeNull();
+    const tile = cell.querySelector('[aria-hidden="true"]');
+    expect(tile).not.toBeNull();
+  });
+
+  it("bundled beats cache: a domain in BOTH the pack and the cache renders the bundled SVG (Story 8.4)", async () => {
+    // netflix.com is in the pack AND seeded in the cache — bundled must win.
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    fake.getLogoCache = (() =>
+      ok<Record<string, string>>({ "netflix.com": DATA_URI })) as SubbyApi["getLogoCache"];
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", website: "https://www.netflix.com/browse" }),
+    ]);
+    await waitFor(() => expect(logoCacheStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Netflix");
+    expect(cell.querySelector("svg path"), "bundled wins over cache").not.toBeNull();
+    expect(cell.querySelector("img"), "no cached <img> when bundled wins").toBeNull();
+  });
+
+  it("same name → same fallback letter AND color on every render", async () => {
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    await renderList([
+      makeSub({ id: "a", name: "Hey Email", website: "" }),
+      makeSub({ id: "b", name: "Hey Email", website: "" }),
+    ]);
+    await waitFor(() => expect(logoPackStore.getSnapshot().loaded).toBe(true));
+
+    // Two rows share the name "Hey Email": get BOTH rows (ambiguous by role, so
+    // use getAllByRole) and compare their lettered tiles.
+    const table = screen.getByRole("table");
+    const rows = within(table)
+      .getAllByRole("checkbox", { name: "Select Hey Email" })
+      .map((cb) => cb.closest("tr")!);
+    expect(rows.length).toBe(2);
+    const tiles = rows.map(
+      (row) =>
+        (row.querySelectorAll("td")[1] as HTMLElement).querySelector(
+          'span[aria-hidden="true"]',
+        ) as HTMLElement,
+    );
+
+    expect(tiles[0].textContent).toBe(tiles[1].textContent); // same letter
+    expect(tiles[0].getAttribute("style")).toBe(tiles[1].getAttribute("style")); // same color
   });
 });

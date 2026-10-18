@@ -134,6 +134,17 @@ export function exponentOf(currency: string): number {
   return exponent;
 }
 
+/**
+ * Non-throwing predicate: `true` iff `currency` is in Subby's modeled set (the
+ * same table `exponentOf` consults). Lets a caller SKIP an unmodeled currency up
+ * front rather than reaching the loud `exponentOf`/`parseBundledSnapshot` throw —
+ * used by the FX refresh provider to drop a currency ECB might publish that Subby
+ * does not model, so one unmodeled rate never rejects an entire refresh.
+ */
+export function knownCurrency(currency: string): boolean {
+  return MINOR_UNIT_EXPONENT[currency] !== undefined;
+}
+
 /** 10n ** exponent, as a BigInt scaling factor. */
 function scaleFactor(exponent: number): bigint {
   let factor = 1n;

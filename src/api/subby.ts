@@ -19,6 +19,7 @@
 
 import type { SubbyApi, Unsubscribe } from "shared/subbyApi";
 import type { AppError, IpcResult } from "shared/types";
+import { EMPTY_LOGO_PACK, type LogoPack } from "core/logo";
 
 // --- Facade access / injection ----------------------------------------------
 
@@ -186,6 +187,73 @@ export async function getFxSnapshotSafe(
     return await fxApi.snapshot(home);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Logo Pack operations (Story 8.3). READ-ONLY: `pack` returns the bundled
+ * {@link LogoPack} (or throws a {@link SubbyError} on a bridge/IPC failure).
+ * The logo surface uses the never-throws {@link getLogoPackSafe} so an absent
+ * bridge or a surprise failure degrades to an EMPTY pack — every row then shows
+ * the deterministic lettered fallback, never a crash.
+ */
+export const logoApi = {
+  pack: () => unwrap(getSubby().getLogoPack()),
+} as const;
+
+/**
+ * Logo Pack fetch that NEVER throws: resolves to the {@link LogoPack} or the
+ * {@link EMPTY_LOGO_PACK}, swallowing any bridge/IPC failure (a missing/corrupt
+ * bundle already arrives as an empty pack from main; this guards the no-preload
+ * / unexpected-throw case too). The logo surface treats the empty pack as "every
+ * row uses the lettered fallback" — a logo is decorative, never load-bearing.
+ */
+export async function getLogoPackSafe(): Promise<LogoPack> {
+  try {
+    return await logoApi.pack();
+  } catch {
+    return EMPTY_LOGO_PACK;
+  }
+}
+
+/**
+ * Logo blob cache + enrichment operations (Story 8.4). `cache` returns the
+ * fetched-logo map (domain→data-URI); `enqueue` fires a background fetch and
+ * resolves with an ack. Both are READ-/fire-and-forget — the UI never awaits a
+ * fetch (AD-9). Prefer the never-throws {@link getLogoCacheSafe} /
+ * {@link enqueueEnrichmentSafe} in UI paths.
+ */
+export const enrichApi = {
+  cache: () => unwrap(getSubby().getLogoCache()),
+  enqueue: (domain: string) => unwrap(getSubby().enqueueEnrichment(domain)),
+} as const;
+
+/**
+ * Logo cache fetch that NEVER throws: resolves to the domain→data-URI map or `{}`,
+ * swallowing any bridge/IPC failure (an absent preload, an unreadable cache). A
+ * cached logo is decorative — an unavailable cache simply means every row falls
+ * back to the bundled pack or the lettered tile. This is what `logoCacheStore`
+ * hydrates from.
+ */
+export async function getLogoCacheSafe(): Promise<Record<string, string>> {
+  try {
+    return await enrichApi.cache();
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Enqueue a logo enrichment that NEVER throws: fire-and-forget, swallowing any
+ * bridge/IPC failure. Enrichment is best-effort — a failed enqueue must silently
+ * do nothing, never surface an error. (The production trigger for this is Story
+ * 8.5; 8.4 ships the plumbing.)
+ */
+export async function enqueueEnrichmentSafe(domain: string): Promise<void> {
+  try {
+    await enrichApi.enqueue(domain);
+  } catch {
+    // Best-effort: a failed enqueue is a silent no-op.
   }
 }
 

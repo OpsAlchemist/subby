@@ -22,7 +22,26 @@ export const fileNames = {
   settings: "settings.json",
   categories: "categories.json",
   reminderLedger: "reminder-ledger.json",
+  /**
+   * The opt-in FX refresh OVERRIDE (Epic 8, Story 8.6; AD-23). When `fxRefresh`
+   * is on, the EnrichmentService writes the whole refreshed ECB table here, under
+   * the active Data Folder — the SAME base name as the bundled read-only
+   * `resources/fx-snapshot.json`, but a different directory (the Data Folder, not
+   * `resources/`), so the two never collide. JSON through the StoragePort (unlike
+   * the logo blob cache under `logos/`, AD-13). The effective snapshot is whichever
+   * of {bundle, override} has the newer `asOf`.
+   */
+  fxOverride: "fx-snapshot.json",
   backupDir: "backup",
+  /**
+   * The logo blob cache subdirectory (Story 8.4, AD-13). Fetched brand logos
+   * are persisted under `<App_Data_Directory>/logos/<domain>.<ext>` by the
+   * `LogoBlobCache` helper — a plain file cache that lives PARALLEL to the JSON
+   * data files, NOT routed through the StoragePort (which stays JSON-only). It
+   * sits under the active data directory so a Data-Folder relocation is a plain
+   * re-point (the next cache op targets the new folder; old blobs are not moved).
+   */
+  logosDir: "logos",
 } as const;
 
 /**

@@ -52,6 +52,7 @@ import { errorStore } from "@/stores/errorStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
 import CategoryColorDot from "@/components/CategoryColorDot";
+import LogoTile from "@/components/LogoTile";
 import ConfirmDialog from "@/components/ConfirmDialog";
 
 // --- Local types -------------------------------------------------------------
@@ -911,12 +912,17 @@ export default function SubscriptionList({
                       />
                     </td>
                     <td className="px-3 py-2 font-medium">
-                      {sub.name}
-                      {sub.provider && (
-                        <span className="block text-xs text-muted-foreground">
-                          {sub.provider}
+                      <span className="flex items-center gap-2">
+                        <LogoTile name={sub.name} website={sub.website} />
+                        <span className="min-w-0">
+                          <span className="block truncate">{sub.name}</span>
+                          {sub.provider && (
+                            <span className="block text-xs text-muted-foreground">
+                              {sub.provider}
+                            </span>
+                          )}
                         </span>
-                      )}
+                      </span>
                     </td>
                     <td className="px-3 py-2 text-muted-foreground">
                       <span className="inline-flex items-center">
@@ -1025,13 +1031,16 @@ export default function SubscriptionList({
                     />
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="truncate font-medium">{sub.name}</p>
-                          {sub.provider && (
-                            <p className="truncate text-xs text-muted-foreground">
-                              {sub.provider}
-                            </p>
-                          )}
+                        <div className="flex min-w-0 items-center gap-2">
+                          <LogoTile name={sub.name} website={sub.website} />
+                          <div className="min-w-0">
+                            <p className="truncate font-medium">{sub.name}</p>
+                            {sub.provider && (
+                              <p className="truncate text-xs text-muted-foreground">
+                                {sub.provider}
+                              </p>
+                            )}
+                          </div>
                         </div>
                         <div className="flex items-center gap-2">
                           <StatusBadge sub={sub} />

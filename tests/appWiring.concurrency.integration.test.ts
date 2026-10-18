@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { buildAppServices, type AppServices } from "../electron/appWiring";
 import { JsonFileStorage } from "../electron/storage/jsonFileStorage";
 import { parsePriceSeed } from "core/priceSeed";
+import type { FxOverride } from "core/fxSnapshot";
 import type { Category } from "core/models/category";
 import type { ReminderLedger } from "core/models/reminder";
 import type { SettingsV2 } from "core/models/settings";
@@ -133,6 +134,22 @@ class InstrumentedStorage implements StoragePort {
       fired: ledger.fired.map((e) => ({ ...e })),
     };
     this.log.push("write:ledger:end");
+  }
+
+  fxOverride: FxOverride | null = null;
+
+  async readFxOverride(): Promise<FxOverride | null> {
+    this.log.push("read:fxOverride:start");
+    await microtaskGap();
+    this.log.push("read:fxOverride:end");
+    return this.fxOverride === null ? null : { ...this.fxOverride };
+  }
+
+  async writeFxOverride(override: FxOverride): Promise<void> {
+    this.log.push("write:fxOverride:start");
+    await microtaskGap();
+    this.fxOverride = { ...override };
+    this.log.push("write:fxOverride:end");
   }
 
   async createBackup(_reason: string): Promise<string> {

@@ -11,6 +11,7 @@
  * their own implementations without touching the core or the UI.
  */
 
+import type { FxOverride } from "../fxSnapshot";
 import type { Category } from "../models/category";
 import type { ReminderLedger } from "../models/reminder";
 import type { SettingsV2 } from "../models/settings";
@@ -41,6 +42,17 @@ export interface StoragePort {
   // file untouched (never downgrade-overwrite).
   readReminderLedger(): Promise<ReminderLedger>;
   writeReminderLedger(ledger: ReminderLedger): Promise<void>;
+
+  // FX refresh override (Epic 8, Story 8.6 — AD-23): the optional, opt-in
+  // Data-Folder `fx-snapshot.json` written by the EnrichmentService (the SOLE
+  // writer) when `fxRefresh` is on. JSON, through the port (unlike the logo blob
+  // cache, AD-13). `readFxOverride` DEGRADES a missing/corrupt/transiently-
+  // unreadable override to `null` (the bundle still totals), never throwing — a
+  // malformed override is "no override", not a crash. `writeFxOverride` validates
+  // LOUDLY (a bad rate throws) and writes atomically under the settings-family
+  // lock, so there is a single serialized writer and no torn mid-write read.
+  readFxOverride(): Promise<FxOverride | null>;
+  writeFxOverride(override: FxOverride): Promise<void>;
 
   // Backups
   createBackup(reason: string): Promise<string>; // returns backup filename

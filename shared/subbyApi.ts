@@ -19,6 +19,7 @@ import type { SubscriptionState, SubscriptionV2 } from "core/models/subscription
 import type { SubscriptionPatchV2 } from "core/subscriptionsV2";
 import type { PriceSuggestion } from "core/priceSeed";
 import type { RateSnapshot } from "core/money";
+import type { LogoPack } from "core/logo";
 import type { ImportOutcome } from "core/import";
 import type {
   AppError,
@@ -117,6 +118,38 @@ export interface SubbyApi {
    * a wrong confident total.
    */
   getFxSnapshot(homeCurrency: string): Promise<IpcResult<RateSnapshot>>;
+
+  // --- Logo Pack (Story 8.3) ---
+  /**
+   * Fetch the bundled {@link LogoPack} ONCE at launch (FR-26, AD-25). READ-ONLY:
+   * no mutation, no `evt:dataChanged`, and NO network — the pack is immutable
+   * shipped data delivered through the resource reader → IPC → store triad. A
+   * missing/corrupt bundle resolves to an EMPTY pack (valid data, not an error),
+   * so the renderer shows the deterministic lettered fallback for every row. The
+   * renderer hydrates this into `logoPackStore` so rows resolve synchronously
+   * with no per-row IPC (AD-9).
+   */
+  getLogoPack(): Promise<IpcResult<LogoPack>>;
+
+  // --- Logo blob cache + enrichment (Story 8.4) ---
+  /**
+   * Fetch the fetched-logo cache as a domain→`data:<mime>;base64,…` map (AD-13).
+   * READ-ONLY: no mutation, no `evt:dataChanged`, no network — it reads the local
+   * `logos/` blob cache. `{}` until a logo has been fetched (live fetch is off
+   * until Story 8.5). The renderer hydrates it into `logoCacheStore` at launch
+   * AND reloads it on `evt:dataChanged`, so a persisted logo swaps in. `resolveLogo`
+   * uses it as the tier BETWEEN the bundled pack and the lettered fallback.
+   */
+  getLogoCache(): Promise<IpcResult<Record<string, string>>>;
+  /**
+   * Enqueue a domain for background logo enrichment and resolve IMMEDIATELY with
+   * an ACK (`null`) — the UI NEVER awaits the fetch (AD-9). The single serial
+   * worker processes the job later (gated by `liveLogoFetch`) and, on a successful
+   * cache write, broadcasts a coalesced `evt:dataChanged` the renderer refreshes
+   * through its existing `onDataChanged` path. Enqueuing is NOT a data mutation.
+   * (The production auto-enqueue trigger and the live toggle arrive in Story 8.5.)
+   */
+  enqueueEnrichment(domain: string): Promise<IpcResult<null>>;
 
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;

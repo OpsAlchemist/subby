@@ -52,6 +52,7 @@ import type { CreateCategoryResult } from "core/categories";
 import type { ImportOutcome } from "core/import";
 import type { PriceSuggestion } from "core/priceSeed";
 import type { RateSnapshot } from "core/money";
+import type { LogoPack } from "core/logo";
 import type {
   AppError,
   ExportRequest,
@@ -65,6 +66,18 @@ import { CH } from "./channels";
 
 /** Returns the live BrowserWindow used for renderer broadcasts, or null. */
 export type GetWindow = () => BrowserWindow | null;
+
+/**
+ * Optional side-effect fired after a successful `settings:update` (Story 8.1).
+ *
+ * Lets the main process react to a settings change without re-reading settings
+ * synchronously elsewhere — the gated-network CSP cache
+ * (`onlineSettingsCache` in `main.ts`) refreshes through this so a toggled
+ * online feature widens `connect-src` on the next request (AD-7). It is a plain
+ * notification (no arguments): the hook re-reads the authoritative settings
+ * itself. Any throw is swallowed so it never fails the IPC call.
+ */
+export type OnSettingsMutated = () => void;
 
 /**
  * Result data returned by the `cat:remove` handler.
@@ -157,10 +170,14 @@ const SYSTEM_ERROR_CODES: ReadonlySet<AppError["code"]> = new Set([
  * @param getWindow Accessor for the renderer window used to broadcast
  *                  `evt:dataChanged` / `evt:error`. May return `null` if no
  *                  window is currently open (broadcasts are then skipped).
+ * @param onSettingsMutated Optional hook fired after a `settings:update`
+ *                  succeeds (Story 8.1). Used by `main.ts` to refresh the
+ *                  gated-network CSP cache; a throw here is swallowed.
  */
 export function registerIpcHandlers(
   services: AppServices,
   getWindow: GetWindow,
+  onSettingsMutated?: OnSettingsMutated,
 ): void {
   const broadcastDataChanged = (): void => {
     const win = getWindow();
@@ -373,8 +390,23 @@ export function registerIpcHandlers(
 
   handle<IpcResult<SettingsV2>>(
     CH.settings.update,
-    (_event, patch: Partial<SettingsV2>) =>
-      mutate(() => services.updateSettings(patch)),
+    async (
+      _event,
+      patch: Partial<SettingsV2>,
+    ): Promise<IpcResult<SettingsV2>> => {
+      const result = await mutate(() => services.updateSettings(patch));
+      // Notify the main process of a successful settings change so the
+      // gated-network CSP cache can refresh (AD-7). Guarded so a hook fault
+      // never turns a successful update into a failed IPC call.
+      if (result.ok && onSettingsMutated) {
+        try {
+          onSettingsMutated();
+        } catch {
+          // Swallow: the hook is a best-effort side effect, never load-bearing.
+        }
+      }
+      return result;
+    },
   );
 
   // --- Suggested price (FR-13, Story 5.4) ------------------------------------
@@ -399,8 +431,8 @@ export function registerIpcHandlers(
   handle<IpcResult<RateSnapshot>>(
     CH.fx.snapshot,
     (_event, homeCurrency: string): Promise<IpcResult<RateSnapshot>> =>
-      query(() => {
-        const snapshot = services.getFxSnapshot(homeCurrency);
+      query(async () => {
+        const snapshot = await services.getFxSnapshot(homeCurrency);
         if (snapshot === null) {
           // A loud, named error the renderer surfaces as "rates unavailable".
           // Thrown here so `query`'s catch maps it to an IpcResult failure.
@@ -408,6 +440,41 @@ export function registerIpcHandlers(
         }
         return snapshot;
       }),
+  );
+
+  // --- Logo Pack (Story 8.3) -------------------------------------------------
+  // READ-ONLY: never broadcasts `evt:dataChanged`. Unlike `fx:snapshot`, an
+  // absent/corrupt pack is NOT an error outcome — the service returns the EMPTY
+  // pack, which is valid data the renderer resolves to lettered fallbacks. So
+  // this returns `{ ok: true, data: pack }` directly. The service never throws;
+  // `query` still wraps it defensively so a crash never crosses the bridge.
+  handle<IpcResult<LogoPack>>(CH.logos.pack, () =>
+    query(() => services.getLogoPack()),
+  );
+
+  // --- Logo blob cache (Story 8.4) -------------------------------------------
+  // READ-ONLY: never broadcasts. Returns the fetched-logo cache as a
+  // domain→data-URI map (`{}` until a logo is fetched — live fetch is off until
+  // 8.5). The renderer hydrates it into `logoCacheStore` and reloads it on
+  // `evt:dataChanged` so a persisted logo swaps in. The service never throws;
+  // `query` wraps it defensively.
+  handle<IpcResult<Record<string, string>>>(CH.logos.cache, () =>
+    query(() => services.getLogoCache()),
+  );
+
+  // --- Enrichment enqueue (Story 8.4) ----------------------------------------
+  // Fire-and-forget ACK (AD-9): push the domain onto the serial worker's queue
+  // and resolve IMMEDIATELY with `null` — the caller NEVER awaits the fetch. The
+  // worker runs the job later (gated by `liveLogoFetch`) and broadcasts a
+  // coalesced `evt:dataChanged` on a successful cache write. This is NOT a
+  // mutation of app data, so it does NOT broadcast here. `enqueue` never throws
+  // (it just pushes), but `query` wraps it defensively so a crash never crosses
+  // the bridge.
+  handle<IpcResult<null>>(CH.enrich.enqueue, (_event, domain: string) =>
+    query(() => {
+      services.enqueueEnrichment(domain);
+      return null;
+    }),
   );
 
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
@@ -477,6 +544,9 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.settings.update,
   CH.price.suggest,
   CH.fx.snapshot,
+  CH.logos.pack,
+  CH.logos.cache,
+  CH.enrich.enqueue,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,
