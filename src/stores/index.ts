@@ -20,6 +20,7 @@ import { categoriesStore } from "./categoriesStore";
 import { settingsStore } from "./settingsStore";
 import { backupsStore } from "./backupsStore";
 import { logoPackStore } from "./logoPackStore";
+import { logoCacheStore } from "./logoCacheStore";
 import { errorStore } from "./errorStore";
 
 export { subscriptionsStore } from "./subscriptionsStore";
@@ -27,6 +28,7 @@ export { categoriesStore } from "./categoriesStore";
 export { settingsStore } from "./settingsStore";
 export { backupsStore } from "./backupsStore";
 export { logoPackStore } from "./logoPackStore";
+export { logoCacheStore } from "./logoCacheStore";
 export { errorStore } from "./errorStore";
 export type { Store, StoreState } from "./createStore";
 export { createStore } from "./createStore";
@@ -35,13 +37,17 @@ export { createStore } from "./createStore";
  * All data-backed stores reloaded together on a `onDataChanged` broadcast. The
  * `backupsStore` (Story 7.4) is included so the backup history refreshes
  * automatically after a restore AND after the Story 7.3 "Back up now" action
- * (both broadcast `evt:dataChanged`).
+ * (both broadcast `evt:dataChanged`). The `logoCacheStore` (Story 8.4) is
+ * included so a logo fetched in the background by the EnrichmentService — which
+ * broadcasts `evt:dataChanged` after persisting it — swaps into every row on the
+ * next reload, through the EXISTING `onDataChanged` path (AD-8, no new channel).
  */
 const allStores = [
   subscriptionsStore,
   categoriesStore,
   settingsStore,
   backupsStore,
+  logoCacheStore,
 ] as const;
 
 /** Reload every data store. Errors are captured per-store (never thrown). */

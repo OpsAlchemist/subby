@@ -452,6 +452,31 @@ export function registerIpcHandlers(
     query(() => services.getLogoPack()),
   );
 
+  // --- Logo blob cache (Story 8.4) -------------------------------------------
+  // READ-ONLY: never broadcasts. Returns the fetched-logo cache as a
+  // domain→data-URI map (`{}` until a logo is fetched — live fetch is off until
+  // 8.5). The renderer hydrates it into `logoCacheStore` and reloads it on
+  // `evt:dataChanged` so a persisted logo swaps in. The service never throws;
+  // `query` wraps it defensively.
+  handle<IpcResult<Record<string, string>>>(CH.logos.cache, () =>
+    query(() => services.getLogoCache()),
+  );
+
+  // --- Enrichment enqueue (Story 8.4) ----------------------------------------
+  // Fire-and-forget ACK (AD-9): push the domain onto the serial worker's queue
+  // and resolve IMMEDIATELY with `null` — the caller NEVER awaits the fetch. The
+  // worker runs the job later (gated by `liveLogoFetch`) and broadcasts a
+  // coalesced `evt:dataChanged` on a successful cache write. This is NOT a
+  // mutation of app data, so it does NOT broadcast here. `enqueue` never throws
+  // (it just pushes), but `query` wraps it defensively so a crash never crosses
+  // the bridge.
+  handle<IpcResult<null>>(CH.enrich.enqueue, (_event, domain: string) =>
+    query(() => {
+      services.enqueueEnrichment(domain);
+      return null;
+    }),
+  );
+
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
 
   handle<IpcResult<ImportOutcome>>(
@@ -520,6 +545,8 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.price.suggest,
   CH.fx.snapshot,
   CH.logos.pack,
+  CH.logos.cache,
+  CH.enrich.enqueue,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,

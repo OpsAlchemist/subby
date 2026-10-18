@@ -126,9 +126,9 @@ describe("LETTER_TILE_PALETTE: every color clears WCAG AA against white text", (
 
 // --- resolveLogo -------------------------------------------------------------
 
-describe("resolveLogo: bundled → lettered fallback (this story's full order)", () => {
+describe("resolveLogo: bundled → cache → lettered fallback (full order)", () => {
   it("bundled hit: a pack domain renders the bundled SVG mark", () => {
-    const r = resolveLogo(PACK, { name: "Netflix", website: "https://www.netflix.com/browse" });
+    const r = resolveLogo(PACK, {}, { name: "Netflix", website: "https://www.netflix.com/browse" });
     expect(r.kind).toBe("bundled");
     if (r.kind === "bundled") {
       expect(r.title).toBe("Netflix");
@@ -138,30 +138,70 @@ describe("resolveLogo: bundled → lettered fallback (this story's full order)",
   });
 
   it("bundled miss: an unknown domain falls back to the lettered tile", () => {
-    const r = resolveLogo(PACK, { name: "Acme", website: "acme.example" });
+    const r = resolveLogo(PACK, {}, { name: "Acme", website: "acme.example" });
     expect(r.kind).toBe("letter");
     if (r.kind === "letter") expect(r.letter).toBe("A");
   });
 
   it("empty website: falls back to the lettered tile keyed off the name", () => {
-    const r = resolveLogo(PACK, { name: "Acme", website: "" });
+    const r = resolveLogo(PACK, {}, { name: "Acme", website: "" });
     expect(r.kind).toBe("letter");
     if (r.kind === "letter") {
       expect(r.letter).toBe("A");
-      expect(r).toEqual(resolveLogo(PACK, { name: "Acme", website: "" })); // deterministic
+      expect(r).toEqual(resolveLogo(PACK, {}, { name: "Acme", website: "" })); // deterministic
     }
   });
 
   it("failed/empty pack: every row shows the lettered fallback, no crash", () => {
-    const r = resolveLogo(EMPTY_LOGO_PACK, { name: "Netflix", website: "https://netflix.com" });
+    const r = resolveLogo(EMPTY_LOGO_PACK, {}, { name: "Netflix", website: "https://netflix.com" });
     expect(r.kind).toBe("letter");
     if (r.kind === "letter") expect(r.letter).toBe("N");
   });
 
   it("same name → identical fallback across calls (determinism)", () => {
-    const a = resolveLogo(EMPTY_LOGO_PACK, { name: "Disney Plus", website: "" });
-    const b = resolveLogo(EMPTY_LOGO_PACK, { name: "Disney Plus", website: "https://x.invalid" });
+    const a = resolveLogo(EMPTY_LOGO_PACK, {}, { name: "Disney Plus", website: "" });
+    const b = resolveLogo(EMPTY_LOGO_PACK, {}, { name: "Disney Plus", website: "https://x.invalid" });
     expect(a).toEqual(b);
+  });
+});
+
+// --- resolveLogo cache tier (Story 8.4) --------------------------------------
+
+describe("resolveLogo: the cache tier sits BETWEEN bundled and letter (Story 8.4)", () => {
+  const DATA_URI = "data:image/png;base64,iVBORw0KGgo=";
+
+  it("cache hit (pack miss): a cached domain renders kind:'cached' with its data-URI", () => {
+    const cache = { "acme.example": DATA_URI };
+    const r = resolveLogo(PACK, cache, { name: "Acme", website: "https://acme.example/app" });
+    expect(r.kind).toBe("cached");
+    if (r.kind === "cached") {
+      expect(r.dataUri).toBe(DATA_URI);
+      expect(r.title).toBe("Acme"); // the name is carried as the title
+    }
+  });
+
+  it("bundled beats cache: a domain in BOTH the pack and the cache resolves bundled", () => {
+    const cache = { "netflix.com": DATA_URI };
+    const r = resolveLogo(PACK, cache, { name: "Netflix", website: "https://netflix.com" });
+    expect(r.kind).toBe("bundled");
+  });
+
+  it("cache miss (pack miss): an unmatched domain still falls back to the lettered tile", () => {
+    const cache = { "other.example": DATA_URI };
+    const r = resolveLogo(PACK, cache, { name: "Acme", website: "https://acme.example" });
+    expect(r.kind).toBe("letter");
+  });
+
+  it("empty data-URI in cache is ignored → lettered fallback (never a blank <img>)", () => {
+    const cache = { "acme.example": "" };
+    const r = resolveLogo(PACK, cache, { name: "Acme", website: "https://acme.example" });
+    expect(r.kind).toBe("letter");
+  });
+
+  it("no website: the cache tier is never consulted → lettered fallback", () => {
+    const cache = { "acme.example": DATA_URI };
+    const r = resolveLogo(PACK, cache, { name: "Acme", website: "" });
+    expect(r.kind).toBe("letter");
   });
 });
 
@@ -220,14 +260,34 @@ describe("properties: determinism + never-blank + never-throws", () => {
   it("resolveLogo never throws and always returns a non-empty tile for any inputs", () => {
     fc.assert(
       fc.property(fc.string(), fc.string(), (name, website) => {
-        const r = resolveLogo(PACK, { name, website });
+        const r = resolveLogo(PACK, {}, { name, website });
         if (r.kind === "letter") {
           expect(r.letter.length).toBe(1);
           expect(LETTER_TILE_PALETTE).toContain(r.color);
+        } else if (r.kind === "cached") {
+          expect(r.dataUri.length).toBeGreaterThan(0);
         } else {
           expect(r.path.length).toBeGreaterThan(0);
           expect(r.hex.length).toBeGreaterThan(0);
         }
+      }),
+    );
+  });
+
+  it("a cache entry NEVER overrides a bundled hit (bundled always wins)", () => {
+    // For any cache content, a packed domain (netflix.com) must still resolve
+    // bundled — the cache can only fill a pack MISS, never shadow a pack hit.
+    fc.assert(
+      fc.property(fc.string(), fc.string(), (dataUri, otherDomain) => {
+        const cache: Record<string, string> = {
+          "netflix.com": dataUri,
+          [otherDomain]: dataUri,
+        };
+        const r = resolveLogo(PACK, cache, {
+          name: "Netflix",
+          website: "https://netflix.com",
+        });
+        expect(r.kind).toBe("bundled");
       }),
     );
   });
@@ -253,7 +313,7 @@ describe("properties: determinism + never-blank + never-throws", () => {
         fc.constantFrom(...suffixes),
         (prefix, suffix) => {
           const website = `${prefix}netflix.com${suffix}`;
-          const r = resolveLogo(PACK, { name: "Netflix", website });
+          const r = resolveLogo(PACK, {}, { name: "Netflix", website });
           expect(r.kind).toBe("bundled");
         },
       ),

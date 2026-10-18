@@ -14,6 +14,7 @@ import {
   categoriesStore,
   settingsStore,
   logoPackStore,
+  logoCacheStore,
   errorStore,
 } from "@/stores";
 import type { LogoPack } from "core/logo";
@@ -131,6 +132,10 @@ function createFakeApi(): FakeApi {
     getLogoPack: (() =>
       ok({ version: 1, generatedAt: "", note: "", icons: {} })) as SubbyApi["getLogoPack"],
 
+    // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue is a no-op ack ---
+    getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
+    enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),
@@ -244,6 +249,7 @@ afterEach(() => {
   categoriesStore.reset();
   settingsStore.reset();
   logoPackStore.reset();
+  logoCacheStore.reset();
   errorStore.clear();
   vi.restoreAllMocks();
 });
@@ -1243,6 +1249,44 @@ describe("logo tile: bundled SVG vs deterministic lettered fallback (Story 8.3)"
     const tile = cell.querySelector('span[aria-hidden="true"]') as HTMLElement;
     expect(tile).not.toBeNull();
     expect(tile.textContent).toBe("A");
+  });
+
+  const DATA_URI = "data:image/png;base64,iVBORw0KGgo=";
+
+  it("cached hit: a pack-miss domain present in the logo cache renders the data-URI <img> (Story 8.4)", async () => {
+    // Pack has netflix.com only; the row's domain (acme.example) is a pack MISS
+    // but IS in the fetched-logo cache → the cache tier renders an <img src>.
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    fake.getLogoCache = (() =>
+      ok<Record<string, string>>({ "acme.example": DATA_URI })) as SubbyApi["getLogoCache"];
+    await renderList([
+      makeSub({ id: "a", name: "Acme", website: "https://acme.example/app" }),
+    ]);
+    await waitFor(() => expect(logoCacheStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Acme");
+    const img = cell.querySelector("img") as HTMLImageElement | null;
+    expect(img, "a cached row renders an <img>").not.toBeNull();
+    expect(img!.getAttribute("src")).toBe(DATA_URI);
+    // No lettered fallback text and no bundled svg path for a cache hit.
+    expect(cell.querySelector("svg path")).toBeNull();
+    const tile = cell.querySelector('[aria-hidden="true"]');
+    expect(tile).not.toBeNull();
+  });
+
+  it("bundled beats cache: a domain in BOTH the pack and the cache renders the bundled SVG (Story 8.4)", async () => {
+    // netflix.com is in the pack AND seeded in the cache — bundled must win.
+    fake.getLogoPack = (() => ok(packWithNetflix)) as SubbyApi["getLogoPack"];
+    fake.getLogoCache = (() =>
+      ok<Record<string, string>>({ "netflix.com": DATA_URI })) as SubbyApi["getLogoCache"];
+    await renderList([
+      makeSub({ id: "a", name: "Netflix", website: "https://www.netflix.com/browse" }),
+    ]);
+    await waitFor(() => expect(logoCacheStore.getSnapshot().loaded).toBe(true));
+
+    const cell = nameCell("Netflix");
+    expect(cell.querySelector("svg path"), "bundled wins over cache").not.toBeNull();
+    expect(cell.querySelector("img"), "no cached <img> when bundled wins").toBeNull();
   });
 
   it("same name → same fallback letter AND color on every render", async () => {

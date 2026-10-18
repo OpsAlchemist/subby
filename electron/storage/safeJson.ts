@@ -206,6 +206,43 @@ export async function writeJsonAtomic(file: string, data: unknown): Promise<void
 }
 
 /**
+ * Atomically write raw bytes to `file` (Story 8.4 logo blob cache, AD-13).
+ *
+ * The binary sibling of {@link writeJsonAtomic}: same temp-then-rename
+ * discipline (write to a unique temp file in the same directory, then rename
+ * over the target so an interrupted write cannot leave a partial/corrupt blob),
+ * but it takes a `Buffer`/`Uint8Array` and writes NO JSON formatting. Used by
+ * the `LogoBlobCache` to persist fetched logo bytes under
+ * `<App_Data_Directory>/logos/` — the StoragePort is untouched (it stays
+ * JSON-only).
+ *
+ * @param file Absolute path to write.
+ * @param data Raw bytes to persist.
+ */
+export async function writeFileAtomic(
+  file: string,
+  data: Uint8Array,
+): Promise<void> {
+  const dir = dirname(file);
+  await mkdir(dir, { recursive: true });
+
+  const tmp = join(dir, `.${randomBytes(8).toString("hex")}.tmp`);
+
+  try {
+    await writeFile(tmp, data);
+    await rename(tmp, file);
+  } catch (err) {
+    // Best-effort cleanup of the temp file if the rename never happened.
+    try {
+      await unlink(tmp);
+    } catch {
+      // Ignore: temp file may not exist or was already renamed.
+    }
+    throw err;
+  }
+}
+
+/**
  * Error thrown by {@link writeJsonExclusive} when the target path already exists
  * (AD-16). The never-overwrite backup writer uses this to resolve a fresh name
  * (bump the uniqueness suffix) rather than silently clobbering an existing

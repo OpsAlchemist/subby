@@ -164,6 +164,10 @@ function createFakeApi(): FakeApi {
     getLogoPack: (() =>
       ok({ version: 1, generatedAt: "", note: "", icons: {} })) as SubbyApi["getLogoPack"],
 
+    // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue acks ---
+    getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
+    enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
+
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
     exportData: () => ok({ path: "/tmp/export.json", bytes: 0 }),

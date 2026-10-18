@@ -16,6 +16,7 @@ import {
 } from "./ipc/handlers";
 import { buildCsp } from "./net/csp";
 import { runChooseDataFolder } from "./services/dialog";
+import { EnrichmentService } from "./services/enrichment";
 import { NotificationService } from "./services/notificationService";
 import { Scheduler } from "./services/scheduler";
 import { destroyTray, ensureTray } from "./services/tray";
@@ -92,6 +93,15 @@ let appContext: AppContext | null = null;
  * stopped on quit.
  */
 let scheduler: Scheduler | null = null;
+
+/**
+ * The logo-enrichment service (Story 8.4). Lives in the main process and owns a
+ * single serial queue; `enrich:enqueue` returns immediately while the worker
+ * fetches through the gated gateway, persists to the `logos/` blob cache, and
+ * broadcasts a coalesced `evt:dataChanged`. Constructed inside the app context
+ * post-barrier, DRAINED only after `ready-to-show` (AD-28), and stopped on quit.
+ */
+let enrichment: EnrichmentService | null = null;
 
 /**
  * Set once a genuine application quit is underway (`before-quit`, or the tray
@@ -200,7 +210,18 @@ function applyProductionCsp(): void {
  * can only be known after the first read.
  */
 async function bootstrapContext(): Promise<AppContext> {
-  const context = createAppContext(app.getPath("userData"));
+  // `getWindow` is a LAZY closure (`() => mainWindow`), so passing it before the
+  // window exists is safe — the EnrichmentService only reads it when a job
+  // completes (long after launch), to broadcast a coalesced `evt:dataChanged`
+  // through the SAME accessor the IPC handlers use (AD-8). The default data
+  // folder / cloud-path predicate are kept (the override is applied below once
+  // settings are read).
+  const context = createAppContext(
+    app.getPath("userData"),
+    null,
+    undefined,
+    getWindow,
+  );
   const settings = await context.services.getSettings();
   if (settings.dataFolder) {
     // Switch subsequent data file operations to the persisted folder (Req 15.3/15.4).
@@ -301,6 +322,21 @@ function scheduleDeferredSchedulerFirstTick(): void {
   }, SCHEDULER_FIRST_TICK_DELAY_MS);
 }
 
+/**
+ * Permit the EnrichmentService to drain its queue (Story 8.4, AD-28).
+ *
+ * Called from the window's `ready-to-show` so a logo fetch never competes with
+ * first paint and the window is painted before any `evt:dataChanged` swap-in.
+ * Combined with the migration barrier (the service is constructed post-barrier
+ * in the `whenReady` sequence), this is the AD-28 "drain only after barrier AND
+ * ready-to-show" ordering. `start()` is idempotent and a no-op before the
+ * service exists or after it is stopped.
+ */
+function startDeferredEnrichmentDrain(): void {
+  if (enrichment === null) return;
+  enrichment.start();
+}
+
 function createWindow(): void {
   const window = new BrowserWindow({
     width: 1200,
@@ -330,6 +366,10 @@ function createWindow(): void {
   window.once("ready-to-show", () => {
     window.show();
     scheduleDeferredSchedulerFirstTick();
+    // Permit the enrichment worker to drain now that the window is painted and
+    // the barrier has passed (AD-28). The queue is empty until Story 8.5 wires
+    // the production auto-enqueue trigger, so this is dormant for real users.
+    startDeferredEnrichmentDrain();
   });
 
   window.on("closed", () => {
@@ -415,6 +455,14 @@ app.whenReady().then(async () => {
       // live OS local offset (`-new Date().getTimezoneOffset()`), so the offset
       // convention (AD-18) has a single source rather than a duplicated literal.
     });
+
+    // Capture the EnrichmentService. It was CONSTRUCTED during bootstrap (step 1,
+    // inside `createAppContext`) — construction itself touches no user data, so
+    // its timing is not load-bearing. The AD-28 safety comes from the START gate,
+    // not construction order: it is only permitted to DRAIN at `ready-to-show`
+    // via `startDeferredEnrichmentDrain`, which runs after this barrier has
+    // passed — so a job can only ever see migrated state.
+    enrichment = appContext.enrichment;
 
     // Seed the Tray_Mode cache from (now barrier-passed) persisted settings so
     // the synchronous `window-all-closed` handler has a sane initial value
@@ -509,5 +557,6 @@ app.on("before-quit", () => {
 // Tear down main-process resources on quit.
 app.on("quit", () => {
   scheduler?.stop();
+  enrichment?.stop();
   destroyTray();
 });

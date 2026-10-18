@@ -48,6 +48,18 @@ export const CH = {
     // renderer hydrates this ONCE at launch into `logoPackStore` so each row
     // resolves its tile synchronously with no per-row IPC (AD-9).
     pack: "logos:pack",
+    // Read-only fetched-logo cache map (Story 8.4). Returns a domain→data-URI
+    // record from the `logos/` blob cache (`{}` until a logo is fetched). The
+    // renderer hydrates it into `logoCacheStore` at launch AND reloads it on
+    // `evt:dataChanged`, so a persisted logo swaps in with no fs access.
+    cache: "logos:cache",
+  },
+  enrich: {
+    // Enqueue a domain for background logo enrichment (Story 8.4). Returns an
+    // ACK immediately (`IpcResult<null>`) — the UI never awaits the fetch
+    // (AD-9); the serial worker processes the job later and broadcasts a
+    // coalesced `evt:dataChanged` on completion.
+    enqueue: "enrich:enqueue",
   },
   data: {
     importFile: "data:import", // {format, conflictMode, path}

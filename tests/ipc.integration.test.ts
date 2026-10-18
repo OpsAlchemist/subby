@@ -842,6 +842,8 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "getPriceSuggestion",
     "getFxSnapshot",
     "getLogoPack",
+    "getLogoCache",
+    "enqueueEnrichment",
     "importData",
     "exportData",
     "listBackups",

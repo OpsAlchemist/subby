@@ -23,6 +23,15 @@ export const fileNames = {
   categories: "categories.json",
   reminderLedger: "reminder-ledger.json",
   backupDir: "backup",
+  /**
+   * The logo blob cache subdirectory (Story 8.4, AD-13). Fetched brand logos
+   * are persisted under `<App_Data_Directory>/logos/<domain>.<ext>` by the
+   * `LogoBlobCache` helper — a plain file cache that lives PARALLEL to the JSON
+   * data files, NOT routed through the StoragePort (which stays JSON-only). It
+   * sits under the active data directory so a Data-Folder relocation is a plain
+   * re-point (the next cache op targets the new folder; old blobs are not moved).
+   */
+  logosDir: "logos",
 } as const;
 
 /**

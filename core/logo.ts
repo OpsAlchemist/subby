@@ -8,12 +8,13 @@
  * resolves a row's logo from already-loaded local data only (mirror
  * `core/money.ts` / `core/priceSeed.ts`).
  *
- * This story's resolution order is bundled Logo Pack → deterministic lettered/
- * colored fallback. There is NO cache read and NO fetch here (those are Stories
- * 8.4 and 8.5, which EXTEND {@link resolveLogo} when they land). A bundled brand
- * renders with zero network; any miss (no match, empty website, or a pack that
- * failed to load) renders a deterministic lettered tile — never blank, never a
- * blocking fetch.
+ * The resolution order is bundled Logo Pack → `logos/` cache → deterministic
+ * lettered/colored fallback. There is NO fetch here (that is Story 8.5): the
+ * cache is a plain already-loaded `Record<string,string>` (domain→data-URI)
+ * param (Story 8.4), so this module stays pure and network-free. A bundled brand
+ * renders with zero network; a cached brand renders a persisted data-URI; any
+ * miss (no match, empty website, or a pack that failed to load) renders a
+ * deterministic lettered tile — never blank, never a blocking fetch.
  *
  *   - {@link parseLogoPack} validates a raw (`unknown`) object into a typed
  *     {@link LogoPack}, degrading to an EMPTY pack on any defect (so a missing/
@@ -29,7 +30,8 @@
  *     dependency on any store (unlike `CategoryColorDot`, which looks the color
  *     up in the categories store).
  *   - {@link resolveLogo} is the single resolver: a bundled hit → the SVG path +
- *     hex; otherwise the lettered fallback.
+ *     hex; a cache hit → the persisted data-URI (`kind:"cached"`); otherwise the
+ *     lettered fallback.
  */
 
 /**
@@ -80,10 +82,14 @@ export const EMPTY_LOGO_PACK: LogoPack = Object.freeze({
 /**
  * The resolution of a row's logo (the output of {@link resolveLogo}):
  *   - `kind: "bundled"` — a bundled brand mark (its SVG `path` + `hex` + `title`).
+ *   - `kind: "cached"`  — a fetched-and-persisted logo (Story 8.4): the
+ *     `data:<mime>;base64,…` URI from the `logos/` blob cache, rendered as an
+ *     `<img src>`. The cache tier sits BETWEEN bundled and letter.
  *   - `kind: "letter"`  — the deterministic lettered/colored fallback.
  */
 export type LogoResolution =
   | { kind: "bundled"; path: string; hex: string; title: string }
+  | { kind: "cached"; dataUri: string; title: string }
   | { kind: "letter"; letter: string; color: string };
 
 /**
@@ -210,20 +216,30 @@ export function domainFromWebsite(website: string): string | null {
 }
 
 /**
- * Resolve a row's logo from the bundled {@link LogoPack} with a deterministic
- * lettered fallback. This story's whole resolution order lives here:
+ * Resolve a row's logo from the bundled {@link LogoPack}, the fetched-logo cache,
+ * and a deterministic lettered fallback — the full three-tier order (Story 8.4):
  *
  *   1. Normalize `website` to a registrable domain. If the domain is in the
- *      pack, return the bundled mark (`kind: "bundled"`) — zero network.
- *   2. Otherwise (no website, no match, or an empty/failed pack), return the
- *      deterministic lettered/colored fallback (`kind: "letter"`) keyed off
- *      `name` — never blank, never a fetch.
+ *      PACK, return the bundled mark (`kind: "bundled"`) — bundled always wins
+ *      (zero network, a curated/correct mark).
+ *   2. Else if the domain is in the `cache` map, return the persisted data-URI
+ *      (`kind: "cached"`) — a logo fetched in a prior session that swapped in.
+ *   3. Otherwise (no website, no match in pack or cache, or an empty/failed
+ *      pack), return the deterministic lettered/colored fallback
+ *      (`kind: "letter"`) keyed off `name` — never blank, never a fetch.
  *
- * Pure and synchronous: safe to call on the render hot path (AD-9). Later
- * stories (8.4 cache, 8.5 fetch) extend step 1 WITHOUT changing this contract.
+ * `cache` is a plain `Record<string,string>` of domain→`data:<mime>;base64,…`,
+ * keyed by the SAME lowercased registrable domain as the pack. Passing `{}`
+ * (the default) collapses to the Story 8.3 bundled→letter order, so existing
+ * callers/tests that do not know about the cache behave identically.
+ *
+ * Pure and synchronous: no clock, no filesystem, no network — safe on the render
+ * hot path (AD-9). Story 8.5 only turns ON the fetch that fills the cache; it
+ * does not change this contract.
  */
 export function resolveLogo(
   pack: LogoPack,
+  cache: Record<string, string>,
   sub: { name: string; website: string },
 ): LogoResolution {
   const domain = domainFromWebsite(sub.website);
@@ -231,6 +247,11 @@ export function resolveLogo(
     const icon = pack.icons[domain];
     if (icon !== undefined) {
       return { kind: "bundled", path: icon.path, hex: icon.hex, title: icon.title };
+    }
+    // Cache tier (Story 8.4): a persisted logo for this domain, below bundled.
+    const dataUri = cache[domain];
+    if (typeof dataUri === "string" && dataUri.length > 0) {
+      return { kind: "cached", dataUri, title: sub.name };
     }
   }
   const { letter, color } = letterTile(sub.name);

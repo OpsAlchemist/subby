@@ -4,12 +4,17 @@
  *
  * Rendered before a subscription name in the List (table + card) and the
  * Dashboard panels, beside the existing {@link CategoryColorDot}. It reads the
- * once-hydrated {@link logoPackStore} and resolves the tile SYNCHRONOUSLY via the
- * pure {@link resolveLogo} — no await, no per-row IPC, nothing network-touching
- * on the render path (AD-9):
+ * once-hydrated {@link logoPackStore} AND the reload-on-change
+ * {@link logoCacheStore}, and resolves the tile SYNCHRONOUSLY via the pure
+ * {@link resolveLogo} — no await, no per-row IPC, nothing network-touching on the
+ * render path (AD-9):
  *
  *   - A bundled brand (its `website` normalizes to a domain in the pack) renders
  *     the Simple Icon SVG with ZERO network.
+ *   - A cached brand (a logo fetched in a prior session and persisted to the
+ *     `logos/` blob cache, Story 8.4) renders the persisted data-URI as an
+ *     `<img>` — the tier BETWEEN bundled and lettered. It swaps in when the
+ *     EnrichmentService broadcasts `evt:dataChanged` and the cache store reloads.
  *   - Any miss (no match, empty `website`, or a pack that failed to load → the
  *     EMPTY pack) renders a DETERMINISTIC lettered/colored fallback keyed off the
  *     NAME — never blank, never a spinner, never a blocking fetch.
@@ -23,6 +28,7 @@
 
 import { resolveLogo } from "core/logo";
 import { logoPackStore } from "@/stores/logoPackStore";
+import { logoCacheStore } from "@/stores/logoCacheStore";
 import { useStoreData } from "@/stores/hooks";
 import { cn } from "@/lib/utils";
 
@@ -51,7 +57,8 @@ export default function LogoTile({
   className,
 }: LogoTileProps): JSX.Element {
   const pack = useStoreData(logoPackStore);
-  const logo = resolveLogo(pack, { name, website });
+  const cache = useStoreData(logoCacheStore);
+  const logo = resolveLogo(pack, cache, { name, website });
 
   if (logo.kind === "bundled") {
     // Bundled Simple Icon: a single 24×24 path filled with the brand hex, on a
@@ -69,6 +76,26 @@ export default function LogoTile({
         >
           <path d={logo.path} fill={`#${logo.hex}`} />
         </svg>
+      </span>
+    );
+  }
+
+  if (logo.kind === "cached") {
+    // A fetched-and-persisted logo (Story 8.4): render the data-URI as an image
+    // on the same tinted plate. Decorative + aria-hidden (the name beside it is
+    // the real label), so the `<img>` carries no meaningful alt text. The data-
+    // URI is local (no network at render) and resolves synchronously.
+    return (
+      <span
+        aria-hidden="true"
+        className={cn(TILE_CLASS, "bg-secondary", className)}
+      >
+        <img
+          src={logo.dataUri}
+          alt=""
+          aria-hidden="true"
+          className="h-[14px] w-[14px] object-contain"
+        />
       </span>
     );
   }

@@ -41,6 +41,9 @@ import {
   readBundledLogoPack,
   readBundledPriceSeed,
 } from "./storage/resourceReader";
+import { LogoBlobCache } from "./services/logoBlobCache";
+import { EnrichmentService } from "./services/enrichment";
+import type { GetWindow } from "./ipc/handlers";
 
 /** Serialization format for export/import. */
 export type DataFormat = "json" | "csv";
@@ -230,6 +233,25 @@ export interface AppServices {
    */
   getLogoPack(): LogoPack;
 
+  // --- Logo blob cache + enrichment (Story 8.4) ---
+  /**
+   * Return the fetched-logo cache as a domain→`data:<mime>;base64,…` map (AD-13).
+   * READ-ONLY, lock-free: reads the `<DataFolder>/logos/` blob cache fresh. `{}`
+   * until a logo has been fetched (live fetch is off until Story 8.5), so for
+   * real users this story it is empty — the renderer then resolves every row to
+   * the bundled pack or the lettered fallback. Never throws (an absent/unreadable
+   * cache yields `{}`); the StoragePort is untouched.
+   */
+  getLogoCache(): Promise<Record<string, string>>;
+  /**
+   * Enqueue a domain for background logo enrichment and return IMMEDIATELY (AD-9)
+   * — the UI never awaits the fetch. The single serial worker processes the job
+   * later (gated by `liveLogoFetch`) and, on a successful cache write, broadcasts
+   * a coalesced `evt:dataChanged`. A no-op when the enrichment service is not
+   * wired (e.g. a test context that did not inject one).
+   */
+  enqueueEnrichment(domain: string): void;
+
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
   getSettings(): Promise<SettingsV2>;
@@ -283,10 +305,33 @@ export interface AppServices {
   backupNow(reason: string): Promise<string>;
 }
 
-/** The assembled application context: the storage port plus the services. */
+/**
+ * The enrichment wiring the services + `main.ts` share (Story 8.4). Kept as a
+ * narrow seam so `buildAppServices` can take an injected fake in tests and the
+ * production composition root can construct the real {@link LogoBlobCache} +
+ * {@link EnrichmentService}.
+ *
+ *   - `blobCache` backs the read-only {@link AppServices.getLogoCache}.
+ *   - `service` backs {@link AppServices.enqueueEnrichment}; `main.ts` also calls
+ *     `start()`/`stop()` on it directly for the deferred-drain launch ordering.
+ */
+export interface EnrichmentWiring {
+  blobCache: LogoBlobCache;
+  service: EnrichmentService;
+}
+
+/** The assembled application context: the storage port, services, and enrichment. */
 export interface AppContext {
   storage: StoragePort;
   services: AppServices;
+  /**
+   * The logo-enrichment pipeline (Story 8.4). Always built by
+   * {@link createAppContext} (with the live `getWindow`). `main.ts` captures it
+   * and permits it to drain only after the migration barrier has passed AND the
+   * window is `ready-to-show` — via `start()`, which it defers to `ready-to-show`
+   * (AD-28); it stops the service on quit.
+   */
+  enrichment: EnrichmentService;
 }
 
 /**
@@ -434,6 +479,7 @@ export function buildAppServices(
   priceSeed: PriceSeed | null = defaultPriceSeedLoader(),
   fxSnapshot: BundledFxSnapshot | null = defaultFxSnapshotLoader(),
   logoPack: LogoPack = defaultLogoPackLoader(),
+  enrichment: EnrichmentWiring | null = null,
 ): AppServices {
   // Per-file write authority (AD-29). Every mutating method below runs its whole
   // `read → core → write` (and, for a destructive op, its pre-op backup) inside
@@ -619,6 +665,23 @@ export function buildAppServices(
       return logoPack;
     },
 
+    // --- Logo blob cache + enrichment (Story 8.4) ----------------------------
+    async getLogoCache() {
+      // Lock-free, read-only read of the `<DataFolder>/logos/` blob cache as a
+      // domain→data-URI map. No enrichment wiring (e.g. a bare test context) →
+      // an empty map. The cache helper never throws (an absent cache yields {}),
+      // and the StoragePort is untouched (AD-13).
+      if (enrichment === null) return {};
+      return enrichment.blobCache.readAllAsDataUris();
+    },
+
+    enqueueEnrichment(domain) {
+      // Fire-and-forget (AD-9): push onto the serial worker's queue and return.
+      // A no-op when no enrichment service is wired. The worker enforces the
+      // gate (liveLogoFetch), never-refetch, and silent-fail-and-fallback.
+      enrichment?.service.enqueue(domain);
+    },
+
     // --- Settings ------------------------------------------------------------
     getSettings() {
       return storage.readSettings();
@@ -726,7 +789,8 @@ export function buildAppServices(
 /**
  * Construct the production {@link AppContext}: build the {@link JsonFileStorage}
  * adapter (injecting the platform `userData` directory and any persisted data
- * folder override) and assemble the services over it.
+ * folder override), the Story 8.4 enrichment pipeline, and assemble the services
+ * over them.
  *
  * @param defaultUserData The platform `userData` directory
  *                        (`app.getPath('userData')`).
@@ -739,11 +803,21 @@ export function buildAppServices(
  *                        guardrail is dormant until PRD Q7 supplies a real per-OS
  *                        detector behind this same seam. Threaded here so the
  *                        swap is a one-argument change with no structural edit.
+ * @param getWindow       Accessor returning the live renderer window (or `null`),
+ *                        used by the {@link EnrichmentService} to broadcast a
+ *                        coalesced `evt:dataChanged` on a completed job (AD-8).
+ *                        It is a LAZY closure (`() => mainWindow`), so passing it
+ *                        before the window exists is safe — it is only read when a
+ *                        job completes, long after launch. Defaults to a no-window
+ *                        accessor so a bare `createAppContext(dir)` call (tests)
+ *                        still wires a functioning service that simply skips the
+ *                        broadcast when no window is present.
  */
 export function createAppContext(
   defaultUserData: string,
   dataFolder: string | null = null,
   isCloudPath: CloudPathPredicate = defaultIsCloudPath,
+  getWindow: GetWindow = () => null,
 ): AppContext {
   const storage = new JsonFileStorage(
     defaultUserData,
@@ -751,6 +825,31 @@ export function createAppContext(
     undefined,
     isCloudPath,
   );
-  const services = buildAppServices(storage);
-  return { storage, services };
+
+  // Story 8.4 enrichment pipeline. The blob cache reads the active data folder
+  // FRESH on each op via `storage.getDataFolder` (bound), so a Data-Folder
+  // relocation is a plain re-point. The service is built here but only DRAINS
+  // after `main.ts` calls `start()` (post-barrier + ready-to-show, AD-28). The
+  // services need the blob cache (for `getLogoCache`) and the service (for
+  // `enqueueEnrichment`), so build them first and inject them.
+  const blobCache = new LogoBlobCache(() => storage.getDataFolder());
+
+  // Placeholder services used only to satisfy the EnrichmentService's
+  // `getSettings` seam; it is immediately replaced by the real services below.
+  // To avoid a chicken-and-egg (service needs services, services need service),
+  // the service reads settings through a thin accessor that forwards to the
+  // assembled services once they exist.
+  let assembled: AppServices;
+  const service = new EnrichmentService({
+    services: { getSettings: () => assembled.getSettings() },
+    blobCache,
+    getWindow,
+  });
+
+  assembled = buildAppServices(storage, undefined, undefined, undefined, {
+    blobCache,
+    service,
+  });
+
+  return { storage, services: assembled, enrichment: service };
 }

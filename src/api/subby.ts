@@ -216,6 +216,47 @@ export async function getLogoPackSafe(): Promise<LogoPack> {
   }
 }
 
+/**
+ * Logo blob cache + enrichment operations (Story 8.4). `cache` returns the
+ * fetched-logo map (domain→data-URI); `enqueue` fires a background fetch and
+ * resolves with an ack. Both are READ-/fire-and-forget — the UI never awaits a
+ * fetch (AD-9). Prefer the never-throws {@link getLogoCacheSafe} /
+ * {@link enqueueEnrichmentSafe} in UI paths.
+ */
+export const enrichApi = {
+  cache: () => unwrap(getSubby().getLogoCache()),
+  enqueue: (domain: string) => unwrap(getSubby().enqueueEnrichment(domain)),
+} as const;
+
+/**
+ * Logo cache fetch that NEVER throws: resolves to the domain→data-URI map or `{}`,
+ * swallowing any bridge/IPC failure (an absent preload, an unreadable cache). A
+ * cached logo is decorative — an unavailable cache simply means every row falls
+ * back to the bundled pack or the lettered tile. This is what `logoCacheStore`
+ * hydrates from.
+ */
+export async function getLogoCacheSafe(): Promise<Record<string, string>> {
+  try {
+    return await enrichApi.cache();
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Enqueue a logo enrichment that NEVER throws: fire-and-forget, swallowing any
+ * bridge/IPC failure. Enrichment is best-effort — a failed enqueue must silently
+ * do nothing, never surface an error. (The production trigger for this is Story
+ * 8.5; 8.4 ships the plumbing.)
+ */
+export async function enqueueEnrichmentSafe(domain: string): Promise<void> {
+  try {
+    await enrichApi.enqueue(domain);
+  } catch {
+    // Best-effort: a failed enqueue is a silent no-op.
+  }
+}
+
 /** Import / export / backup operations (Req 16, 17, 18). */
 export const dataApi = {
   importData: (req: Parameters<SubbyApi["importData"]>[0]) =>
