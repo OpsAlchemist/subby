@@ -477,6 +477,22 @@ export function registerIpcHandlers(
     }),
   );
 
+  // --- Enrichment "Sync Now" (Story 9.2) -------------------------------------
+  // Fire-and-forget ACK (AD-9): dispatch an on-demand sync and resolve IMMEDIATELY
+  // with `null` — the caller NEVER awaits a fetch. `syncNow` reads the live
+  // `settings.online` toggles and, independently gated, kicks a logo backfill
+  // (`liveLogoFetch` on) and a FORCED FX refresh (`fxRefresh` on) through the SAME
+  // serial queue; results swap in later via a coalesced `evt:dataChanged`. This is
+  // NOT a mutation of app data, so it does NOT broadcast here. `syncNow` never
+  // throws (it just dispatches), but `query` wraps it defensively so a crash never
+  // crosses the bridge — the renderer's never-throws facade swallows a failure.
+  handle<IpcResult<null>>(CH.enrich.syncNow, () =>
+    query(() => {
+      services.syncNow();
+      return null;
+    }),
+  );
+
   // --- Data: import / export / backups (Req 16, 17, 18) ----------------------
 
   handle<IpcResult<ImportOutcome>>(
@@ -547,6 +563,7 @@ const REGISTERED_CHANNELS: readonly string[] = [
   CH.logos.pack,
   CH.logos.cache,
   CH.enrich.enqueue,
+  CH.enrich.syncNow,
   CH.data.importFile,
   CH.data.exportFile,
   CH.data.listBackups,

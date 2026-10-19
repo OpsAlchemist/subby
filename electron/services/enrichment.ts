@@ -179,6 +179,17 @@ export class EnrichmentService {
    */
   private fxRefreshRequested = false;
 
+  /**
+   * The `force` intent carried by a deferred FX refresh request (Story 9.2). An
+   * explicit Sync Now ({@link enqueueFxRefresh}`({ force: true })`) that lands
+   * before {@link start} must still carry its force intent when {@link start}
+   * replays it — so Sync Now at launch is not silently demoted to a capped
+   * automatic refresh. Latches to `true` if ANY pending request forced; reset by
+   * {@link start} and {@link stop}. The cap-bypass itself is Story 9.3 — here the
+   * flag is only threaded through.
+   */
+  private fxRefreshRequestedForce = false;
+
   constructor(opts: EnrichmentOptions) {
     this.services = opts.services;
     this.blobCache = opts.blobCache;
@@ -202,9 +213,13 @@ export class EnrichmentService {
     if (this.queue.length > 0) void this.drain();
     // Run a deferred FX refresh that was requested before the start gate (AD-28,
     // e.g. the launch-with-toggle-on trigger fired before `ready-to-show`).
+    // Carry through the `force` intent (Story 9.2) so a Sync Now that fired before
+    // `ready-to-show` is not demoted to a capped automatic refresh.
     if (this.fxRefreshRequested) {
       this.fxRefreshRequested = false;
-      void this.runFxRefresh();
+      const force = this.fxRefreshRequestedForce;
+      this.fxRefreshRequestedForce = false;
+      void this.runFxRefresh(force);
     }
   }
 
@@ -223,6 +238,7 @@ export class EnrichmentService {
     }
     this.broadcastPending = false;
     this.fxRefreshRequested = false;
+    this.fxRefreshRequestedForce = false;
     // Drop any queued-but-unprocessed domains so a restart does not replay them.
     this.queue.length = 0;
   }
@@ -290,29 +306,42 @@ export class EnrichmentService {
 
   /**
    * Request an FX rate refresh and return IMMEDIATELY (AD-9; Story 8.6). The two
-   * production triggers (`main.ts` at launch when `fxRefresh` is on, and the
-   * `onSettingsMutated` hook when the toggle flips on) call this — NO second timer
-   * subsystem. Fire-and-forget: the caller never awaits the fetch.
+   * AUTOMATIC triggers (`main.ts` at launch when `fxRefresh` is on, and the
+   * `onSettingsMutated` hook when the toggle flips on) call this un-forced — NO
+   * second timer subsystem. The on-demand "Sync Now" control (Story 9.2) calls it
+   * with `{ force: true }`. Fire-and-forget: the caller never awaits the fetch.
    *
    *   - A `stop()`ped service is a no-op.
    *   - Before {@link start} has permitted draining (AD-28), the request is
-   *     REMEMBERED and run by `start()` (so a launch trigger that fires before
-   *     `ready-to-show` still refreshes once, after the barrier).
+   *     REMEMBERED (carrying its `force` intent) and run by `start()` (so a launch
+   *     or Sync-Now trigger that fires before `ready-to-show` still refreshes once,
+   *     after the barrier).
    *   - Once started, the FX job runs now (fire-and-forget).
    *
-   * The job itself self-gates on BOTH the `fxRefresh` toggle AND the ≤24h cadence
-   * ({@link FX_REFRESH_MIN_INTERVAL_MS}), so even if triggered more often the
-   * network is hit ≤1×/24h (FR-28 is a CAP). Returns `void` synchronously — the
-   * public {@link refreshFxNow} is the awaitable variant tests use.
+   * The job itself self-gates on the `fxRefresh` toggle AND (when NOT forced) the
+   * ≤24h cadence ({@link FX_REFRESH_MIN_INTERVAL_MS}), so an automatic trigger hits
+   * the network ≤1×/24h (FR-28 is a CAP for AUTOMATIC refreshes). `force` is
+   * THREADED through here for Story 9.2; the actual cap-bypass lands in Story 9.3
+   * ({@link runFxRefresh}) — until then `force` changes no behavior, only intent.
+   * Returns `void` synchronously — the public {@link refreshFxNow} is the awaitable
+   * variant tests use.
+   *
+   * @param opts.force when `true`, requests a cap-bypass refresh (Sync Now). The
+   *                   automatic callers omit it (default `false`), so they stay
+   *                   capped. Shape kept coherent with {@link refreshFxNow} /
+   *                   {@link runFxRefresh} across Stories 9.2/9.3.
    */
-  enqueueFxRefresh(): void {
+  enqueueFxRefresh(opts: { force?: boolean } = {}): void {
     if (this.stopped) return;
+    const force = opts.force ?? false;
     if (!this.started) {
-      // Defer until the start gate (AD-28). `start()` consumes the flag.
+      // Defer until the start gate (AD-28). `start()` consumes the flags. Latch the
+      // force intent so a pending Sync Now is not demoted to a capped refresh.
       this.fxRefreshRequested = true;
+      if (force) this.fxRefreshRequestedForce = true;
       return;
     }
-    void this.runFxRefresh();
+    void this.runFxRefresh(force);
   }
 
   /**
@@ -320,10 +349,14 @@ export class EnrichmentService {
    * deterministically). Production uses the fire-and-forget {@link enqueueFxRefresh};
    * this is the same job, awaitable. A no-op before {@link start} / after
    * {@link stop}.
+   *
+   * @param force threaded through to {@link runFxRefresh} (Story 9.2 plumbing; the
+   *              cap-bypass itself is Story 9.3). Defaults to `false` so existing
+   *              callers (and the automatic triggers) stay capped.
    */
-  async refreshFxNow(): Promise<void> {
+  async refreshFxNow(force = false): Promise<void> {
     if (!this.started || this.stopped) return;
-    await this.runFxRefresh();
+    await this.runFxRefresh(force);
   }
 
   /**
@@ -343,8 +376,19 @@ export class EnrichmentService {
    *      `fetchedAt = now()`.
    *   6. BROADCAST a single coalesced `evt:dataChanged` so the renderer reloads and
    *      re-queries `getFxSnapshot` (newer `asOf` swaps in) — the SAME path logos use.
+   *
+   * @param force Story 9.2 plumbing for the on-demand "Sync Now" path. When an
+   *              explicit Sync Now dispatches an FX refresh it passes `force=true`
+   *              so the ≤24h cap SHOULD be bypassed — but the actual bypass of
+   *              step (3) is Story 9.3. Here `force` is accepted and threaded in
+   *              (so the signature is coherent across 9.2/9.3) without yet changing
+   *              the cadence gate: the automatic callers pass `false` and stay
+   *              capped, and a forced call behaves identically for now. 9.3 makes
+   *              `force` load-bearing by skipping (3) when set.
    */
-  private async runFxRefresh(): Promise<void> {
+  private async runFxRefresh(force = false): Promise<void> {
+    // `force` is threaded for Story 9.2; the cap-bypass it will gate is Story 9.3.
+    void force;
     if (this.fxRefreshInFlight || this.stopped) return;
     // The FX override read/write seams are optional (a logo-only stub omits them);
     // without them the FX job cannot run.

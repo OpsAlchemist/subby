@@ -279,8 +279,27 @@ export interface AppServices {
    * by `main.ts` at launch (when `fxRefresh` is on) and by the `onSettingsMutated`
    * hook when the toggle flips on — NO second timer. The job self-gates on the
    * toggle and the ≤24h cadence; a no-op when the enrichment service is not wired.
+   *
+   * @param opts.force when `true`, requests a cap-bypass refresh — the on-demand
+   *                   "Sync Now" path (Story 9.2). The automatic callers omit it
+   *                   (default `false`) so they stay capped. The actual bypass
+   *                   lands in Story 9.3; here `force` is threaded through.
    */
-  enqueueFxRefresh(): void;
+  enqueueFxRefresh(opts?: { force?: boolean }): void;
+
+  // --- On-demand "Sync Now" (Story 9.2, FR-25) ----------------------------
+  /**
+   * Dispatch an on-demand enrichment sync and return IMMEDIATELY (fire-and-forget,
+   * AD-9). Reads the live `settings.online` and, independently gated per toggle,
+   * kicks a logo backfill ({@link EnrichmentService.backfillAllLogos}, Story 9.1)
+   * when `liveLogoFetch` is on and a FORCED FX refresh ({@link enqueueFxRefresh}
+   * with `force: true`) when `fxRefresh` is on — both through the SAME serial
+   * queue. With BOTH toggles off this is a no-op (nothing to sync; the renderer
+   * already disables the button, and the gateway would refuse regardless). A no-op
+   * when the enrichment service is not wired. Never awaits a fetch; degrades
+   * silently on any fault (the dispatch itself never throws).
+   */
+  syncNow(): void;
 
   // --- Settings (Req 15) ---
   /** Read the persisted settings. */
@@ -727,11 +746,43 @@ export function buildAppServices(
       return lock("settings", () => storage.writeFxOverride(override));
     },
 
-    enqueueFxRefresh() {
+    enqueueFxRefresh(opts) {
       // Fire-and-forget (AD-9): ask the serial FX job to run and return. A no-op
       // when no enrichment service is wired. The job enforces the `fxRefresh` gate,
-      // the ≤24h cadence cap, and silent-fail-keep-last-good.
-      enrichment?.service.enqueueFxRefresh();
+      // the ≤24h cadence cap, and silent-fail-keep-last-good. `force` (Sync Now,
+      // Story 9.2) is threaded through; the cap-bypass itself is Story 9.3.
+      enrichment?.service.enqueueFxRefresh(opts);
+    },
+
+    // --- On-demand "Sync Now" (Story 9.2) ------------------------------------
+    syncNow() {
+      // Fire-and-forget (AD-9): dispatch the enabled feature(s)' sync through the
+      // SAME serial queue and return. A no-op when no enrichment service is wired.
+      // Each sub-dispatch is independently gated on its live `settings.online`
+      // toggle — read fresh here so the dispatch keys off the current state (and
+      // the worker/gateway are the authoritative backstop). With both toggles off
+      // nothing is dispatched (the renderer also disables the button). Reads
+      // settings asynchronously but returns synchronously (the whole point is to
+      // never await a fetch). Any fault degrades silently.
+      if (enrichment === null) return;
+      void (async () => {
+        try {
+          const { online } = await storage.readSettings();
+          // Logo backfill: enqueue EVERY existing subscription's domain through the
+          // existing queue (de-dup + never-refetch `has()` do the rest, Story 9.1).
+          if (online.liveLogoFetch) {
+            void enrichment.service.backfillAllLogos();
+          }
+          // FX refresh: a FORCED request (Sync Now is an explicit action, so it
+          // asks to bypass the ≤24h cap — the bypass lands in Story 9.3).
+          if (online.fxRefresh) {
+            enrichment.service.enqueueFxRefresh({ force: true });
+          }
+        } catch {
+          // Degrade silently (AD-9): a failed settings read means no dispatch — the
+          // user sees no error, consistent with the opt-in enrichment stance.
+        }
+      })();
     },
 
     // --- Settings ------------------------------------------------------------

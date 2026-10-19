@@ -226,6 +226,7 @@ export async function getLogoPackSafe(): Promise<LogoPack> {
 export const enrichApi = {
   cache: () => unwrap(getSubby().getLogoCache()),
   enqueue: (domain: string) => unwrap(getSubby().enqueueEnrichment(domain)),
+  syncNow: () => unwrap(getSubby().syncNow()),
 } as const;
 
 /**
@@ -254,6 +255,22 @@ export async function enqueueEnrichmentSafe(domain: string): Promise<void> {
     await enrichApi.enqueue(domain);
   } catch {
     // Best-effort: a failed enqueue is a silent no-op.
+  }
+}
+
+/**
+ * Dispatch an on-demand "Sync Now" that NEVER throws (Story 9.2, FR-25):
+ * fire-and-forget, swallowing any bridge/IPC failure. Sync is best-effort and
+ * degrades silently (no error toast), consistent with AD-9 and the opt-in
+ * enrichment stance — a failed dispatch must silently do nothing. The main-side
+ * handler decides WHAT to sync from the live `settings.online` toggles; this
+ * front door just acknowledges the user's click.
+ */
+export async function syncNowSafe(): Promise<void> {
+  try {
+    await enrichApi.syncNow();
+  } catch {
+    // Best-effort: a failed sync dispatch is a silent no-op (no toast).
   }
 }
 

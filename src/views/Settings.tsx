@@ -38,14 +38,14 @@
  * _Requirements: 15.1, 15.2, 15.3, 23.2, 23.3_
  */
 
-import { useState } from "react";
-import { FolderOpen } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FolderOpen, RefreshCw } from "lucide-react";
 
 import type {
   ReminderLeadTime,
   SettingsV2 as SettingsModel,
 } from "core/models/settings";
-import { settingsApi, toAppError } from "@/api/subby";
+import { settingsApi, syncNowSafe, toAppError } from "@/api/subby";
 import { settingsStore } from "@/stores/settingsStore";
 import { errorStore } from "@/stores/errorStore";
 import { useStore } from "@/stores/hooks";
@@ -106,13 +106,59 @@ const FOCUS_RING =
 const SELECT_CLASS =
   `w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ${FOCUS_RING}`;
 
+/**
+ * The transient "Syncing…" affordance window for the Sync Now button (Story 9.2).
+ *
+ * Fire-and-forget means there is NO completion signal to await across the
+ * `enrich:syncNow` boundary (AD-9) — the busy state is a short UX acknowledgement
+ * of the click, not a real "done". It resolves after this bounded interval; the
+ * actual logos/rates swap in later via `evt:dataChanged` as the queue drains.
+ */
+const SYNC_BUSY_MS = 1500;
+
 export default function Settings(): JSX.Element {
   const { data: settings } = useStore(settingsStore);
   const [choosingFolder, setChoosingFolder] = useState(false);
+  // Transient "Syncing…" acknowledgement for the Sync Now control (Story 9.2).
+  const [syncing, setSyncing] = useState(false);
+  const syncTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Clear a pending busy-state timer on unmount so it never fires into an
+  // unmounted component.
+  useEffect(() => {
+    return () => {
+      if (syncTimer.current !== null) clearTimeout(syncTimer.current);
+    };
+  }, []);
 
   // The appearance currently painted (dark/light), so the accent swatch for the
   // active theme can be marked current — matching the token applyAccent paints.
   const activeTheme: ResolvedTheme = resolveTheme(settings.theme);
+
+  // Sync Now is inert when NOTHING is online — nothing to sync, so the control is
+  // disabled with a programmatically-associated reason (AD-9 + privacy gate).
+  const anyOnline = settings.online.liveLogoFetch || settings.online.fxRefresh;
+
+  /**
+   * Dispatch an on-demand "Sync Now" (Story 9.2, FR-25). Fire-and-forget: the
+   * never-throws facade swallows any bridge/IPC failure (no toast). The busy state
+   * is a short bounded acknowledgement of the click — NOT a real completion signal
+   * (there is nothing to await across the fire-and-forget boundary); results swap
+   * in later via the existing `evt:dataChanged` → store-reload path.
+   */
+  function syncNow(): void {
+    // Guard against a double-trigger (also idempotent downstream via queue de-dup
+    // + never-refetch + the FX in-flight guard — this just avoids restacking the
+    // timer on a rapid second click).
+    if (syncing || !anyOnline) return;
+    setSyncing(true);
+    void syncNowSafe();
+    if (syncTimer.current !== null) clearTimeout(syncTimer.current);
+    syncTimer.current = setTimeout(() => {
+      syncTimer.current = null;
+      setSyncing(false);
+    }, SYNC_BUSY_MS);
+  }
 
   /**
    * Persist a settings patch (Req 15.2). Any IPC failure is normalized to an
@@ -402,6 +448,42 @@ export default function Settings(): JSX.Element {
               })
             }
           />
+        </div>
+
+        {/*
+          Sync Now (Story 9.2; FR-25, AD-9) — an on-demand trigger for the enabled
+          feature(s). It is a real <button> (not a toggle): fire-and-forget via
+          `syncNowSafe()`, which dispatches `enrich:syncNow` and returns an ack
+          immediately — the UI never awaits a fetch. It is DISABLED when both
+          online features are off (nothing to sync; the disclosure of WHY is wired
+          via aria-describedby so the reason is announced with the control). On
+          click it shows a short, bounded "Syncing…" acknowledgement (not a real
+          completion signal); refreshed logos/rates swap in later via the existing
+          `evt:dataChanged` refresh. A failure degrades silently (no toast). Reuses
+          the "Choose folder…" button pattern (focus ring + disabled styling).
+        */}
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={syncNow}
+            disabled={!anyOnline || syncing}
+            aria-describedby={!anyOnline ? "online-sync-disabled-reason" : undefined}
+            className={`inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted disabled:opacity-50 ${FOCUS_RING}`}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${syncing ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            />
+            {syncing ? "Syncing…" : "Sync now"}
+          </button>
+          {!anyOnline && (
+            <p
+              id="online-sync-disabled-reason"
+              className="text-sm text-muted-foreground"
+            >
+              Turn on a feature above to sync.
+            </p>
+          )}
         </div>
       </SettingsSection>
 
