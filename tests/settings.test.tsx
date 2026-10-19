@@ -85,6 +85,7 @@ interface FakeApi extends SubbyApi {
   chooseFolderSpy: ReturnType<typeof vi.fn>;
   createBackupSpy: ReturnType<typeof vi.fn>;
   restoreBackupSpy: ReturnType<typeof vi.fn>;
+  syncNowSpy: ReturnType<typeof vi.fn>;
   state: {
     subscriptions: SubscriptionV2[];
     categories: Category[];
@@ -113,12 +114,16 @@ function createFakeApi(): FakeApi {
   // Restore (Story 7.4): resolves with the restored subscriptions by default; a
   // test overrides it to a rejected IpcResult to exercise the error→toast path.
   const restoreBackupSpy = vi.fn(() => ok<SubscriptionV2[]>(fake.state.subscriptions));
+  // Sync Now (Story 9.2): fire-and-forget ack by default; a test overrides it to a
+  // rejected IpcResult to exercise the silent-degrade (no toast) path.
+  const syncNowSpy = vi.fn(() => ok<null>(null));
 
   const fake: FakeApi = {
     updateSpy,
     chooseFolderSpy,
     createBackupSpy,
     restoreBackupSpy,
+    syncNowSpy,
     state: {
       subscriptions: [],
       categories: [makeCategory()],
@@ -167,6 +172,9 @@ function createFakeApi(): FakeApi {
     // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue acks ---
     getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
     enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
+
+    // --- On-demand "Sync Now" (Story 9.2): fire-and-forget ack ---
+    syncNow: syncNowSpy as SubbyApi["syncNow"],
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
@@ -499,6 +507,156 @@ describe("Settings → Online Features section (Story 8.2)", () => {
 
     // jsdom cannot compute color contrast (the sanctioned exception, mirrors the
     // Categories scan); every other rule stays on.
+    const results = await axe(document.body, {
+      rules: { "color-contrast": { enabled: false } },
+    });
+    const serious = results.violations.filter(
+      (v) => v.impact === "serious" || v.impact === "critical",
+    );
+    expect(serious.map((v) => v.id)).toEqual([]);
+  });
+});
+
+// --- Sync Now control (Story 9.2; FR-25, AD-9) --------------------------------
+
+describe("Settings → Online Features: Sync Now control (Story 9.2)", () => {
+  const syncName = /^sync now$/i;
+
+  /** Re-seed the stores with a given online state so the button's gate is set. */
+  async function seedOnline(
+    online: SettingsModel["online"],
+  ): Promise<void> {
+    fake.state.settings = { ...fake.state.settings, online };
+    settingsStore.reset();
+    teardown?.();
+    teardown = initStores();
+    await waitFor(() =>
+      expect(settingsStore.getSnapshot().loaded).toBe(true),
+    );
+  }
+
+  it("is DISABLED with a programmatically-associated reason when both features are off", async () => {
+    // KNOWN_SETTINGS.online is all-false by default.
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const button = within(region).getByRole("button", { name: syncName });
+    expect(button).toBeDisabled();
+
+    // The disabled reason is wired via aria-describedby (not color-only).
+    const reasonId = button.getAttribute("aria-describedby");
+    expect(reasonId).toBeTruthy();
+    const reason = document.getElementById(reasonId!);
+    expect(reason).not.toBeNull();
+    expect(reason).toHaveTextContent(/turn on a feature above to sync/i);
+  });
+
+  it("does NOT dispatch when both features are off (disabled → click is inert)", async () => {
+    const user = userEvent.setup();
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+    const button = within(region).getByRole("button", { name: syncName });
+
+    // Clicking a disabled button is a no-op — zero dispatch, zero outbound.
+    await user.click(button);
+    expect(fake.syncNowSpy).not.toHaveBeenCalled();
+  });
+
+  it("is ENABLED when only logos are on, and a click dispatches syncNow exactly once", async () => {
+    const user = userEvent.setup();
+    await seedOnline({ liveLogoFetch: true, fxRefresh: false });
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const button = within(region).getByRole("button", { name: syncName });
+    expect(button).not.toBeDisabled();
+    // No disabled-reason description when enabled.
+    expect(button).not.toHaveAttribute("aria-describedby");
+
+    await user.click(button);
+    await waitFor(() => expect(fake.syncNowSpy).toHaveBeenCalledTimes(1));
+  });
+
+  it("is ENABLED when only FX is on, and a click dispatches syncNow exactly once", async () => {
+    const user = userEvent.setup();
+    await seedOnline({ liveLogoFetch: false, fxRefresh: true });
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    const button = within(region).getByRole("button", { name: syncName });
+    expect(button).not.toBeDisabled();
+
+    await user.click(button);
+    await waitFor(() => expect(fake.syncNowSpy).toHaveBeenCalledTimes(1));
+  });
+
+  it("shows a transient 'Syncing…' state on click that resolves back to idle", async () => {
+    // Real timers throughout: `userEvent`'s click awaits the real microtask queue
+    // (the handler's fire-and-forget `syncNowSafe()` promise), and the component's
+    // busy state resets via a real `setTimeout(SYNC_BUSY_MS)`. Mixing fake timers
+    // with `userEvent`/`waitFor` here deadlocks (fake timers don't flush the
+    // handler's real promise and never adopt an already-pending real timer), so we
+    // let the short bounded window elapse for real and `waitFor` the idle swap.
+    const user = userEvent.setup();
+    await seedOnline({ liveLogoFetch: true, fxRefresh: true });
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    // Idle name before the click.
+    expect(
+      within(region).getByRole("button", { name: /^sync now$/i }),
+    ).toBeInTheDocument();
+
+    await user.click(within(region).getByRole("button", { name: /^sync now$/i }));
+
+    // Busy: the accessible name reflects the state and the button is disabled.
+    const busy = within(region).getByRole("button", { name: /^syncing…$/i });
+    expect(busy).toBeDisabled();
+    // Dispatched exactly once (the UX ack is not a second dispatch).
+    expect(fake.syncNowSpy).toHaveBeenCalledTimes(1);
+
+    // After the bounded busy window it returns to idle. Allow a generous ceiling
+    // above SYNC_BUSY_MS (1.5s) for the real timer to fire + React to re-render.
+    await waitFor(
+      () =>
+        expect(
+          within(region).getByRole("button", { name: /^sync now$/i }),
+        ).not.toBeDisabled(),
+      { timeout: 4000 },
+    );
+    // Still exactly one dispatch — the UX ack reset is not a second dispatch.
+    expect(fake.syncNowSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("degrades silently on a dispatch failure — no toast", async () => {
+    const user = userEvent.setup();
+    await seedOnline({ liveLogoFetch: true, fxRefresh: false });
+    // The bridge throws; syncNowSafe must swallow it (no error surfaced).
+    fake.syncNowSpy.mockImplementationOnce(() => fail<null>("bridge down"));
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+
+    await user.click(within(region).getByRole("button", { name: syncName }));
+
+    await waitFor(() => expect(fake.syncNowSpy).toHaveBeenCalledTimes(1));
+    // Silent: no global toast recorded.
+    expect(errorStore.getSnapshot().latest).toBeNull();
+  });
+
+  it("is keyboard-operable (focus + Enter activates) and axe-clean", async () => {
+    const user = userEvent.setup();
+    await seedOnline({ liveLogoFetch: true, fxRefresh: false });
+    render(<Settings />);
+    const region = await screen.findByRole("region", { name: "Online Features" });
+    const button = within(region).getByRole("button", { name: syncName });
+
+    button.focus();
+    expect(button).toHaveFocus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(fake.syncNowSpy).toHaveBeenCalledTimes(1));
+
+    // jsdom cannot compute color contrast (the sanctioned exception); every other
+    // rule stays on. The disabled-reason wiring must also be axe-clean.
     const results = await axe(document.body, {
       rules: { "color-contrast": { enabled: false } },
     });

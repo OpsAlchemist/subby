@@ -634,3 +634,523 @@ describe("FX refresh job (Story 8.6): gate, ≤24h cap, write + one broadcast, d
     expect(send).not.toHaveBeenCalled();
   });
 });
+
+// --- Story 9.3: Sync Now FORCES an FX refresh past the ≤24h cap --------------
+
+/**
+ * The `force` flag is now LOAD-BEARING in `runFxRefresh`: a forced (Sync Now)
+ * refresh bypasses ONLY the ≤24h `fetchedAt` cadence self-gate (step 3). The
+ * bypass is deliberately NARROW — the toggle gate, the pre-provider TOCTOU
+ * re-read, the in-flight guard, and the write-time validation all still hold
+ * under force. Automatic callers stay `force=false` and remain capped ≤1×/24h.
+ * These tests pin the narrow bypass: the cap is defeated for the force path
+ * ONLY, the privacy gates survive force, and the degrade stance is unchanged.
+ */
+describe("FX refresh force (Story 9.3): Sync Now bypasses ONLY the ≤24h cap", () => {
+  const okFxProvider = (asOf = "2026-10-15"): FxProvider =>
+    vi.fn(async () => makeFxSnapshot(asOf));
+
+  it("FORCED within 24h: the self-gate is bypassed → re-fetch + fresh override (new fetchedAt)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now` → the cap WOULD suppress
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE
+
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the cap did NOT short-circuit
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override!.asOf).toBe("2026-10-15"); // rewritten with the fresh table
+    expect(state.override!.fetchedAt).toBe("2026-10-15T08:00:00.000Z"); // new stamp
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("AUTOMATIC (un-forced) within 24h STILL no-ops — the cap stays intact for everyone else", async () => {
+    // This is the test that proves 9.3 did not accidentally remove the cap for
+    // the automatic launch/toggle triggers: the SAME <24h state, un-forced, must
+    // still hit no network.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now`
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(); // un-forced (default) — the automatic path
+
+    expect(fxProvider).not.toHaveBeenCalled(); // within 24h → no network (the CAP)
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED with the toggle OFF: the toggle gate (step 2) still refuses — no fetch under force", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h, but the toggle gate fires first
+    };
+    const { services, writeFxOverride } = makeFxServices(ALL_OFF, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE, but fxRefresh is off
+
+    // Force defeats the rate cap, NEVER the privacy toggle gate.
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED, toggle flips OFF mid-flight: the pre-provider TOCTOU re-read still bails under force", async () => {
+    // The toggle is ON at the step-2 gate but is turned OFF while readFxOverride()
+    // is pending. The forced refresh skips the cadence gate but MUST still honor the
+    // fresh pre-provider re-read: a request can never open after the save, even forced.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h — only force gets us past step 3
+    };
+    const state = { online: FX_ON, override: seeded as FxOverride | null };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    const readFxOverride = vi.fn(async () => {
+      state.online = ALL_OFF; // flip OFF during the override-read await (TOCTOU window)
+      return state.override;
+    });
+    const writeFxOverride = vi.fn(async (o: FxOverride) => {
+      state.override = o;
+    });
+    const services: EnrichmentServices = { getSettings, readFxOverride, writeFxOverride };
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE
+
+    // The fresh re-read saw fxRefresh=off → no provider call, no write, no broadcast,
+    // even though force bypassed the cadence gate.
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED failure (provider throws): no override written; the prior snapshot + fetchedAt stay", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h — force gets us to the fetch, which throws
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider: FxProvider = vi.fn(async () => {
+      throw new Error("FX refresh failed: HTTP 503");
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE past the cap, then the fetch throws
+
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the cap was bypassed → we reached the fetch
+    expect(writeFxOverride).not.toHaveBeenCalled(); // failure writes nothing
+    expect(state.override).toBe(seeded); // the last good snapshot (and its fetchedAt) stays
+    expect(send).not.toHaveBeenCalled(); // silent degrade
+  });
+
+  it("FORCED after 24h: behaves like an un-forced after-24h refresh (fetch + rewrite)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-10"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // > 24h before `now`
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE — but it was already due anyway
+
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override!.asOf).toBe("2026-10-15");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("FORCED while a job is in-flight: jobs never overlap (one fetch in flight at the race)", async () => {
+    // Two forced refreshes race (a double Sync Now). The in-flight guard survives
+    // force: the second does NOT run concurrently — at the moment of the race exactly
+    // one fetch is in flight. (It is latched and runs AFTER — see the next test.)
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now` → past the 60s floor
+    };
+    const { services } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    let releaseFetch!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseFetch = r;
+    });
+    const fxProvider: FxProvider = vi.fn(async () => {
+      await gate;
+      return makeFxSnapshot("2026-10-15");
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    const first = svc.refreshFxNow(true); // FORCE — enters, awaits the blocked fetch
+    // Flush enough microtasks for the first job to pass getSettings + readOverride
+    // and reach the (blocked) provider call before the second forced call arrives.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    void svc.refreshFxNow(true); // second FORCE arrives while the first is in-flight
+    expect(fxProvider).toHaveBeenCalledTimes(1); // no overlap: one fetch in flight
+    releaseFetch();
+    await first;
+  });
+
+  it("FORCED while in-flight is LATCHED and runs after the current job settles (not lost)", async () => {
+    // Regression (PR #56, qodo): a Sync Now click during an automatic refresh must
+    // not be discarded — it is latched and run once the in-flight job finishes,
+    // INCLUDING when that in-flight job fails.
+    // Seed the last fetch >24h before `now` so the FIRST (automatic) refresh
+    // genuinely runs (past the 24h cap) and reaches the provider — only then is a
+    // job in-flight for the Sync Now to latch behind.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-12"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // 2 DAYS before `now` → cap does not apply
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let call = 0;
+    const fxProvider: FxProvider = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        await firstGate;
+        throw new Error("the in-flight automatic refresh fails");
+      }
+      return makeFxSnapshot("2026-10-15"); // the latched forced follow-up succeeds
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    const first = svc.refreshFxNow(false); // automatic refresh, blocked in-flight
+    // Wait until the first job is OBSERVABLY in-flight (its provider call has been
+    // reached and is blocked) before the Sync Now arrives — deterministic
+    // regardless of how many awaits precede the provider.
+    for (let i = 0; i < 50 && (fxProvider as unknown as { mock: { calls: unknown[] } }).mock.calls.length < 1; i++) {
+      await Promise.resolve();
+    }
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the automatic job is in-flight
+    svc.enqueueFxRefresh({ force: true }); // Sync Now arrives DURING the in-flight job → latched
+    releaseFirst();
+    await first;
+    // Flush enough microtasks for the latched forced follow-up to run end to end.
+    for (let i = 0; i < 15; i++) await Promise.resolve();
+
+    // Two calls: the failed automatic one, then the latched forced one that writes.
+    expect(fxProvider).toHaveBeenCalledTimes(2);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+  });
+
+  it("FORCED within the 60s floor is a no-op (button-mash guard; PR #56)", async () => {
+    // Regression (PR #56, qodo low): force bypasses the 24h cap but NOT a short 60s
+    // hard floor — repeated Sync Now clicks can't hit the provider every ~1.5s.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-15"),
+      fetchedAt: "2026-10-15T08:00:30.000Z", // 30s before `now` → inside the 60s floor
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:01:00.000Z"), // 30s after the last fetch
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE, but within 60s of the last fetch
+
+    expect(fxProvider).not.toHaveBeenCalled(); // the 60s floor holds even under force
+    expect(writeFxOverride).not.toHaveBeenCalled();
+  });
+});
+
+// --- Story 9.1: backfill all existing subscriptions on enable ----------------
+
+/**
+ * `backfillAllLogos` reads EVERY subscription (not just rendered rows), maps each
+ * `website` → registrable domain via `domainFromWebsite`, and feeds the EXISTING
+ * `enqueue` path. It adds no fetch/queue of its own: the per-domain de-dup,
+ * `normalizeDomainKey` shape gate, and the worker's never-refetch `has()` + the
+ * gateway gate stay the authorities. These tests exercise the mapping/skip/de-dup
+ * behavior and the degrade-on-fault path through the real queue.
+ */
+describe("backfillAllLogos: enqueue every subscription's domain (Story 9.1)", () => {
+  /** EnrichmentServices with a mutable subs list + a mutable online toggle. */
+  function makeBackfillServices(
+    online: OnlineSettingsV2,
+    websites: string[],
+  ) {
+    const state = { online, websites };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    const listSubscriptions = vi.fn(async () =>
+      state.websites.map((website) => ({ website })),
+    );
+    const services: EnrichmentServices = { getSettings, listSubscriptions };
+    return { services, state, getSettings, listSubscriptions };
+  }
+
+  it("enqueues each distinct registrable domain once and fetches genuine misses", async () => {
+    const { services, listSubscriptions } = makeBackfillServices(LOGO_ON, [
+      "https://www.netflix.com/browse",
+      "music.youtube.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(listSubscriptions).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(3);
+    const fetched = writes.map((w) => w.domain).sort();
+    expect(fetched).toEqual(["netflix.com", "spotify.com", "youtube.com"]);
+    // Backfilled rows swap in through ONE coalesced broadcast (the final flush).
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips an empty/unparseable website (domainFromWebsite → null)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "", // empty
+      "not a url", // junk → no dot host
+      "acme", // dotless → null
+      "https://netflix.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // Only the one parseable website enqueued; the three nulls were skipped.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["netflix.com"]);
+  });
+
+  it("de-dups duplicate registrable domains across subs (fetched at most once)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://music.youtube.com",
+      "https://www.youtube.com/watch",
+      "youtube.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // All three map to youtube.com → the queue de-dup fetches it exactly once.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["youtube.com"]);
+  });
+
+  it("a bundled/cached domain is enqueued but the never-refetch has() fetches nothing", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://netflix.com", // already cached
+      "https://spotify.com", // a genuine miss
+    ]);
+    const { blobCache, writes, write } = makeBlobCache(["netflix.com"]);
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    // netflix.com is already present → has() short-circuits, no fetch/write for it.
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(writes.map((w) => w.domain)).toEqual(["spotify.com"]);
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+
+  it("an empty subscription list is a no-op (nothing enqueued, nothing fetched)", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, []);
+    const { blobCache, has, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(has).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("a listSubscriptions read failure degrades silently (no throw, no fetch)", async () => {
+    const getSettings = vi.fn(async () => makeSettings(LOGO_ON));
+    const listSubscriptions = vi.fn(async () => {
+      throw new Error("storage read failed");
+    });
+    const services: EnrichmentServices = { getSettings, listSubscriptions };
+    const { blobCache, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider = okProvider();
+    // Swallow the local non-telemetry diagnostic the degrade path logs.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    // Does not throw into the caller (fire-and-forget safe).
+    await expect(svc.backfillAllLogos()).resolves.toBeUndefined();
+    await svc.drain();
+
+    expect(write).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("no listSubscriptions dep (logo-only stub): backfill is a no-op", async () => {
+    const { services } = makeServices(LOGO_ON); // no listSubscriptions seam
+    const { blobCache, has, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await expect(svc.backfillAllLogos()).resolves.toBeUndefined();
+    await svc.drain();
+
+    expect(has).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+  });
+
+  it("gate off at the worker (liveLogoFetch off): enqueued but gateway refuses, nothing cached", async () => {
+    // The main.ts caller gates on liveLogoFetch; the worker/gateway are the
+    // backstop. If backfill runs with the toggle off, the provider's NetworkGateError
+    // is an ordinary silent miss — nothing cached, no broadcast.
+    const { services } = makeBackfillServices(ALL_OFF, [
+      "https://netflix.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, write } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const provider: LogoProvider = vi.fn(async () => {
+      throw new NetworkGateError("blocked: t2.gstatic.com");
+    });
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+    svc.start();
+
+    await svc.backfillAllLogos();
+    await svc.drain();
+
+    expect(write).not.toHaveBeenCalled(); // gateway refused every job
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("safe to call before start(): enqueues defer, drain happens after start", async () => {
+    const { services } = makeBackfillServices(LOGO_ON, [
+      "https://netflix.com",
+      "https://spotify.com",
+    ]);
+    const { blobCache, writes, write } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const provider = okProvider();
+    const svc = new EnrichmentService({ services, blobCache, getWindow, provider });
+
+    // Called BEFORE start() — enqueue defers the drain (AD-28); nothing fetched yet.
+    await svc.backfillAllLogos();
+    expect(provider).not.toHaveBeenCalled();
+
+    svc.start();
+    await svc.drain();
+
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(writes.map((w) => w.domain).sort()).toEqual(["netflix.com", "spotify.com"]);
+  });
+});

@@ -98,6 +98,7 @@ function createFakeApi(settings: SettingsV2, pack: LogoPack): FakeApi {
     getLogoPack: (() => ok(fake.state.pack)) as SubbyApi["getLogoPack"],
     getLogoCache: (() => ok(fake.state.cache)) as SubbyApi["getLogoCache"],
     enqueueEnrichment: enqueueSpy as SubbyApi["enqueueEnrichment"],
+    syncNow: (() => ok(null)) as SubbyApi["syncNow"],
 
     // --- Data (unused) ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),

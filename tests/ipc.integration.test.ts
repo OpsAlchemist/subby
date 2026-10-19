@@ -510,6 +510,58 @@ describe("AppServices Logo Pack (Story 8.3)", () => {
   });
 });
 
+describe("enrich:syncNow IPC round-trip (Story 9.2)", () => {
+  it("`enrich:syncNow` dispatches to services.syncNow and acks IpcResult<null> (no broadcast)", async () => {
+    const { registerIpcHandlers } = await import("../electron/ipc/handlers");
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    sentChannels.length = 0;
+
+    // Spy on the service's syncNow so we assert the handler dispatches to it. The
+    // base `services` here is wired WITHOUT an enrichment pipeline, so syncNow is a
+    // safe no-op — all this test cares about is the handler → service dispatch +
+    // the fire-and-forget ack shape (never awaits a fetch, never broadcasts).
+    const syncNowSpy = vi.spyOn(services, "syncNow");
+    const fakeWin = {
+      isDestroyed: () => false,
+      webContents: { send: (channel: string) => sentChannels.push(channel) },
+    };
+    registerIpcHandlers(services, () => fakeWin as never);
+
+    expect(CH.enrich.syncNow).toBe("enrich:syncNow");
+    const listener = ipcHandlers.get(CH.enrich.syncNow);
+    expect(listener).toBeTypeOf("function");
+
+    const result = (await listener!({} as never)) as {
+      ok: boolean;
+      data?: null;
+    };
+
+    // Fire-and-forget ack: { ok: true, data: null }.
+    expect(result.ok).toBe(true);
+    expect(result.data).toBeNull();
+    // The handler dispatched to the service exactly once.
+    expect(syncNowSpy).toHaveBeenCalledTimes(1);
+    // NOT a mutation of app data → no evt:dataChanged broadcast from the handler.
+    expect(sentChannels).not.toContain(CH.events.dataChanged);
+  });
+
+  it("`enrich:syncNow` is in the unregister list (torn down cleanly)", async () => {
+    const { registerIpcHandlers, unregisterIpcHandlers } = await import(
+      "../electron/ipc/handlers"
+    );
+    const { CH } = await import("../electron/ipc/channels");
+
+    ipcHandlers.clear();
+    registerIpcHandlers(services, () => null);
+    expect(ipcHandlers.has(CH.enrich.syncNow)).toBe(true);
+
+    unregisterIpcHandlers();
+    expect(ipcHandlers.has(CH.enrich.syncNow)).toBe(false);
+  });
+});
+
 describe("AppServices export / import round-trips (Req 2.3)", () => {
   it("exportData('json') returns an importer-compatible string", async () => {
     await services.createSubscription(makeInput({ name: "Disney+" }));
@@ -920,6 +972,7 @@ describe("renderer↔main contract: typed bridge facade (Req 2.4, 2.5)", () => {
     "getLogoPack",
     "getLogoCache",
     "enqueueEnrichment",
+    "syncNow",
     "importData",
     "exportData",
     "listBackups",

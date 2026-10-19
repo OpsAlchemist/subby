@@ -60,6 +60,13 @@ export const CH = {
     // (AD-9); the serial worker processes the job later and broadcasts a
     // coalesced `evt:dataChanged` on completion.
     enqueue: "enrich:enqueue",
+    // On-demand "Sync Now" (Story 9.2). Fire-and-forget like `enrich:enqueue`:
+    // returns an ACK immediately (`IpcResult<null>`) — the UI never awaits a
+    // fetch (AD-9). The main-side handler dispatches a logo backfill (if
+    // `liveLogoFetch` on) and a FORCED FX refresh (if `fxRefresh` on) through the
+    // SAME background queue; results swap in later via the coalesced
+    // `evt:dataChanged`. Each sub-dispatch is independently gated on its toggle.
+    syncNow: "enrich:syncNow",
   },
   data: {
     importFile: "data:import", // {format, conflictMode, path}

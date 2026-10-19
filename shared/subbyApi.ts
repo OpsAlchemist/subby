@@ -151,6 +151,20 @@ export interface SubbyApi {
    */
   enqueueEnrichment(domain: string): Promise<IpcResult<null>>;
 
+  // --- On-demand "Sync Now" (Story 9.2, FR-25) ---
+  /**
+   * Dispatch an on-demand enrichment sync and resolve IMMEDIATELY with an ACK
+   * (`null`) — the UI NEVER awaits a fetch (AD-9). The main-side handler reads the
+   * live `settings.online` and, independently gated per toggle, kicks a logo
+   * backfill (`liveLogoFetch` on) and a FORCED FX refresh (`fxRefresh` on) through
+   * the SAME serial queue; results swap in later via a coalesced `evt:dataChanged`
+   * the renderer refreshes through its existing `onDataChanged` path. With both
+   * toggles off it is an inert no-op (the renderer also disables the control). Not
+   * a data mutation. The renderer uses the never-throws `syncNowSafe` so a failure
+   * degrades silently (no toast), consistent with the opt-in enrichment stance.
+   */
+  syncNow(): Promise<IpcResult<null>>;
+
   // --- Data: import / export / backups (Req 16, 17, 18) ---
   importData(req: ImportRequest): Promise<IpcResult<ImportOutcome>>;
   exportData(req: ExportRequest): Promise<IpcResult<ExportResult>>;

@@ -177,6 +177,7 @@ function createFakeApi(): FakeApi {
     // --- Logo blob cache + enrichment (Story 8.4): empty cache; enqueue acks ---
     getLogoCache: (() => ok<Record<string, string>>({})) as SubbyApi["getLogoCache"],
     enqueueEnrichment: (() => ok(null)) as SubbyApi["enqueueEnrichment"],
+    syncNow: (() => ok(null)) as SubbyApi["syncNow"],
 
     // --- Data ---
     importData: () => ok({ applied: [], imported: 0, skipped: 0, rejected: [] }),
