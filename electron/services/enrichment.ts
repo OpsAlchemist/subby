@@ -320,11 +320,11 @@ export class EnrichmentService {
    *
    * The job itself self-gates on the `fxRefresh` toggle AND (when NOT forced) the
    * ≤24h cadence ({@link FX_REFRESH_MIN_INTERVAL_MS}), so an automatic trigger hits
-   * the network ≤1×/24h (FR-28 is a CAP for AUTOMATIC refreshes). `force` is
-   * THREADED through here for Story 9.2; the actual cap-bypass lands in Story 9.3
-   * ({@link runFxRefresh}) — until then `force` changes no behavior, only intent.
-   * Returns `void` synchronously — the public {@link refreshFxNow} is the awaitable
-   * variant tests use.
+   * the network ≤1×/24h (FR-28 is a CAP for AUTOMATIC refreshes). A forced refresh
+   * (Story 9.3) bypasses ONLY that cadence self-gate in {@link runFxRefresh} — the
+   * toggle gate and the TOCTOU re-read still apply — so Sync Now defeats the rate
+   * cap, never the privacy gate. Returns `void` synchronously — the public
+   * {@link refreshFxNow} is the awaitable variant tests use.
    *
    * @param opts.force when `true`, requests a cap-bypass refresh (Sync Now). The
    *                   automatic callers omit it (default `false`), so they stay
@@ -350,9 +350,9 @@ export class EnrichmentService {
    * this is the same job, awaitable. A no-op before {@link start} / after
    * {@link stop}.
    *
-   * @param force threaded through to {@link runFxRefresh} (Story 9.2 plumbing; the
-   *              cap-bypass itself is Story 9.3). Defaults to `false` so existing
-   *              callers (and the automatic triggers) stay capped.
+   * @param force threaded through to {@link runFxRefresh}; when `true` it bypasses
+   *              ONLY the ≤24h cadence self-gate (Story 9.3). Defaults to `false` so
+   *              existing callers (and the automatic triggers) stay capped.
    */
   async refreshFxNow(force = false): Promise<void> {
     if (!this.started || this.stopped) return;
@@ -377,18 +377,17 @@ export class EnrichmentService {
    *   6. BROADCAST a single coalesced `evt:dataChanged` so the renderer reloads and
    *      re-queries `getFxSnapshot` (newer `asOf` swaps in) — the SAME path logos use.
    *
-   * @param force Story 9.2 plumbing for the on-demand "Sync Now" path. When an
-   *              explicit Sync Now dispatches an FX refresh it passes `force=true`
-   *              so the ≤24h cap SHOULD be bypassed — but the actual bypass of
-   *              step (3) is Story 9.3. Here `force` is accepted and threaded in
-   *              (so the signature is coherent across 9.2/9.3) without yet changing
-   *              the cadence gate: the automatic callers pass `false` and stay
-   *              capped, and a forced call behaves identically for now. 9.3 makes
-   *              `force` load-bearing by skipping (3) when set.
+   * @param force the on-demand "Sync Now" path (Stories 9.2/9.3). When `true`, the
+   *              ≤24h cadence SELF-GATE (step 3) is SKIPPED so an explicit user
+   *              action is never silently suppressed within 24h — a fresh table is
+   *              re-fetched and a new override written. The bypass is NARROW: it
+   *              defeats ONLY the rate cap, never the privacy toggle gate (step 2),
+   *              the pre-provider TOCTOU re-read, the in-flight guard, or the
+   *              write-time rate validation — those protect the user and survive a
+   *              force. The automatic callers pass `false` and stay capped at
+   *              ≤1×/24h (FR-28 is a CAP for AUTOMATIC refreshes only).
    */
   private async runFxRefresh(force = false): Promise<void> {
-    // `force` is threaded for Story 9.2; the cap-bypass it will gate is Story 9.3.
-    void force;
     if (this.fxRefreshInFlight || this.stopped) return;
     // The FX override read/write seams are optional (a logo-only stub omits them);
     // without them the FX job cannot run.
@@ -403,8 +402,14 @@ export class EnrichmentService {
       if (!settings.online.fxRefresh) return;
 
       // (3) ≤24h self-gate on the LAST successful fetch instant (`fetchedAt`).
+      // Story 9.3: a FORCED refresh (Sync Now) bypasses ONLY this cadence self-gate
+      // so an explicit user action is never silently suppressed within 24h. The
+      // bypass is deliberately narrow — the toggle gate (step 2), the pre-provider
+      // TOCTOU re-read, the in-flight guard, and the write-time rate validation all
+      // still apply under force. Automatic callers pass `force=false` and stay
+      // capped at ≤1×/24h (FR-28, AD-23).
       const existing = await readOverride();
-      if (existing !== null) {
+      if (!force && existing !== null) {
         const lastFetchedMs = Date.parse(existing.fetchedAt);
         const delta = this.now().getTime() - lastFetchedMs;
         // The no-op applies ONLY to a stamp in the PAST within the window

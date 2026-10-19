@@ -635,6 +635,235 @@ describe("FX refresh job (Story 8.6): gate, ≤24h cap, write + one broadcast, d
   });
 });
 
+// --- Story 9.3: Sync Now FORCES an FX refresh past the ≤24h cap --------------
+
+/**
+ * The `force` flag is now LOAD-BEARING in `runFxRefresh`: a forced (Sync Now)
+ * refresh bypasses ONLY the ≤24h `fetchedAt` cadence self-gate (step 3). The
+ * bypass is deliberately NARROW — the toggle gate, the pre-provider TOCTOU
+ * re-read, the in-flight guard, and the write-time validation all still hold
+ * under force. Automatic callers stay `force=false` and remain capped ≤1×/24h.
+ * These tests pin the narrow bypass: the cap is defeated for the force path
+ * ONLY, the privacy gates survive force, and the degrade stance is unchanged.
+ */
+describe("FX refresh force (Story 9.3): Sync Now bypasses ONLY the ≤24h cap", () => {
+  const okFxProvider = (asOf = "2026-10-15"): FxProvider =>
+    vi.fn(async () => makeFxSnapshot(asOf));
+
+  it("FORCED within 24h: the self-gate is bypassed → re-fetch + fresh override (new fetchedAt)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now` → the cap WOULD suppress
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE
+
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the cap did NOT short-circuit
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override!.asOf).toBe("2026-10-15"); // rewritten with the fresh table
+    expect(state.override!.fetchedAt).toBe("2026-10-15T08:00:00.000Z"); // new stamp
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("AUTOMATIC (un-forced) within 24h STILL no-ops — the cap stays intact for everyone else", async () => {
+    // This is the test that proves 9.3 did not accidentally remove the cap for
+    // the automatic launch/toggle triggers: the SAME <24h state, un-forced, must
+    // still hit no network.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now`
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(); // un-forced (default) — the automatic path
+
+    expect(fxProvider).not.toHaveBeenCalled(); // within 24h → no network (the CAP)
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED with the toggle OFF: the toggle gate (step 2) still refuses — no fetch under force", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h, but the toggle gate fires first
+    };
+    const { services, writeFxOverride } = makeFxServices(ALL_OFF, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE, but fxRefresh is off
+
+    // Force defeats the rate cap, NEVER the privacy toggle gate.
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED, toggle flips OFF mid-flight: the pre-provider TOCTOU re-read still bails under force", async () => {
+    // The toggle is ON at the step-2 gate but is turned OFF while readFxOverride()
+    // is pending. The forced refresh skips the cadence gate but MUST still honor the
+    // fresh pre-provider re-read: a request can never open after the save, even forced.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h — only force gets us past step 3
+    };
+    const state = { online: FX_ON, override: seeded as FxOverride | null };
+    const getSettings = vi.fn(async () => makeSettings(state.online));
+    const readFxOverride = vi.fn(async () => {
+      state.online = ALL_OFF; // flip OFF during the override-read await (TOCTOU window)
+      return state.override;
+    });
+    const writeFxOverride = vi.fn(async (o: FxOverride) => {
+      state.override = o;
+    });
+    const services: EnrichmentServices = { getSettings, readFxOverride, writeFxOverride };
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE
+
+    // The fresh re-read saw fxRefresh=off → no provider call, no write, no broadcast,
+    // even though force bypassed the cadence gate.
+    expect(fxProvider).not.toHaveBeenCalled();
+    expect(writeFxOverride).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("FORCED failure (provider throws): no override written; the prior snapshot + fetchedAt stay", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h — force gets us to the fetch, which throws
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider: FxProvider = vi.fn(async () => {
+      throw new Error("FX refresh failed: HTTP 503");
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE past the cap, then the fetch throws
+
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the cap was bypassed → we reached the fetch
+    expect(writeFxOverride).not.toHaveBeenCalled(); // failure writes nothing
+    expect(state.override).toBe(seeded); // the last good snapshot (and its fetchedAt) stays
+    expect(send).not.toHaveBeenCalled(); // silent degrade
+  });
+
+  it("FORCED after 24h: behaves like an un-forced after-24h refresh (fetch + rewrite)", async () => {
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-10"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // > 24h before `now`
+    };
+    const { services, writeFxOverride, state } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow, send } = makeWindow();
+    const fxProvider = okFxProvider("2026-10-15");
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE — but it was already due anyway
+
+    expect(fxProvider).toHaveBeenCalledTimes(1);
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+    expect(state.override!.asOf).toBe("2026-10-15");
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("FORCED while a job is in-flight: the second is a no-op (single serial FX job)", async () => {
+    // Two forced refreshes race (a double Sync Now). The in-flight guard survives
+    // force: only ONE fetch runs — force never lets two FX jobs run concurrently.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-14"),
+      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h, so only force reaches the fetch
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    // A provider that blocks until released, so the first job stays in-flight while
+    // the second forced call arrives.
+    let releaseFetch!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseFetch = r;
+    });
+    const fxProvider: FxProvider = vi.fn(async () => {
+      await gate;
+      return makeFxSnapshot("2026-10-15");
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    const first = svc.refreshFxNow(true); // FORCE — enters, awaits the blocked fetch
+    await Promise.resolve(); // let the first job reach the in-flight guard + fetch
+    await svc.refreshFxNow(true); // second FORCE arrives while the first is in-flight → no-op
+    releaseFetch();
+    await first;
+
+    expect(fxProvider).toHaveBeenCalledTimes(1); // only the first forced job fetched
+    expect(writeFxOverride).toHaveBeenCalledTimes(1);
+  });
+});
+
 // --- Story 9.1: backfill all existing subscriptions on enable ----------------
 
 /**
