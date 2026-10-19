@@ -182,20 +182,26 @@ async function refreshOnlineSettings(): Promise<void> {
  * IPC-layer guard around this hook so it never fails the IPC call.
  */
 async function onSettingsMutated(): Promise<void> {
+  // Capture the PREVIOUS online toggles before the cache is refreshed, so we can
+  // act on a true off→on TRANSITION rather than on every settings save.
+  const prev = onlineSettingsCache;
   await refreshOnlineSettings();
+  const next = onlineSettingsCache;
+
   // The cache now reflects the just-persisted toggles. Trigger an FX refresh only
   // when fxRefresh is on; the job no-ops otherwise and self-caps at ≤1×/24h.
-  if (onlineSettingsCache.fxRefresh && appContext !== null) {
+  if (next.fxRefresh && appContext !== null) {
     appContext.services.enqueueFxRefresh();
   }
-  // Story 9.1: when `liveLogoFetch` is on, backfill logos for EVERY existing
-  // subscription (not just rendered rows). Fire-and-forget off the hot path
-  // (AD-9) — the backfill reads all subs, maps each to a registrable domain, and
-  // feeds the SAME serial queue (de-dup + never-refetch `has()` do the rest), with
-  // results swapping in via the existing coalesced `evt:dataChanged`. The backfill
-  // is idempotent, so re-running on an unrelated settings change is harmless, but
-  // we gate on the toggle to skip a pointless `listSubscriptions` read.
-  if (onlineSettingsCache.liveLogoFetch && appContext !== null && enrichment !== null) {
+  // Story 9.1: backfill logos for EVERY existing subscription (not just rendered
+  // rows) ONLY on the `liveLogoFetch` false→true TRANSITION — the story is about
+  // the ENABLE event, not every subsequent settings save. Gating on the transition
+  // (not merely "on") avoids a spurious full `listSubscriptions` disk read + N
+  // enqueues (and the retry of every un-cached/failed domain) on an unrelated
+  // change like theme or currency (PR #56 review). An already-enabled relaunch is
+  // covered by the launch backfill in `startDeferredEnrichmentDrain`; a manual
+  // re-pass is Sync Now. Fire-and-forget off the hot path (AD-9).
+  if (!prev.liveLogoFetch && next.liveLogoFetch && appContext !== null && enrichment !== null) {
     void enrichment.backfillAllLogos();
   }
 }
@@ -372,6 +378,16 @@ function startDeferredEnrichmentDrain(): void {
   // `onlineSettingsCache` was seeded post-barrier, so it reflects the real toggle.
   if (onlineSettingsCache.fxRefresh) {
     enrichment.enqueueFxRefresh();
+  }
+  // Launch logo backfill (Story 9.1 + PR #56 review): if `liveLogoFetch` is ALREADY
+  // on at launch, backfill all existing subscriptions once now that the service may
+  // drain (post-barrier + ready-to-show, AD-28). This covers the already-enabled
+  // relaunch case the `onSettingsMutated` off→on transition does NOT — and retries
+  // any logo a prior session failed to fetch (an un-cached domain has no blob, so
+  // the never-refetch `has()` lets it through again). De-dup + `has()` + the gateway
+  // gate keep it cheap and gated; fire-and-forget, off first paint.
+  if (onlineSettingsCache.liveLogoFetch) {
+    void enrichment.backfillAllLogos();
   }
 }
 

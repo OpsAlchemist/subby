@@ -824,18 +824,17 @@ describe("FX refresh force (Story 9.3): Sync Now bypasses ONLY the ≤24h cap", 
     expect(send).toHaveBeenCalledTimes(1);
   });
 
-  it("FORCED while a job is in-flight: the second is a no-op (single serial FX job)", async () => {
+  it("FORCED while a job is in-flight: jobs never overlap (one fetch in flight at the race)", async () => {
     // Two forced refreshes race (a double Sync Now). The in-flight guard survives
-    // force: only ONE fetch runs — force never lets two FX jobs run concurrently.
+    // force: the second does NOT run concurrently — at the moment of the race exactly
+    // one fetch is in flight. (It is latched and runs AFTER — see the next test.)
     const seeded: FxOverride = {
       ...makeFxSnapshot("2026-10-14"),
-      fetchedAt: "2026-10-15T06:00:00.000Z", // <24h, so only force reaches the fetch
+      fetchedAt: "2026-10-15T06:00:00.000Z", // 2h before `now` → past the 60s floor
     };
-    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { services } = makeFxServices(FX_ON, seeded);
     const { blobCache } = makeBlobCache();
     const { getWindow } = makeWindow();
-    // A provider that blocks until released, so the first job stays in-flight while
-    // the second forced call arrives.
     let releaseFetch!: () => void;
     const gate = new Promise<void>((r) => {
       releaseFetch = r;
@@ -854,13 +853,94 @@ describe("FX refresh force (Story 9.3): Sync Now bypasses ONLY the ≤24h cap", 
     svc.start();
 
     const first = svc.refreshFxNow(true); // FORCE — enters, awaits the blocked fetch
-    await Promise.resolve(); // let the first job reach the in-flight guard + fetch
-    await svc.refreshFxNow(true); // second FORCE arrives while the first is in-flight → no-op
+    // Flush enough microtasks for the first job to pass getSettings + readOverride
+    // and reach the (blocked) provider call before the second forced call arrives.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    void svc.refreshFxNow(true); // second FORCE arrives while the first is in-flight
+    expect(fxProvider).toHaveBeenCalledTimes(1); // no overlap: one fetch in flight
     releaseFetch();
     await first;
+  });
 
-    expect(fxProvider).toHaveBeenCalledTimes(1); // only the first forced job fetched
+  it("FORCED while in-flight is LATCHED and runs after the current job settles (not lost)", async () => {
+    // Regression (PR #56, qodo): a Sync Now click during an automatic refresh must
+    // not be discarded — it is latched and run once the in-flight job finishes,
+    // INCLUDING when that in-flight job fails.
+    // Seed the last fetch >24h before `now` so the FIRST (automatic) refresh
+    // genuinely runs (past the 24h cap) and reaches the provider — only then is a
+    // job in-flight for the Sync Now to latch behind.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-12"),
+      fetchedAt: "2026-10-13T08:00:00.000Z", // 2 DAYS before `now` → cap does not apply
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    let call = 0;
+    const fxProvider: FxProvider = vi.fn(async () => {
+      call += 1;
+      if (call === 1) {
+        await firstGate;
+        throw new Error("the in-flight automatic refresh fails");
+      }
+      return makeFxSnapshot("2026-10-15"); // the latched forced follow-up succeeds
+    });
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:00:00.000Z"),
+    });
+    svc.start();
+
+    const first = svc.refreshFxNow(false); // automatic refresh, blocked in-flight
+    // Wait until the first job is OBSERVABLY in-flight (its provider call has been
+    // reached and is blocked) before the Sync Now arrives — deterministic
+    // regardless of how many awaits precede the provider.
+    for (let i = 0; i < 50 && (fxProvider as unknown as { mock: { calls: unknown[] } }).mock.calls.length < 1; i++) {
+      await Promise.resolve();
+    }
+    expect(fxProvider).toHaveBeenCalledTimes(1); // the automatic job is in-flight
+    svc.enqueueFxRefresh({ force: true }); // Sync Now arrives DURING the in-flight job → latched
+    releaseFirst();
+    await first;
+    // Flush enough microtasks for the latched forced follow-up to run end to end.
+    for (let i = 0; i < 15; i++) await Promise.resolve();
+
+    // Two calls: the failed automatic one, then the latched forced one that writes.
+    expect(fxProvider).toHaveBeenCalledTimes(2);
     expect(writeFxOverride).toHaveBeenCalledTimes(1);
+  });
+
+  it("FORCED within the 60s floor is a no-op (button-mash guard; PR #56)", async () => {
+    // Regression (PR #56, qodo low): force bypasses the 24h cap but NOT a short 60s
+    // hard floor — repeated Sync Now clicks can't hit the provider every ~1.5s.
+    const seeded: FxOverride = {
+      ...makeFxSnapshot("2026-10-15"),
+      fetchedAt: "2026-10-15T08:00:30.000Z", // 30s before `now` → inside the 60s floor
+    };
+    const { services, writeFxOverride } = makeFxServices(FX_ON, seeded);
+    const { blobCache } = makeBlobCache();
+    const { getWindow } = makeWindow();
+    const fxProvider = okFxProvider();
+    const svc = new EnrichmentService({
+      services,
+      blobCache,
+      getWindow,
+      fxProvider,
+      now: fixedNow("2026-10-15T08:01:00.000Z"), // 30s after the last fetch
+    });
+    svc.start();
+
+    await svc.refreshFxNow(true); // FORCE, but within 60s of the last fetch
+
+    expect(fxProvider).not.toHaveBeenCalled(); // the 60s floor holds even under force
+    expect(writeFxOverride).not.toHaveBeenCalled();
   });
 });
 

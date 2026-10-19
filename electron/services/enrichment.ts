@@ -90,6 +90,17 @@ export type FxProvider = (
 export const FX_REFRESH_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 /**
+ * A short HARD floor between FX fetches that applies EVEN under `force` (Sync Now).
+ * The 24h cap is for automatic refreshes; an explicit Sync Now bypasses THAT, but
+ * a user mashing the button (or a renderer calling `enrich:syncNow` in a loop)
+ * must not be able to hammer the provider every ~1.5s. A forced refresh within
+ * this floor of the last successful fetch is a no-op — the rates can't have changed
+ * in 60s anyway. Deliberately tiny vs the cap so a genuine "sync now" minutes later
+ * still works.
+ */
+export const FX_FORCE_MIN_INTERVAL_MS = 60 * 1000;
+
+/**
  * The logo provider seam: fetch bytes+content-type for a domain through the
  * gateway (gated by `online`), or throw. Matches {@link fetchLogo}; injectable so
  * a test supplies a fake returning fixed bytes or a controlled throw without any
@@ -148,6 +159,16 @@ export class EnrichmentService {
    * double-trigger from racing two fetches at once.
    */
   private fxRefreshInFlight = false;
+
+  /**
+   * A FORCED (Sync Now) FX refresh requested while another FX job was already
+   * in-flight (Story 9.3 review). Without this, a Sync Now click during an
+   * automatic refresh — including one that then FAILS — would be silently dropped.
+   * The in-flight job's `finally` runs exactly one follow-up forced refresh when
+   * this is set, so an explicit click is never lost. Only a FORCED request latches
+   * (an automatic in-flight collision stays a no-op — the cap would skip it anyway).
+   */
+  private fxForcePending = false;
 
   /** FIFO queue of registrable domains awaiting a fetch. */
   private readonly queue: string[] = [];
@@ -239,6 +260,7 @@ export class EnrichmentService {
     this.broadcastPending = false;
     this.fxRefreshRequested = false;
     this.fxRefreshRequestedForce = false;
+    this.fxForcePending = false;
     // Drop any queued-but-unprocessed domains so a restart does not replay them.
     this.queue.length = 0;
   }
@@ -341,6 +363,14 @@ export class EnrichmentService {
       if (force) this.fxRefreshRequestedForce = true;
       return;
     }
+    if (force && this.fxRefreshInFlight) {
+      // A job is ALREADY running (e.g. an automatic refresh). Latch the forced
+      // intent SYNCHRONOUSLY here — not inside the async `runFxRefresh` guard, which
+      // could lose the race if the in-flight job settles first. The settling job's
+      // `finally` then runs exactly one follow-up forced refresh (PR #56 review).
+      this.fxForcePending = true;
+      return;
+    }
     void this.runFxRefresh(force);
   }
 
@@ -388,7 +418,16 @@ export class EnrichmentService {
    *              ≤1×/24h (FR-28 is a CAP for AUTOMATIC refreshes only).
    */
   private async runFxRefresh(force = false): Promise<void> {
-    if (this.fxRefreshInFlight || this.stopped) return;
+    if (this.stopped) return;
+    if (this.fxRefreshInFlight) {
+      // A job is already running. A FORCED (Sync Now) request must not be lost —
+      // latch it so the in-flight job's `finally` runs it once the current one
+      // settles (including if that one fails). An automatic collision stays a
+      // no-op (the cap would skip it anyway). Single pending slot: repeated clicks
+      // during one job collapse to one follow-up (the 60s force-floor then applies).
+      if (force) this.fxForcePending = true;
+      return;
+    }
     // The FX override read/write seams are optional (a logo-only stub omits them);
     // without them the FX job cannot run.
     const readOverride = this.services.readFxOverride?.bind(this.services);
@@ -409,20 +448,24 @@ export class EnrichmentService {
       // still apply under force. Automatic callers pass `force=false` and stay
       // capped at ≤1×/24h (FR-28, AD-23).
       const existing = await readOverride();
-      if (!force && existing !== null) {
+      if (existing !== null) {
         const lastFetchedMs = Date.parse(existing.fetchedAt);
         const delta = this.now().getTime() - lastFetchedMs;
-        // The no-op applies ONLY to a stamp in the PAST within the window
-        // (`0 <= delta < 24h`). A FUTURE stamp (clock skew / an edited file) makes
+        // The window: automatic refreshes respect the 24h CAP; a FORCED (Sync Now)
+        // refresh bypasses the cap but STILL respects a short 60s HARD floor so
+        // button-mashing can't hammer the provider (the rates can't change in 60s).
+        const window = force ? FX_FORCE_MIN_INTERVAL_MS : FX_REFRESH_MIN_INTERVAL_MS;
+        // The no-op applies ONLY to a stamp in the PAST within `window`
+        // (`0 <= delta < window`). A FUTURE stamp (clock skew / an edited file) makes
         // `delta` negative; without the lower bound that would always read as
-        // "< 24h" and suppress refresh indefinitely — so a future/out-of-range
+        // "< window" and suppress refresh indefinitely — so a future/out-of-range
         // stamp falls through to a fetch (the safe freshness direction).
         if (
           Number.isFinite(lastFetchedMs) &&
           delta >= 0 &&
-          delta < FX_REFRESH_MIN_INTERVAL_MS
+          delta < window
         ) {
-          return; // fetched within 24h → no network (the CAP)
+          return; // within the applicable window → no network (CAP or force-floor)
         }
       }
 
@@ -468,6 +511,14 @@ export class EnrichmentService {
       }
     } finally {
       this.fxRefreshInFlight = false;
+      // Run a Sync Now that arrived while this job was in-flight (Story 9.3
+      // review): now that the slot is free, process the single latched forced
+      // request. Not awaited (fire-and-forget); the follow-up re-reads the toggle
+      // and applies the 60s force-floor, so a failed/forced burst can't storm.
+      if (this.fxForcePending && !this.stopped) {
+        this.fxForcePending = false;
+        void this.runFxRefresh(true);
+      }
     }
   }
 
